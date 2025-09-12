@@ -6,89 +6,54 @@
 - Configured for the LibriSpeech train.clean.100 dataset.
 """
 
-import subprocess
-import sys
+import argparse
+import math
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
-import math
+from typing import Any, Dict, List
+
+import evaluate
+import numpy as np
+import torch
+import torch.nn as nn
+import torchaudio.models as T_models
+import torchaudio.transforms as T
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from datasets import load_dataset
+from einops import rearrange
+from peft import LoraConfig, TaskType, get_peft_model
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from pathlib import Path
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+    logging,
+)
 
 warnings.filterwarnings("ignore")
-from transformers import logging
-
 logging.set_verbosity_error()
-
-# Environment variables must be set on the host
-
-# OPTIMIZATION: Added flash-attn for automatic memory-efficient attention dispatch.
-# Skip package installation on RunPod (handled by setup script)
-if not os.environ.get("RUNPOD_POD_ID"):
-    packages = [
-        "torch",
-        "torchaudio",
-        "torchvision",
-        "datasets",
-        "tokenizers",
-        "jiwer",
-        "huggingface_hub",
-        "sentencepiece",
-        "transformers>=4.41.0",
-        "accelerate",
-        "einops",
-        "peft",
-        "numpy",
-        "tensorboard",
-        "evaluate",
-    ]
-    # Only install flash-attn on Linux (not macOS)
-    if sys.platform == "linux":
-        packages.append("flash-attn")
-    print("Installing/upgrading packages...")
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + packages
-    )
-    print("✅ Packages ready.")
 
 # Detect environment and set paths accordingly
 if os.environ.get("RUNPOD_POD_ID"):
     # RunPod environment
     DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized"
     print(f"🚀 Running on RunPod (Pod ID: {os.environ.get('RUNPOD_POD_ID')})")
-    print(f"📊 GPU Count: {torch.cuda.device_count()}")
-    for i in range(torch.cuda.device_count()):
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+    if torch.cuda.is_available():
+        print(f"📊 GPU Count: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 else:
     DATA_PATH = "./ASR_Conformer_SmolLM2_Optimized"
     print("💻 Running on local machine")
 
+# Create directories after torch import
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchaudio
-import torchaudio.transforms as T
-import torchaudio.models as T_models
-from datasets import load_dataset
-import jiwer
-import re
-import numpy as np
-import evaluate
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    get_linear_schedule_with_warmup,
-)
-from peft import LoraConfig, get_peft_model, TaskType
-from einops import rearrange
-from accelerate import Accelerator
-from accelerate.utils import set_seed
-from torch.utils.data import DataLoader
 
 # OPTIMIZATION: Ensure TF32 is enabled and set CudNN to benchmark mode for A100 performance.
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -424,7 +389,8 @@ class TrainingConfig:
 
                 print(f"📊 Auto-adjusted batch sizes for {gpu_mem:.1f}GB VRAM:")
                 print(
-                    f"   Train: {self.per_device_train_batch_size}, Eval: {self.per_device_eval_batch_size}"
+                    f"   Train: {self.per_device_train_batch_size}, "
+                    f"Eval: {self.per_device_eval_batch_size}"
                 )
 
 
@@ -800,8 +766,6 @@ This model combines a Conformer encoder with SmolLM2 decoder for automatic speec
 
 if __name__ == "__main__":
     # Parse command line arguments for RunPod
-    import argparse
-
     parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
     parser.add_argument(
         "--push-to-hub", action="store_true", help="Push model to Hugging Face Hub"

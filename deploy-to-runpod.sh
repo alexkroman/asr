@@ -8,7 +8,7 @@ set -e
 # Configuration
 IMAGE_NAME="${IMAGE_NAME:-asr-training}"
 TAG="${TAG:-latest}"
-GITHUB_USER="${GITHUB_USER:-alexkroman}"
+RUNPOD_USER="${RUNPOD_USER:-$USER}"
 POD_NAME="${POD_NAME:-asr-training}"
 GPU_TYPE="${GPU_TYPE:-NVIDIA GeForce RTX 4090}"
 GPU_COUNT="${GPU_COUNT:-1}"
@@ -39,10 +39,10 @@ check_prerequisites() {
         exit 1
     fi
     
-    # Check gh CLI
-    if ! command -v gh &> /dev/null; then
-        print_color "RED" "Error: GitHub CLI (gh) is not installed"
-        print_color "YELLOW" "Install with: brew install gh"
+    # Check runpodctl CLI
+    if ! command -v runpodctl &> /dev/null; then
+        print_color "RED" "Error: runpodctl is not installed"
+        print_color "YELLOW" "Install from: https://github.com/runpod/runpodctl"
         exit 1
     fi
      
@@ -79,39 +79,31 @@ build_image() {
     print_color "GREEN" "✓ Docker image built"
 }
 
-# Push to GitHub Container Registry
-push_to_ghcr() {
-    local full_image="ghcr.io/${GITHUB_USER}/${IMAGE_NAME}:${TAG}"
+# Push to RunPod Registry
+push_to_runpod() {
+    local full_image="registry.runpod.io/${RUNPOD_USER}/${IMAGE_NAME}:${TAG}"
     
-    print_color "YELLOW" "Pushing to GitHub Container Registry..."
+    print_color "YELLOW" "Pushing to RunPod Registry..."
     
-    # Check gh auth
-    if ! gh auth status &> /dev/null; then
-        print_color "RED" "Error: Not authenticated with GitHub"
-        print_color "YELLOW" "Run: gh auth login"
+    # Login to RunPod registry using API key
+    echo "$RUNPOD_API_KEY" | docker login registry.runpod.io -u "$RUNPOD_USER" --password-stdin
+    
+    if [ $? -ne 0 ]; then
+        print_color "RED" "Error: Failed to login to RunPod registry"
+        print_color "YELLOW" "Make sure your RUNPOD_API_KEY is valid"
         exit 1
     fi
-    
-    # Get GitHub token and login to GHCR
-    GITHUB_TOKEN=$(gh auth token)
-    echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_USER --password-stdin
     
     # Tag and push
     docker tag ${IMAGE_NAME}:${TAG} ${full_image}
     docker push ${full_image}
     
     if [ $? -ne 0 ]; then
-        print_color "RED" "Error: Failed to push to GHCR"
+        print_color "RED" "Error: Failed to push to RunPod registry"
         exit 1
     fi
     
-    # Make package private
-    gh api --method PUT \
-        -H "Accept: application/vnd.github+json" \
-        "/user/packages/container/${IMAGE_NAME}/visibility" \
-        -f visibility='private' 2>/dev/null || true
-    
-    print_color "GREEN" "✓ Pushed to GHCR: ${full_image}"
+    print_color "GREEN" "✓ Pushed to RunPod Registry: ${full_image}"
     echo "$full_image"
 }
 
@@ -121,8 +113,7 @@ create_pod() {
     
     print_color "YELLOW" "Creating RunPod pod..."
     
-    # Get GitHub token for image pull
-    GITHUB_TOKEN=$(gh auth token)
+    # No additional auth needed for RunPod registry - the pod will use the API key
     
     # Build runpodctl command
     local cmd="runpodctl create pod"
@@ -135,12 +126,8 @@ create_pod() {
     cmd="$cmd --ports \"22/tcp,6006/http\""
     cmd="$cmd --env \"HF_TOKEN=$HF_TOKEN\""
     
-    # Add image pull credentials for private GHCR
-    if [[ $image == ghcr.io/* ]]; then
-        cmd="$cmd --env \"REGISTRY_AUTH_TOKEN=$GITHUB_TOKEN\""
-        # Note: runpodctl may need additional auth config for private registries
-        # This might require creating a RunPod secret first
-    fi
+    # RunPod registry images are automatically accessible with the API key
+    # No additional credentials needed
     
     # Add spot instance options
     if [ "$USE_SPOT" = "true" ]; then
@@ -246,7 +233,7 @@ Usage: $0 [OPTIONS]
 
 Options:
     --build-only        Only build Docker image
-    --push-only         Only push to GHCR
+    --push-only         Only push to RunPod registry
     --deploy-only       Only deploy to RunPod
     --skip-build        Skip Docker build
     --skip-push         Skip GHCR push
@@ -260,7 +247,7 @@ Options:
 
 Environment Variables:
     RUNPOD_API_KEY      RunPod API key (required)
-    GITHUB_USER         GitHub username (default: alexkroman)
+    RUNPOD_USER         RunPod username (default: current user)
     IMAGE_NAME          Docker image name (default: asr-training)
     TAG                 Docker tag (default: latest)
     POD_NAME            Pod name (default: asr-training)
@@ -303,12 +290,12 @@ EOF
         if [ "$SKIP_BUILD" != "true" ]; then
             build_image
         fi
-        push_to_ghcr
+        push_to_runpod
         exit 0
     fi
     
     if [ "$DEPLOY_ONLY" = "true" ]; then
-        FULL_IMAGE="ghcr.io/${GITHUB_USER}/${IMAGE_NAME}:${TAG}"
+        FULL_IMAGE="registry.runpod.io/${RUNPOD_USER}/${IMAGE_NAME}:${TAG}"
         create_pod "$FULL_IMAGE"
         exit 0
     fi
@@ -319,9 +306,9 @@ EOF
     fi
     
     if [ "$SKIP_PUSH" != "true" ]; then
-        FULL_IMAGE=$(push_to_ghcr)
+        FULL_IMAGE=$(push_to_runpod)
     else
-        FULL_IMAGE="ghcr.io/${GITHUB_USER}/${IMAGE_NAME}:${TAG}"
+        FULL_IMAGE="registry.runpod.io/${RUNPOD_USER}/${IMAGE_NAME}:${TAG}"
     fi
     
     create_pod "$FULL_IMAGE"
