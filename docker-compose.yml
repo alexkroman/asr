@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  asr-training:
+    build: .
+    image: asr-conformer-smollm2:latest
+    container_name: asr_training
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN}
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - CUDA_LAUNCH_BLOCKING=0
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      - ./workspace:/workspace
+      - ./cache:/workspace/cache
+      - ./models:/workspace/ASR_Conformer_SmolLM2_Optimized/models
+      - ./checkpoints:/workspace/ASR_Conformer_SmolLM2_Optimized/checkpoints
+      - ./logs:/workspace/ASR_Conformer_SmolLM2_Optimized/logs
+    shm_size: '64gb'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack:
+        soft: 67108864
+        hard: 67108864
+    command: /bin/bash -c "./runpod_setup.sh && ./launch_training.sh"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
