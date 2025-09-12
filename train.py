@@ -55,7 +55,8 @@ os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
-# OPTIMIZATION: Ensure TF32 is enabled and set CudNN to benchmark mode for A100 performance.
+# OPTIMIZATION: Ensure TF32 is enabled and set CudNN to benchmark mode for
+# A100 performance.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -86,7 +87,9 @@ elif hf_write_token:
     login(token=hf_write_token)
     print("✅ Logged in to Hugging Face Hub with write token")
 else:
-    print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
+    print(
+        "⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. " "Model upload will be skipped."
+    )
 
 # Optional: Setup WandB if available
 if os.environ.get("WANDB_API_KEY"):
@@ -225,9 +228,8 @@ class SmolLM2Decoder(nn.Module):
             self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
             self.model.resize_token_embeddings(len(self.tokenizer))
             with torch.no_grad():
-                self.model.get_input_embeddings().weight[-1] = (
-                    self.model.get_input_embeddings().weight[:-1].mean(dim=0)
-                )
+                embeddings = self.model.get_input_embeddings()
+                embeddings.weight[-1] = embeddings.weight[:-1].mean(dim=0)
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
         if config.use_lora:
             lora_config = LoraConfig(
@@ -247,8 +249,9 @@ class ASRModel(nn.Module):
         super().__init__()
         self.encoder = ConformerEncoder(conformer_cfg)
         self.decoder = SmolLM2Decoder(smollm2_cfg)
+        text_dim = self.decoder.model.config.hidden_size
         self.audio_projector = LightweightAudioProjector(
-            conformer_cfg.d_model, self.decoder.model.config.hidden_size, proj_cfg
+            conformer_cfg.d_model, text_dim, proj_cfg
         )
         self.spec_augment = SpecAugment()
 
@@ -259,13 +262,17 @@ class ASRModel(nn.Module):
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
 
-        text_embeds = self.decoder.model.get_input_embeddings()(labels)
+        embeddings = self.decoder.model.get_input_embeddings()
+        text_embeds = embeddings(labels)
         combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
 
         audio_mask = torch.ones(
             audio_prefix.shape[:2], dtype=torch.long, device=input_values.device
         )
-        combined_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+        if attention_mask is not None:
+            combined_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+        else:
+            combined_attention_mask = audio_mask
 
         return self.decoder.model(
             inputs_embeds=combined_embeds,
@@ -398,10 +405,12 @@ class TrainingConfig:
                 else:  # 80GB+ VRAM (A100 80GB, H100)
                     self.per_device_train_batch_size = 256
                     self.per_device_eval_batch_size = 256
-                    self.gradient_checkpointing = True  # Enable for large batches
+                    # Enable gradient checkpointing for large batches
+                    self.gradient_checkpointing = True
                     # A100 specific optimizations
                     if "A100" in torch.cuda.get_device_name(0):
-                        self.gradient_accumulation_steps = 1  # No need with large batch
+                        # No need for grad accumulation with large batch
+                        self.gradient_accumulation_steps = 1
 
                 print(f"📊 Auto-adjusted batch sizes for {gpu_mem:.1f}GB VRAM:")
                 print(
@@ -418,9 +427,11 @@ def train_with_accelerate():
     training_cfg = TrainingConfig()
 
     # Initialize accelerator with appropriate logging
-    log_with = ["tensorboard"]
+    from accelerate.utils import LoggerType
+
+    log_with = [LoggerType.TENSORBOARD]
     if os.environ.get("WANDB_API_KEY"):
-        log_with.append("wandb")
+        log_with.append(LoggerType.WANDB)
 
     accelerator = Accelerator(
         mixed_precision=training_cfg.mixed_precision,
@@ -441,25 +452,38 @@ def train_with_accelerate():
 
     # Enable gradient checkpointing for memory efficiency with large batches
     if training_cfg.gradient_checkpointing:
-        model.encoder.conformer.gradient_checkpointing_enable()
-        model.decoder.model.gradient_checkpointing_enable()
+        if hasattr(model.encoder.conformer, "gradient_checkpointing_enable"):
+            model.encoder.conformer.gradient_checkpointing_enable()
+        if hasattr(model.decoder.model, "gradient_checkpointing_enable"):
+            model.decoder.model.gradient_checkpointing_enable()
         if accelerator.is_main_process:
             print("✅ Gradient checkpointing enabled for memory efficiency")
-    
     # Compile model components for A100 (works with gradient checkpointing)
     if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
         if accelerator.is_main_process:
-            print("🚀 Compiling model with torch.compile (mode='max-autotune' for A100)...")
-        model.encoder = torch.compile(model.encoder, mode="max-autotune")
-        model.audio_projector = torch.compile(model.audio_projector, mode="max-autotune")
+            print(
+                "🚀 Compiling model with torch.compile "
+                "(mode='max-autotune' for A100)..."
+            )
+        # Type ignore for torch.compile as it returns a callable wrapper
+        model.encoder = torch.compile(  # type: ignore
+            model.encoder, mode="max-autotune"
+        )
+        model.audio_projector = torch.compile(  # type: ignore
+            model.audio_projector, mode="max-autotune"
+        )
         # Decoder compilation with reduced overhead
-        model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead")
+        model.decoder.model = torch.compile(  # type: ignore
+            model.decoder.model, mode="reduce-overhead"
+        )
         if accelerator.is_main_process:
             print("✅ Model compilation complete with A100 optimizations")
 
     # Data processing - optimize for A100 memory capacity
     processor = AudioDataProcessor(
-        tokenizer, max_audio_seconds=20.0, max_text_words=150  # Can handle longer sequences
+        tokenizer,
+        max_audio_seconds=20.0,
+        max_text_words=150,  # Can handle longer sequences
     )
 
     def preprocess_function(examples):
@@ -473,30 +497,45 @@ def train_with_accelerate():
 
     # Preprocess datasets
     with accelerator.main_process_first():
+        # Get column names for removal
+        train_columns = (
+            list(train_dataset.column_names)
+            if hasattr(train_dataset, "column_names")
+            else []
+        )
         train_dataset = train_dataset.map(
             preprocess_function,
-            num_proc=8 if accelerator.num_processes == 1 else 1,  # Use all 8 vCPUs
-            remove_columns=train_dataset.column_names,
+            num_proc=8 if accelerator.num_processes == 1 else 1,
+            # Use all 8 vCPUs
+            remove_columns=train_columns,
             batch_size=100,  # Process in larger batches
         ).filter(lambda x: x["spectrogram"] is not None)
 
+        # Get column names for removal
+        val_columns = (
+            list(val_dataset.column_names)
+            if hasattr(val_dataset, "column_names")
+            else []
+        )
         val_dataset = val_dataset.map(
             preprocess_function,
-            num_proc=8 if accelerator.num_processes == 1 else 1,  # Use all 8 vCPUs
-            remove_columns=val_dataset.column_names,
+            num_proc=8 if accelerator.num_processes == 1 else 1,
+            # Use all 8 vCPUs
+            remove_columns=val_columns,
             batch_size=100,  # Process in larger batches
         ).filter(lambda x: x["spectrogram"] is not None)
 
     if accelerator.is_main_process:
         print(
-            f"✅ Datasets ready. Train: {len(train_dataset)}, Val: {len(val_dataset)}"
+            f"✅ Datasets ready. Train: {len(train_dataset)}, "
+            f"Val: {len(val_dataset)}"
         )
 
     # Create data collator and loaders
     collator = DataCollator(tokenizer)
 
     train_dataloader = DataLoader(
-        train_dataset.with_format("torch"),
+        train_dataset.with_format("torch"),  # type: ignore
         batch_size=training_cfg.per_device_train_batch_size,
         shuffle=True,
         collate_fn=collator,
@@ -507,7 +546,7 @@ def train_with_accelerate():
     )
 
     val_dataloader = DataLoader(
-        val_dataset.with_format("torch"),
+        val_dataset.with_format("torch"),  # type: ignore
         batch_size=training_cfg.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
@@ -557,7 +596,7 @@ def train_with_accelerate():
     if accelerator.is_main_process:
         print("🚀 Starting training...")
         tracker_kwargs = {}
-        if "wandb" in log_with:
+        if LoggerType.WANDB in log_with:
             tracker_kwargs["wandb"] = {
                 "name": f"asr-training-{training_cfg.seed}",
                 "tags": ["asr", "conformer", "smollm2"],
@@ -667,7 +706,8 @@ def train_with_accelerate():
 
                 if accelerator.is_main_process:
                     print(
-                        f"\nStep {global_step}: Val Loss: {avg_val_loss:.4f}, WER: {wer_score:.4f}"
+                        f"\nStep {global_step}: Val Loss: {avg_val_loss:.4f}, "
+                        f"WER: {wer_score:.4f}"
                     )
                     accelerator.log(
                         {
@@ -678,7 +718,7 @@ def train_with_accelerate():
                     )
 
                     # Early stopping check
-                    if wer_score < best_wer:
+                    if wer_score is not None and wer_score < best_wer:
                         best_wer = wer_score
                         patience_counter = 0
                         # Save best model
@@ -687,7 +727,10 @@ def train_with_accelerate():
                     else:
                         patience_counter += 1
                         if patience_counter >= early_stopping_patience:
-                            print(f"Early stopping triggered. Best WER: {best_wer:.4f}")
+                            print(
+                                f"Early stopping triggered. "
+                                f"Best WER: {best_wer:.4f}"
+                            )
                             break
 
                 model.train()
@@ -778,12 +821,13 @@ model-index:
 
 # Conformer-SmolLM2 ASR Model
 
-This model combines a Conformer encoder with SmolLM2 decoder for automatic speech recognition.
+This model combines a Conformer encoder with SmolLM2 decoder for automatic
+speech recognition.
 
 ## Training Details
 - **Dataset**: LibriSpeech train-clean-100
 - **Best WER**: {best_wer:.4f}
-- **Training Device**: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}
+- **Training Device**: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}  # noqa: E501
 - **GPU Count**: {torch.cuda.device_count()}
 """
 
