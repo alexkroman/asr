@@ -60,7 +60,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-torch.set_float32_matmul_precision("medium")
+torch.set_float32_matmul_precision("high")  # A100 can handle high precision
+
+# A100-specific optimizations
+if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
+    # Enable CUDA graphs for better performance
+    torch.cuda.set_sync_debug_mode(0)
+    # Optimize memory allocation
+    torch.cuda.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Use most of the 80GB
+    print("🚀 A100 detected - enabling specific optimizations")
 
 # Handle Hugging Face authentication
 hf_read_token = os.environ.get("HF_READ_TOKEN")
@@ -347,19 +356,19 @@ class DataCollator:
 @dataclass
 class TrainingConfig:
     output_dir: str = f"{DATA_PATH}/checkpoints"
-    per_device_train_batch_size: int = 96
-    per_device_eval_batch_size: int = 64
-    gradient_accumulation_steps: int = 2
-    learning_rate: float = 6e-4
+    per_device_train_batch_size: int = 256  # Optimized for A100 80GB
+    per_device_eval_batch_size: int = 256
+    gradient_accumulation_steps: int = 1  # Reduced since we have large batch
+    learning_rate: float = 8e-4  # Slightly higher for larger batch
     weight_decay: float = 0.05
-    warmup_steps: int = 2000
+    warmup_steps: int = 1000  # Adjusted for larger batch size
     max_steps: int = 50000
     logging_steps: int = 10
     eval_steps: int = 250
     save_steps: int = 250
     save_total_limit: int = 3
     mixed_precision: str = "bf16"
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True  # Enable for memory efficiency
     seed: int = 42
     push_to_hub: bool = True  # Enable by default
     hub_model_id: str = "mazesmazes/asr"  # Your HF repository
@@ -383,9 +392,16 @@ class TrainingConfig:
                 elif gpu_mem < 40:  # 24-40GB VRAM
                     self.per_device_train_batch_size = 64
                     self.per_device_eval_batch_size = 64
-                else:  # 40GB+ VRAM (A100, H100)
-                    self.per_device_train_batch_size = 96
-                    self.per_device_eval_batch_size = 96
+                elif gpu_mem < 80:  # 40-80GB VRAM (A100 40GB, A6000)
+                    self.per_device_train_batch_size = 128
+                    self.per_device_eval_batch_size = 128
+                else:  # 80GB+ VRAM (A100 80GB, H100)
+                    self.per_device_train_batch_size = 256
+                    self.per_device_eval_batch_size = 256
+                    self.gradient_checkpointing = True  # Enable for large batches
+                    # A100 specific optimizations
+                    if "A100" in torch.cuda.get_device_name(0):
+                        self.gradient_accumulation_steps = 1  # No need with large batch
 
                 print(f"📊 Auto-adjusted batch sizes for {gpu_mem:.1f}GB VRAM:")
                 print(
@@ -423,17 +439,27 @@ def train_with_accelerate():
     model = ASRModel(conformer_cfg, smollm2_cfg, proj_cfg)
     tokenizer = model.decoder.tokenizer
 
-    # Compile model components if not using gradient checkpointing
-    if not training_cfg.gradient_checkpointing and accelerator.is_main_process:
-        print("🚀 Compiling model components with torch.compile...")
-        model.encoder = torch.compile(model.encoder)
-        model.audio_projector = torch.compile(model.audio_projector)
-        model.decoder.model = torch.compile(model.decoder.model)
-        print("✅ Model compilation complete.")
+    # Enable gradient checkpointing for memory efficiency with large batches
+    if training_cfg.gradient_checkpointing:
+        model.encoder.conformer.gradient_checkpointing_enable()
+        model.decoder.model.gradient_checkpointing_enable()
+        if accelerator.is_main_process:
+            print("✅ Gradient checkpointing enabled for memory efficiency")
+    
+    # Compile model components for A100 (works with gradient checkpointing)
+    if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
+        if accelerator.is_main_process:
+            print("🚀 Compiling model with torch.compile (mode='max-autotune' for A100)...")
+        model.encoder = torch.compile(model.encoder, mode="max-autotune")
+        model.audio_projector = torch.compile(model.audio_projector, mode="max-autotune")
+        # Decoder compilation with reduced overhead
+        model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead")
+        if accelerator.is_main_process:
+            print("✅ Model compilation complete with A100 optimizations")
 
-    # Data processing
+    # Data processing - optimize for A100 memory capacity
     processor = AudioDataProcessor(
-        tokenizer, max_audio_seconds=15.0, max_text_words=100
+        tokenizer, max_audio_seconds=20.0, max_text_words=150  # Can handle longer sequences
     )
 
     def preprocess_function(examples):
@@ -449,14 +475,16 @@ def train_with_accelerate():
     with accelerator.main_process_first():
         train_dataset = train_dataset.map(
             preprocess_function,
-            num_proc=4 if accelerator.num_processes == 1 else 1,
+            num_proc=8 if accelerator.num_processes == 1 else 1,  # Use all 8 vCPUs
             remove_columns=train_dataset.column_names,
+            batch_size=100,  # Process in larger batches
         ).filter(lambda x: x["spectrogram"] is not None)
 
         val_dataset = val_dataset.map(
             preprocess_function,
-            num_proc=4 if accelerator.num_processes == 1 else 1,
+            num_proc=8 if accelerator.num_processes == 1 else 1,  # Use all 8 vCPUs
             remove_columns=val_dataset.column_names,
+            batch_size=100,  # Process in larger batches
         ).filter(lambda x: x["spectrogram"] is not None)
 
     if accelerator.is_main_process:
@@ -472,8 +500,10 @@ def train_with_accelerate():
         batch_size=training_cfg.per_device_train_batch_size,
         shuffle=True,
         collate_fn=collator,
-        num_workers=4,
+        num_workers=8,  # Use all 8 vCPUs
         pin_memory=True,
+        prefetch_factor=4,  # Prefetch more batches
+        persistent_workers=True,  # Keep workers alive between epochs
     )
 
     val_dataloader = DataLoader(
@@ -481,18 +511,24 @@ def train_with_accelerate():
         batch_size=training_cfg.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=4,
+        num_workers=8,  # Use all 8 vCPUs
         pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True,
     )
 
-    # Optimizer and scheduler
+    # Optimizer with fused kernels for A100
+    use_fused = torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training_cfg.learning_rate,
         weight_decay=training_cfg.weight_decay,
         betas=(0.9, 0.999),
         eps=1e-8,
+        fused=use_fused,  # Use fused optimizer on A100
     )
+    if use_fused and accelerator.is_main_process:
+        print("✅ Using fused AdamW optimizer for A100")
 
     num_training_steps = training_cfg.max_steps
     lr_scheduler = get_linear_schedule_with_warmup(
