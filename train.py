@@ -86,7 +86,7 @@ elif hf_write_token:
     login(token=hf_write_token)
     print("✅ Logged in to Hugging Face Hub with write token")
 else:
-    print("⚠️  No HF_TOKEN found. Model upload will be skipped.")
+    print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
 
 # Optional: Setup WandB if available
 if os.environ.get("WANDB_API_KEY"):
