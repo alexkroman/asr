@@ -1,203 +1,246 @@
 # RunPod ASR Training Quick Start Guide
 
-## 🚀 Quick Deploy on RunPod
+## Prerequisites
 
-### Option 1: Using RunPod Templates (Easiest)
+1. **RunPod Account**: Sign up at [runpod.io](https://runpod.io)
+2. **RunPod API Key**: Get from [RunPod Settings](https://www.runpod.io/console/settings) → API Keys
+3. **GitHub CLI**: Install with `brew install gh` and authenticate with `gh auth login`
+4. **Docker**: Install [Docker Desktop](https://docker.com)
 
-1. **Create a RunPod Pod**:
-   - Go to [RunPod](https://runpod.io)
-   - Select "GPU Cloud" → "Secure Cloud"
-   - Choose GPU type (recommended: RTX 4090, A5000, or A100)
-   - Select PyTorch template: `runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel`
+## Quick Deploy
 
-2. **Connect to Pod**:
-   ```bash
-   ssh root@[your-pod-ip] -p [your-pod-port]
-   # Or use RunPod's web terminal
-   ```
+### One-Command Deployment
 
-3. **Setup and Run**:
-   ```bash
-   # Clone your repository or upload files
-   cd /workspace
-   
-   # Download the files
-   wget https://raw.githubusercontent.com/your-repo/train.py
-   wget https://raw.githubusercontent.com/your-repo/runpod_setup.sh
-   
-   # Run setup
-   chmod +x runpod_setup.sh
-   ./runpod_setup.sh
-   
-   # Set your tokens
-   export HF_TOKEN="your_huggingface_token"
-   export WANDB_API_KEY="your_wandb_key"  # Optional
-   
-   # Start training
-   ./launch_training.sh
-   ```
-
-### Option 2: Using Docker Image
-
-1. **Build and Push Docker Image** (do this locally):
-   ```bash
-   # Build image
-   docker build -t your-dockerhub-username/asr-training:latest .
-   
-   # Push to Docker Hub
-   docker push your-dockerhub-username/asr-training:latest
-   ```
-
-2. **Deploy on RunPod**:
-   - Create new pod with custom Docker image
-   - Image: `your-dockerhub-username/asr-training:latest`
-   - Container Disk: 50GB minimum
-   - Volume Disk: 100GB recommended
-
-3. **Run Training**:
-   ```bash
-   export HF_TOKEN="your_token"
-   python /workspace/train.py --push-to-hub
-   ```
-
-## 📊 GPU Recommendations
-
-| GPU Type | VRAM | Batch Size | Est. Speed | Cost/hr |
-|----------|------|------------|------------|---------|
-| RTX 4090 | 24GB | 32 | Fast | ~$0.44 |
-| A5000 | 24GB | 32 | Fast | ~$0.79 |
-| A100 40GB | 40GB | 64 | Fastest | ~$1.89 |
-| A100 80GB | 80GB | 96 | Fastest | ~$3.89 |
-| 2x A100 40GB | 80GB | 128 | Ultra Fast | ~$3.78 |
-
-## 🎯 Training Commands
-
-### Basic Training:
 ```bash
-python train.py
+# Set your RunPod API key
+export RUNPOD_API_KEY="your-api-key-here"
+
+# Deploy everything (build, push to GitHub Container Registry, deploy pod)
+./deploy-to-runpod.sh
 ```
 
-### With Model Upload to HuggingFace:
+The script will:
+1. Auto-install `runpodctl` if needed
+2. Build your Docker image
+3. Push to GitHub Container Registry (private)
+4. Deploy a RunPod pod with your image
+5. Show you the pod ID and connection details
+
+### Deployment Options
+
 ```bash
-python train.py --push-to-hub --hub-model-id "my-asr-model"
+# Deploy with spot instance (50-70% cheaper)
+./deploy-to-runpod.sh --use-spot --bid-price 0.60
+
+# Deploy with multiple GPUs
+./deploy-to-runpod.sh --gpu-type "NVIDIA A100 80GB" --gpu-count 2
+
+# Deploy with custom GPU
+./deploy-to-runpod.sh --gpu-type "NVIDIA GeForce RTX 4090"
 ```
 
-### Custom Settings:
+## GPU Recommendations
+
+| Model Size | GPU Type | VRAM | Cost/hr (On-Demand) | Cost/hr (Spot) |
+|------------|----------|------|---------------------|-----------------|
+| Small | RTX 4090 | 24GB | ~$0.74 | ~$0.44 |
+| Medium | A100 40GB | 40GB | ~$1.89 | ~$0.79 |
+| Large | A100 80GB | 80GB | ~$3.89 | ~$1.89 |
+| XLarge | 2x A100 80GB | 160GB | ~$7.78 | ~$3.78 |
+
+## Managing Your Deployment
+
+### Check Pod Status
+
 ```bash
-python train.py \
-  --max-steps 10000 \
-  --eval-steps 500 \
-  --batch-size 32 \
-  --push-to-hub
+# List all your pods
+./deploy-to-runpod.sh --list
+
+# Or use runpodctl directly
+runpodctl get pods
 ```
 
-### Multi-GPU Training:
+### Connect to Your Pod
+
+Once deployed, connect via:
+
+1. **Web Terminal**: Go to [RunPod Console](https://www.runpod.io/console/pods) and click "Connect"
+
+2. **SSH** (if you exposed port 22):
 ```bash
-# Automatically detected and configured
-accelerate launch train.py
+# Get connection details from pod list
+ssh root@[pod-ip] -p [ssh-port]
 ```
 
-## 📈 Monitoring
+### Monitor Training
 
-### GPU Usage:
+1. **TensorBoard** (if port 6006 exposed):
+   - URL: `https://[pod-id]-6006.proxy.runpod.net`
+
+2. **Logs**:
 ```bash
-./monitor.sh  # Real-time GPU, memory, disk monitoring
+# View pod logs
+runpodctl logs [pod-id]
 ```
 
-### Training Logs:
-```bash
-# TensorBoard
-tensorboard --logdir /workspace/ASR_Conformer_SmolLM2_Optimized/logs
+3. **Weights & Biases** (if configured):
+   - View at [wandb.ai](https://wandb.ai)
 
-# Weights & Biases (if configured)
-# View at https://wandb.ai/your-username/asr_training
+### Stop Pod
+
+```bash
+# Stop when done to avoid charges
+./deploy-to-runpod.sh --stop [pod-id]
+
+# Or terminate completely
+runpodctl terminate pod [pod-id]
 ```
 
-### Check Training Progress:
-```bash
-# View latest checkpoint
-ls -la /workspace/ASR_Conformer_SmolLM2_Optimized/checkpoints/
+## Environment Variables
 
-# Tail training logs
-tail -f /workspace/ASR_Conformer_SmolLM2_Optimized/logs/events.out.tfevents.*
+Set these before deployment:
+
+```bash
+# Required
+export RUNPOD_API_KEY="your-runpod-api-key"
+
+# Optional
+export HF_TOKEN="your-huggingface-token"  # For model uploads
+export WANDB_API_KEY="your-wandb-key"     # For experiment tracking
+export GITHUB_USER="your-github-username"  # Default: alexkroman
+export IMAGE_NAME="custom-image-name"      # Default: asr-training
+export POD_NAME="custom-pod-name"         # Default: asr-training
 ```
 
-## 🔧 Troubleshooting
+## Advanced Usage
 
-### Out of Memory:
+### Build and Push Only
+
 ```bash
-# Reduce batch size
-python train.py --batch-size 16
-
-# Or enable gradient checkpointing (edit train.py)
-# Set gradient_checkpointing: bool = True in TrainingConfig
+# Just build and push to GHCR, no deployment
+./deploy-to-runpod.sh --push-only
 ```
 
-### CUDA Errors:
-```bash
-# Reset GPU
-nvidia-smi --gpu-reset
+### Deploy Existing Image
 
-# Check CUDA version
-nvcc --version
+```bash
+# Skip build and push, deploy existing image
+./deploy-to-runpod.sh --deploy-only --skip-build --skip-push
+```
+
+### Custom Configuration
+
+```bash
+# Full control
+./deploy-to-runpod.sh \
+  --gpu-type "NVIDIA A100 80GB" \
+  --gpu-count 2 \
+  --use-spot \
+  --bid-price 1.50
+```
+
+## Data Management
+
+### Using Network Volumes
+
+Network volumes persist data across pod restarts:
+
+1. Create a network volume in RunPod console
+2. Mount it when creating pod (script handles this automatically)
+3. Access at `/workspace` in your pod
+
+### Upload Training Data
+
+```bash
+# From local to pod
+rsync -avz -e "ssh -p [ssh-port]" \
+  ./data/ root@[pod-ip]:/workspace/data/
+```
+
+### Download Results
+
+```bash
+# From pod to local
+rsync -avz -e "ssh -p [ssh-port]" \
+  root@[pod-ip]:/workspace/checkpoints/ \
+  ./checkpoints/
+```
+
+## Troubleshooting
+
+### Authentication Issues
+
+```bash
+# Check GitHub CLI auth
+gh auth status
+
+# Re-authenticate if needed
+gh auth login
+
+# Check RunPod API key
+echo $RUNPOD_API_KEY
+```
+
+### Pod Creation Failed
+
+1. Check available GPUs: Some GPU types might be out of stock
+2. Try spot instances: Often more availability
+3. Try different regions: Change in RunPod settings
+
+### Container Pull Errors
+
+The script automatically handles GitHub Container Registry authentication, but if you have issues:
+
+1. Ensure your GitHub token has `read:packages` scope
+2. Verify the image was pushed: Check GitHub → Packages
+3. Make sure the container is set to private (script does this automatically)
+
+### Common Commands
+
+```bash
+# Check GPU availability in pod
 nvidia-smi
+
+# Monitor resource usage
+htop
+nvtop
+
+# Check disk space
+df -h
+
+# Test CUDA
+python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-### Slow Training:
-```bash
-# Ensure using compiled model (check logs)
-# Verify mixed precision is enabled
-# Check GPU utilization: nvidia-smi -l 1
-```
+## Cost Optimization Tips
 
-## 💾 Saving & Resuming
+1. **Use Spot Instances**: 50-70% cheaper, good for training
+2. **Set Auto-Stop**: Configure in pod settings to stop when idle
+3. **Use Network Volumes**: Avoid re-uploading data
+4. **Monitor Usage**: Check RunPod dashboard regularly
+5. **Stop When Done**: Always stop pods after training
 
-### Auto-saves checkpoints every 250 steps to:
-```
-/workspace/ASR_Conformer_SmolLM2_Optimized/checkpoints/
-```
+## Quick Example
 
-### Resume from checkpoint:
-```bash
-# Training automatically resumes from last checkpoint
-python train.py
-```
-
-### Download Model:
-```bash
-# From RunPod terminal
-cd /workspace/ASR_Conformer_SmolLM2_Optimized/models/
-tar -czf final_model.tar.gz final_model/
-
-# Then download via RunPod file browser or scp
-```
-
-## 🌐 Environment Variables
+Complete training workflow:
 
 ```bash
-# Required for model upload
-export HF_TOKEN="hf_xxxxxxxxxxxxx"
+# 1. Set credentials
+export RUNPOD_API_KEY="runpod_api_..."
+export HF_TOKEN="hf_..."
 
-# Optional for experiment tracking
-export WANDB_API_KEY="xxxxxxxxxxxxx"
+# 2. Deploy with spot instance
+./deploy-to-runpod.sh --use-spot --gpu-type "NVIDIA GeForce RTX 4090"
 
-# RunPod automatically sets
-echo $RUNPOD_POD_ID  # Your pod ID
-echo $CUDA_VISIBLE_DEVICES  # Available GPUs
+# 3. Monitor training (get pod-id from output)
+runpodctl logs [pod-id] --follow
+
+# 4. Stop when complete
+./deploy-to-runpod.sh --stop [pod-id]
 ```
 
-## 📝 Tips for RunPod
+## Support
 
-1. **Persistent Storage**: Use RunPod's network volumes to persist data between sessions
-2. **Spot Instances**: Use spot instances for 50-70% cost savings (may be interrupted)
-3. **Multi-GPU**: Scales automatically - just select multi-GPU pod
-4. **Preemptible Pods**: Great for testing, not recommended for full training runs
-5. **SSH Access**: Set up SSH keys for easier access than web terminal
-
-## 🚨 Important Notes
-
-- Training uses ~50GB for dataset cache on first run
-- Model checkpoints use ~2GB each
-- Full training on train-clean-100 takes ~12-24 hours on A100
-- WER should reach <10% after full training
-- Remember to stop your pod when done to avoid charges!
+- **RunPod Documentation**: [docs.runpod.io](https://docs.runpod.io)
+- **RunPod Discord**: [discord.gg/runpod](https://discord.gg/runpod)
+- **runpodctl CLI**: [github.com/runpod/runpodctl](https://github.com/runpod/runpodctl)

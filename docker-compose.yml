@@ -27,7 +27,7 @@ services:
       stack:
         soft: 67108864
         hard: 67108864
-    command: /bin/bash -c "./runpod_setup.sh && ./launch_training.sh"
+    command: /bin/bash -c "./launch_training.sh"
     deploy:
       resources:
         reservations:

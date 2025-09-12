@@ -1,0 +1,29 @@
+# Core ML libraries
+torch>=2.0.0
+torchaudio
+torchvision
+
+# Hugging Face ecosystem
+transformers>=4.41.0
+datasets
+tokenizers
+huggingface_hub
+accelerate
+peft
+evaluate
+
+# Audio processing and ASR
+sentencepiece
+jiwer
+
+# Utilities
+einops
+numpy
+tqdm
+
+# Training optimization
+# flash-attn  # Only for Linux/CUDA systems, not macOS
+tensorboard
+
+# Optional: Weights & Biases for experiment tracking
+wandb

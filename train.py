@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 import math
 from tqdm.auto import tqdm
+from pathlib import Path
 
 warnings.filterwarnings('ignore')
 from transformers import logging
 
 logging.set_verbosity_error()
+
+# Environment variables must be set on the host
 
 # OPTIMIZATION: Added flash-attn for automatic memory-efficient attention dispatch.
 # Skip package installation on RunPod (handled by setup script)
@@ -27,8 +30,11 @@ if not os.environ.get('RUNPOD_POD_ID'):
         "torch", "torchaudio", "torchvision", "datasets",
         "tokenizers", "jiwer", "huggingface_hub", "sentencepiece",
         "transformers>=4.41.0", "accelerate", "einops", "peft", "numpy",
-        "tensorboard", "flash-attn", "evaluate"
+        "tensorboard", "evaluate"
     ]
+    # Only install flash-attn on Linux (not macOS)
+    if sys.platform == "linux":
+        packages.append("flash-attn")
     print("Installing/upgrading packages...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + packages)
     print("✅ Packages ready.")
@@ -42,14 +48,8 @@ if os.environ.get('RUNPOD_POD_ID'):
     for i in range(torch.cuda.device_count()):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 else:
-    try:
-        from google.colab import drive
-        drive.mount('/content/drive', force_remount=True)
-        DATA_PATH = "/content/drive/MyDrive/ASR_Conformer_SmolLM2_Optimized"
-        print("📱 Running on Google Colab")
-    except ImportError:
-        DATA_PATH = "./ASR_Conformer_SmolLM2_Optimized"
-        print("💻 Running on local machine")
+    DATA_PATH = "./ASR_Conformer_SmolLM2_Optimized"
+    print("💻 Running on local machine")
 
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
@@ -84,21 +84,19 @@ torch.backends.cudnn.deterministic = False
 torch.set_float32_matmul_precision('medium')
 
 # Handle Hugging Face authentication
-hf_token = None
-if os.environ.get('HF_TOKEN'):
-    hf_token = os.environ.get('HF_TOKEN')
+hf_read_token = os.environ.get('HF_READ_TOKEN')
+hf_write_token = os.environ.get('HF_WRITE_TOKEN') or os.environ.get('HF_TOKEN')
+
+if hf_read_token:
     from huggingface_hub import login
-    login(token=hf_token)
-    print("✅ Logged in to Hugging Face Hub")
+    login(token=hf_read_token)
+    print("✅ Logged in to Hugging Face Hub with read token")
+elif hf_write_token:
+    from huggingface_hub import login
+    login(token=hf_write_token)
+    print("✅ Logged in to Hugging Face Hub with write token")
 else:
-    try:
-        from google.colab import userdata
-        hf_token = userdata.get('HF_TOKEN')
-        from huggingface_hub import login
-        login(token=hf_token)
-        print("✅ Logged in to Hugging Face Hub (Colab)")
-    except Exception:
-        print("⚠️  No HF_TOKEN found. Model upload will be skipped.")
+    print("⚠️  No HF_TOKEN found. Model upload will be skipped.")
 
 # Optional: Setup WandB if available
 if os.environ.get('WANDB_API_KEY'):
@@ -312,9 +310,9 @@ class TrainingConfig:
     mixed_precision: str = "bf16"
     gradient_checkpointing: bool = False
     seed: int = 42
-    push_to_hub: bool = False
-    hub_model_id: str = "conformer-smollm2-asr"
-    hub_private: bool = True
+    push_to_hub: bool = True  # Enable by default
+    hub_model_id: str = "mazesmazes/asr"  # Your HF repository
+    hub_private: bool = False  # Public repository
     
     def __post_init__(self):
         # Adjust batch sizes based on available GPUs and VRAM
@@ -622,27 +620,21 @@ def train_with_accelerate():
         print(f"✅ Model saved to {save_path}")
         
         # Push to Hugging Face Hub if configured
-        if training_cfg.push_to_hub and hf_token:
+        if training_cfg.push_to_hub and hf_write_token:
             try:
-                from huggingface_hub import HfApi, create_repo
-                api = HfApi()
+                from huggingface_hub import HfApi
+                api = HfApi(token=hf_write_token)
                 
-                # Create repo if it doesn't exist
-                repo_id = f"{api.whoami()['name']}/{training_cfg.hub_model_id}"
-                create_repo(
-                    repo_id=repo_id,
-                    private=training_cfg.hub_private,
-                    exist_ok=True,
-                    token=hf_token
-                )
+                # Use the hub_model_id directly (already includes username)
+                repo_id = training_cfg.hub_model_id
                 
-                # Upload model and tokenizer
+                # Upload model and tokenizer (assumes repo already exists)
                 print(f"📤 Uploading model to Hugging Face Hub: {repo_id}")
                 api.upload_folder(
                     folder_path=save_path,
                     repo_id=repo_id,
                     repo_type="model",
-                    token=hf_token
+                    token=hf_write_token
                 )
                 
                 # Create model card
@@ -687,7 +679,7 @@ This model combines a Conformer encoder with SmolLM2 decoder for automatic speec
                     path_in_repo="README.md",
                     repo_id=repo_id,
                     repo_type="model",
-                    token=hf_token
+                    token=hf_write_token
                 )
                 
                 print(f"✅ Model uploaded to: https://huggingface.co/{repo_id}")
@@ -699,7 +691,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
     parser.add_argument("--push-to-hub", action="store_true", help="Push model to Hugging Face Hub")
-    parser.add_argument("--hub-model-id", type=str, default="conformer-smollm2-asr", help="Model ID for Hugging Face Hub")
+    parser.add_argument("--hub-model-id", type=str, default="mazesmazes/asr", help="Model ID for Hugging Face Hub")
     parser.add_argument("--max-steps", type=int, default=50000, help="Maximum training steps")
     parser.add_argument("--eval-steps", type=int, default=250, help="Evaluation frequency")
     parser.add_argument("--batch-size", type=int, default=None, help="Override automatic batch size")
