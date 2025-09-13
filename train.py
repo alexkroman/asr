@@ -12,7 +12,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union, cast, Tuple
 
 import evaluate
 import numpy as np
@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torchaudio.models as T_models
 import torchaudio.transforms as T
-from accelerate import Accelerator
+from accelerate import Accelerator 
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from einops import rearrange
@@ -130,8 +130,9 @@ class ProjectorConfig:
 
 class SpecAugment(nn.Module):
     def __init__(
-        self, freq_mask_param=27, time_mask_param=100, n_freq_masks=2, n_time_masks=2
-    ):
+        self, freq_mask_param: int = 27, time_mask_param: int = 100, 
+        n_freq_masks: int = 2, n_time_masks: int = 2
+    ) -> None:
         super().__init__()
         self.freq_masks = nn.ModuleList(
             [
@@ -146,7 +147,7 @@ class SpecAugment(nn.Module):
             ]
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for freq_mask in self.freq_masks:
             x = freq_mask(x)
         for time_mask in self.time_masks:
@@ -177,7 +178,7 @@ class ConformerEncoder(nn.Module):
             dropout=config.dropout,
         )
 
-    def forward(self, x, input_lengths):
+    def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
         x = self.subsample(x.unsqueeze(1))
         x = rearrange(x, "b c f t -> b t (c f)")
         x = self.input_proj(x)
@@ -214,7 +215,8 @@ class LightweightAudioProjector(nn.Module):
         audio_proj = self.audio_proj(audio_features)
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)
         attn_out, _ = self.cross_attn(queries, audio_proj, audio_proj)
-        return self.mlp(attn_out + queries)
+        result: torch.Tensor = self.mlp(attn_out + queries)
+        return result
 
 
 class SmolLM2Decoder(nn.Module):
@@ -229,33 +231,39 @@ class SmolLM2Decoder(nn.Module):
             self.model.resize_token_embeddings(len(self.tokenizer))
             with torch.no_grad():
                 embeddings = self.model.get_input_embeddings()
-                embeddings.weight[-1] = embeddings.weight[:-1].mean(dim=0)
+                if embeddings is not None and hasattr(embeddings, 'weight'):
+                    embedding_weight = embeddings.weight
+                    embedding_weight[-1] = embedding_weight[:-1].mean(dim=0)
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
         if config.use_lora:
             lora_config = LoraConfig(
                 r=config.lora_r,
                 lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
+                target_modules=list(config.lora_target_modules) if config.lora_target_modules else None,
                 lora_dropout=config.lora_dropout,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM,
             )
             self.model = get_peft_model(self.model, lora_config)
-            self.model.print_trainable_parameters()
+            if hasattr(self.model, 'print_trainable_parameters'):
+                self.model.print_trainable_parameters()
 
 
 class ASRModel(nn.Module):
-    def __init__(self, conformer_cfg, smollm2_cfg, proj_cfg):
+    def __init__(self, conformer_cfg: ConformerConfig, smollm2_cfg: SmolLM2Config, 
+                 proj_cfg: ProjectorConfig) -> None:
         super().__init__()
         self.encoder = ConformerEncoder(conformer_cfg)
         self.decoder = SmolLM2Decoder(smollm2_cfg)
-        text_dim = self.decoder.model.config.hidden_size
+        text_dim = getattr(self.decoder.model.config, 'hidden_size', 768)
         self.audio_projector = LightweightAudioProjector(
             conformer_cfg.d_model, text_dim, proj_cfg
         )
         self.spec_augment = SpecAugment()
 
-    def forward(self, input_values, input_lengths, labels=None, attention_mask=None):
+    def forward(self, input_values: torch.Tensor, input_lengths: torch.Tensor, 
+                labels: Optional[torch.Tensor] = None, 
+                attention_mask: Optional[torch.Tensor] = None) -> Any:
         if self.training:
             input_values = self.spec_augment(input_values)
 
@@ -263,7 +271,7 @@ class ASRModel(nn.Module):
         audio_prefix = self.audio_projector(audio_features)
 
         embeddings = self.decoder.model.get_input_embeddings()
-        text_embeds = embeddings(labels)
+        text_embeds = embeddings(labels) if callable(embeddings) else embeddings.forward(labels)
         combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
 
         audio_mask = torch.ones(
@@ -274,14 +282,15 @@ class ASRModel(nn.Module):
         else:
             combined_attention_mask = audio_mask
 
-        return self.decoder.model(
+        return self.decoder.model.forward(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attention_mask,
             labels=labels,
         )
 
     @torch.inference_mode()
-    def generate(self, input_values, input_lengths, **kwargs):
+    def generate(self, input_values: torch.Tensor, input_lengths: torch.Tensor, 
+                 **kwargs: Any) -> torch.Tensor:
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
@@ -290,12 +299,12 @@ class ASRModel(nn.Module):
 class AudioDataProcessor:
     def __init__(
         self,
-        tokenizer,
-        sample_rate=16000,
-        n_mels=80,
-        max_audio_seconds=None,
-        max_text_words=None,
-    ):
+        tokenizer: Any,
+        sample_rate: int = 16000,
+        n_mels: int = 80,
+        max_audio_seconds: Optional[float] = None,
+        max_text_words: Optional[int] = None,
+    ) -> None:
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         self.max_audio_seconds = max_audio_seconds
@@ -309,10 +318,10 @@ class AudioDataProcessor:
         )
         self.amp_to_db = T.AmplitudeToDB(stype="magnitude", top_db=80)
 
-    def _normalize_text(self, text):
+    def _normalize_text(self, text: str) -> str:
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def process_sample(self, sample):
+    def process_sample(self, sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             audio_array = np.array(sample["audio"]["array"], dtype=np.float32)
             if self.max_audio_seconds and (
@@ -381,7 +390,7 @@ class TrainingConfig:
     hub_model_id: str = "mazesmazes/asr"  # Your HF repository
     hub_private: bool = False  # Public repository
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # Adjust batch sizes based on available GPUs and VRAM
         if os.environ.get("RUNPOD_POD_ID"):
             gpu_count = torch.cuda.device_count()
@@ -419,7 +428,7 @@ class TrainingConfig:
                 )
 
 
-def train_with_accelerate():
+def train_with_accelerate() -> None:
     # Initialize configs
     conformer_cfg = ConformerConfig()
     smollm2_cfg = SmolLM2Config()
@@ -466,14 +475,14 @@ def train_with_accelerate():
                 "(mode='max-autotune' for A100)..."
             )
         # Type ignore for torch.compile as it returns a callable wrapper
-        model.encoder = torch.compile(  # type: ignore
+        model.encoder = torch.compile(
             model.encoder, mode="max-autotune"
         )
-        model.audio_projector = torch.compile(  # type: ignore
+        model.audio_projector = torch.compile(
             model.audio_projector, mode="max-autotune"
         )
         # Decoder compilation with reduced overhead
-        model.decoder.model = torch.compile(  # type: ignore
+        model.decoder.model = torch.compile(
             model.decoder.model, mode="reduce-overhead"
         )
         if accelerator.is_main_process:
@@ -486,7 +495,7 @@ def train_with_accelerate():
         max_text_words=150,  # Can handle longer sequences
     )
 
-    def preprocess_function(examples):
+    def preprocess_function(examples: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return processor.process_sample(examples)
 
     if accelerator.is_main_process:
@@ -535,7 +544,7 @@ def train_with_accelerate():
     collator = DataCollator(tokenizer)
 
     train_dataloader = DataLoader(
-        train_dataset.with_format("torch"),  # type: ignore
+        train_dataset.with_format("torch"), 
         batch_size=training_cfg.per_device_train_batch_size,
         shuffle=True,
         collate_fn=collator,
@@ -546,7 +555,7 @@ def train_with_accelerate():
     )
 
     val_dataloader = DataLoader(
-        val_dataset.with_format("torch"),  # type: ignore
+        val_dataset.with_format("torch"), 
         batch_size=training_cfg.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
@@ -718,7 +727,7 @@ def train_with_accelerate():
                     )
 
                     # Early stopping check
-                    if wer_score is not None and wer_score < best_wer:
+                    if wer_score is not None and float(wer_score) < best_wer:
                         best_wer = wer_score
                         patience_counter = 0
                         # Save best model
@@ -844,7 +853,8 @@ speech recognition.
                 print(f"⚠️  Failed to upload to Hugging Face Hub: {e}")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Main entry point for the training script."""
     # Parse command line arguments for RunPod
     parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
     parser.add_argument(
@@ -882,3 +892,7 @@ if __name__ == "__main__":
         TrainingConfig.per_device_eval_batch_size = args.batch_size
 
     train_with_accelerate()
+
+
+if __name__ == "__main__":
+    main()
