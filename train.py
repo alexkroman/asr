@@ -9,10 +9,6 @@
 import argparse
 import math
 import os
-import re
-import warnings
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union, cast, Tuple
 
 # Set Hugging Face cache directory to /workspace BEFORE importing any HF libraries
 os.environ["HF_HOME"] = "/workspace"
@@ -20,9 +16,19 @@ os.environ["HF_DATASETS_CACHE"] = "/workspace/datasets"
 os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hub"
 os.environ["XDG_CACHE_HOME"] = "/workspace"  # Some libraries use this as fallback
 
+# Optimize data downloading
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Use faster hf_transfer for downloads
+os.environ["HF_DATASETS_DOWNLOAD_MANAGER_MAX_WORKERS"] = "8"  # Parallel downloads
+
+import re
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union, cast, Tuple
+
+# Import torch early to check for GPU
+import torch
 import evaluate
 import numpy as np
-import torch
 import torch.nn as nn
 import torchaudio.models as T_models
 import torchaudio.transforms as T
@@ -30,7 +36,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from einops import rearrange
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
@@ -42,27 +48,11 @@ from transformers import (
 
 warnings.filterwarnings("ignore")
 logging.set_verbosity_error()
-
-# Detect environment and set paths accordingly
-if os.environ.get("RUNPOD_POD_ID"):
-    # RunPod environment
-    DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized"
-    print(f"🚀 Running on RunPod (Pod ID: {os.environ.get('RUNPOD_POD_ID')})")
-    if torch.cuda.is_available():
-        print(f"📊 GPU Count: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-else:
-    DATA_PATH = "./ASR_Conformer_SmolLM2_Optimized"
-    print("💻 Running on local machine")
-
-# Create directories after torch import
+DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized"
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
-# OPTIMIZATION: Ensure TF32 is enabled and set CudNN to benchmark mode for
-# A100 performance.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -161,6 +151,10 @@ class SpecAugment(nn.Module):
         return x
 
 
+#
+# 🛑 REMOVE your old ConformerEncoder class.
+# ✅ REPLACE it with this new version that uses a standard nn.TransformerEncoder.
+#
 class ConformerEncoder(nn.Module):
     def __init__(self, config: ConformerConfig):
         super().__init__()
@@ -175,13 +169,21 @@ class ConformerEncoder(nn.Module):
             config.d_model * (config.n_mels // 4), config.d_model
         )
         self.dropout = nn.Dropout(config.dropout)
-        self.conformer = T_models.Conformer(
-            input_dim=config.d_model,
-            num_heads=config.n_head,
-            ffn_dim=config.d_model * 4,
-            num_layers=config.num_layers,
-            depthwise_conv_kernel_size=config.kernel_size,
+        
+        # CHANGE #1: Use torch.nn.TransformerEncoder instead of T_models.Conformer
+        # This is a more stable and standard PyTorch component.
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.n_head,
+            dim_feedforward=config.d_model * 4,
             dropout=config.dropout,
+            activation="gelu",
+            batch_first=False,  # We will feed it Time-first data
+            norm_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=config.num_layers,
         )
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
@@ -189,13 +191,22 @@ class ConformerEncoder(nn.Module):
         x = rearrange(x, "b c f t -> b t (c f)")
         x = self.input_proj(x)
         x = self.dropout(x)
-        x = x.permute(1, 0, 2)
+        x = x.permute(1, 0, 2)  # Switch to (Time, Batch, Dim) format
+
+        # CHANGE #2: Manually create the padding mask
+        # The new encoder expects a boolean mask, not a lengths tensor.
         output_lengths = input_lengths // 4
-        x, _ = self.conformer(x, output_lengths)
-        x = x.permute(1, 0, 2)
+        max_len = x.size(0) # Get the max sequence length from the time dimension
+        
+        # Create a mask of shape (Batch, Time)
+        mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        
+        # Pass the tensor and the mask to the transformer encoder
+        x = self.transformer_encoder(x, src_key_padding_mask=mask)
+        
+        x = x.permute(1, 0, 2) # Switch back to (Batch, Time, Dim)
         return x
-
-
+    
 class LightweightAudioProjector(nn.Module):
     def __init__(self, audio_dim: int, text_dim: int, config: ProjectorConfig):
         super().__init__()
@@ -228,7 +239,7 @@ class LightweightAudioProjector(nn.Module):
 class SmolLM2Decoder(nn.Module):
     def __init__(self, config: SmolLM2Config):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model: Any = AutoModelForCausalLM.from_pretrained(
             config.model_name, torch_dtype=torch.bfloat16
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -238,8 +249,10 @@ class SmolLM2Decoder(nn.Module):
             with torch.no_grad():
                 embeddings = self.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, 'weight'):
-                    embedding_weight = embeddings.weight
-                    embedding_weight[-1] = embedding_weight[:-1].mean(dim=0)
+                    # Type assertion for mypy
+                    embedding_weight: torch.nn.Parameter = embeddings.weight  # type: ignore
+                    # embedding_weight is a Parameter, we need to modify its data
+                    embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
         if config.use_lora:
             lora_config = LoraConfig(
@@ -268,56 +281,78 @@ class ASRModel(nn.Module):
         self.spec_augment = SpecAugment()
 
     def forward(self, input_values: torch.Tensor, input_lengths: torch.Tensor, 
-                labels: Optional[torch.Tensor] = None, 
-                attention_mask: Optional[torch.Tensor] = None) -> Any:
-        if self.training:
-            input_values = self.spec_augment(input_values)
+                    labels: Optional[torch.Tensor] = None, 
+                    attention_mask: Optional[torch.Tensor] = None) -> Any:
+            if self.training:
+                input_values = self.spec_augment(input_values)
 
-        audio_features = self.encoder(input_values, input_lengths)
-        audio_prefix = self.audio_projector(audio_features)
+            audio_features = self.encoder(input_values, input_lengths)
+            audio_prefix = self.audio_projector(audio_features)
 
-        embeddings = self.decoder.model.get_input_embeddings()
-        text_embeds = embeddings(labels) if callable(embeddings) else embeddings.forward(labels)
-        combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
+            # This part remains the same
+            embeddings = self.decoder.model.get_input_embeddings()
+            text_embeds = embeddings(labels) if callable(embeddings) else embeddings.forward(labels)
+            combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
 
-        audio_mask = torch.ones(
-            audio_prefix.shape[:2], dtype=torch.long, device=input_values.device
-        )
-        if attention_mask is not None:
-            combined_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
-        else:
-            combined_attention_mask = audio_mask
+            audio_mask = torch.ones(
+                audio_prefix.shape[:2], dtype=torch.long, device=input_values.device
+            )
+            if attention_mask is not None:
+                combined_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+            else:
+                combined_attention_mask = audio_mask
 
-        return self.decoder.model.forward(
-            inputs_embeds=combined_embeds,
-            attention_mask=combined_attention_mask,
-            labels=labels,
-        )
+            # ✅ FIX: Construct a new labels tensor that aligns with the combined input
+            if labels is not None:
+                # Create a tensor of -100s (the ignore_index) with the same shape as the audio prefix
+                prefix_labels = torch.full(
+                    audio_prefix.shape[:2], 
+                    fill_value=-100,
+                    dtype=labels.dtype,
+                    device=labels.device
+                )
+                
+                # Concatenate the ignore prefix with the real text labels
+                combined_labels = torch.cat([prefix_labels, labels], dim=1)
+            else:
+                combined_labels = None
+
+            # Pass the correctly shaped labels to the model
+            return self.decoder.model.forward(
+                inputs_embeds=combined_embeds,
+                attention_mask=combined_attention_mask,
+                labels=combined_labels,
+            )
+
 
     @torch.inference_mode()
-    def generate(self, input_values: torch.Tensor, input_lengths: torch.Tensor, 
-                 **kwargs: Any) -> torch.Tensor:
+    def generate(self, input_values: torch.Tensor, input_lengths: torch.Tensor,
+                 **kwargs: Any) -> Any:
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
 
+#
+# ✅ NEW: UnifiedDataCollator replaces the old AudioDataProcessor and DataCollator
+#
+@dataclass
+class UnifiedDataCollator:
+    """
+    A unified data collator that performs all preprocessing steps on-the-fly.
+    This includes filtering, feature extraction (spectrograms), text normalization,
+    and batch padding for both audio and text.
+    """
+    tokenizer: Any
+    sample_rate: int = 16000
+    n_mels: int = 80
+    max_audio_seconds: float = 20.0
+    max_text_words: int = 150
 
-class AudioDataProcessor:
-    def __init__(
-        self,
-        tokenizer: Any,
-        sample_rate: int = 16000,
-        n_mels: int = 80,
-        max_audio_seconds: Optional[float] = None,
-        max_text_words: Optional[int] = None,
-    ) -> None:
-        self.tokenizer = tokenizer
-        self.sample_rate = sample_rate
-        self.max_audio_seconds = max_audio_seconds
-        self.max_text_words = max_text_words
+    def __post_init__(self):
+        # Initialize audio transforms once
         self.mel_transform = T.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_mels=n_mels,
+            sample_rate=self.sample_rate,
+            n_mels=self.n_mels,
             n_fft=512,
             win_length=400,
             hop_length=160,
@@ -325,48 +360,49 @@ class AudioDataProcessor:
         self.amp_to_db = T.AmplitudeToDB(stype="magnitude", top_db=80)
 
     def _normalize_text(self, text: str) -> str:
+        # Simple text normalization
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def process_sample(self, sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            audio_array = np.array(sample["audio"]["array"], dtype=np.float32)
-            if self.max_audio_seconds and (
-                len(audio_array) / self.sample_rate > self.max_audio_seconds
-            ):
-                return None
-            clean_text = self._normalize_text(sample["text"])
-            if self.max_text_words and (len(clean_text.split()) > self.max_text_words):
-                return None
-            spec = self.mel_transform(torch.from_numpy(audio_array))
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Step 1: Filter samples that are too long
+        valid_features = []
+        for f in features:
+            try:
+                audio_len_sec = len(f["audio"]["array"]) / self.sample_rate
+                text_len_words = len(self._normalize_text(f["text"]).split())
+                if (audio_len_sec <= self.max_audio_seconds and
+                    text_len_words <= self.max_text_words):
+                    valid_features.append(f)
+            except Exception:
+                # Skip samples with processing errors
+                continue
+        
+        # If the entire batch is filtered out, return an empty dictionary
+        if not valid_features:
+            return {}
+
+        # Step 2: Process audio to spectrograms and normalize texts
+        specs, texts = [], []
+        for f in valid_features:
+            audio_array = torch.from_numpy(np.array(f["audio"]["array"], dtype=np.float32))
+            spec = self.mel_transform(audio_array)
             spec_db = self.amp_to_db(spec)
             spec_norm = (spec_db - spec_db.mean()) / (spec_db.std() + 1e-8)
-            # The map function needs serializable outputs
-            return {"spectrogram": spec_norm.numpy(), "text": clean_text}
-        except Exception:
-            return None
+            specs.append(spec_norm)
+            texts.append(self._normalize_text(f["text"]))
 
-
-@dataclass
-class DataCollator:
-    tokenizer: Any
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Convert numpy arrays back to tensors
-        specs = [torch.from_numpy(f["spectrogram"]) for f in features]
-        texts = [f["text"] for f in features]
-
+        # Step 3: Pad spectrograms to the same length within the batch
         input_lengths = torch.tensor([s.shape[1] for s in specs], dtype=torch.long)
-
         specs_transposed = [s.transpose(0, 1) for s in specs]
         padded_specs = torch.nn.utils.rnn.pad_sequence(
             specs_transposed, batch_first=True
-        )
-        padded_specs = padded_specs.permute(0, 2, 1)
+        ).permute(0, 2, 1)
 
+        # Step 4: Tokenize and pad text labels
         labels = self.tokenizer(
             texts, padding="longest", truncation=True, return_tensors="pt"
         )
-
+        
         return {
             "input_values": padded_specs,
             "input_lengths": input_lengths,
@@ -465,14 +501,19 @@ def train_with_accelerate() -> None:
     model = ASRModel(conformer_cfg, smollm2_cfg, proj_cfg)
     tokenizer = model.decoder.tokenizer
 
-    # Enable gradient checkpointing for memory efficiency with large batches
     if training_cfg.gradient_checkpointing:
-        if hasattr(model.encoder.conformer, "gradient_checkpointing_enable"):
-            model.encoder.conformer.gradient_checkpointing_enable()
+        if hasattr(model.encoder, "transformer_encoder"):
+            # Note: nn.TransformerEncoder doesn't have a `.gradient_checkpointing_enable()` method.
+            # This check will correctly prevent an error. For full activation,
+            # you'd typically apply checkpointing to the layers individually.
+            pass # The new encoder doesn't support this specific method call.
+
         if hasattr(model.decoder.model, "gradient_checkpointing_enable"):
             model.decoder.model.gradient_checkpointing_enable()
+            
         if accelerator.is_main_process:
             print("✅ Gradient checkpointing enabled for memory efficiency")
+            
     # Compile model components for A100 (works with gradient checkpointing)
     if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
         if accelerator.is_main_process:
@@ -480,94 +521,49 @@ def train_with_accelerate() -> None:
                 "🚀 Compiling model with torch.compile "
                 "(mode='max-autotune' for A100)..."
             )
-        # Type ignore for torch.compile as it returns a callable wrapper
-        model.encoder = torch.compile(
-            model.encoder, mode="max-autotune"
-        )
-        model.audio_projector = torch.compile(
-            model.audio_projector, mode="max-autotune"
-        )
-        # Decoder compilation with reduced overhead
-        model.decoder.model = torch.compile(
-            model.decoder.model, mode="reduce-overhead"
-        )
+        model.encoder = torch.compile(model.encoder, mode="max-autotune") # type: ignore
+        model.audio_projector = torch.compile(model.audio_projector, mode="max-autotune") # type: ignore
+        model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead") # type: ignore
         if accelerator.is_main_process:
             print("✅ Model compilation complete with A100 optimizations")
 
-    # Data processing - optimize for A100 memory capacity
-    processor = AudioDataProcessor(
-        tokenizer,
-        max_audio_seconds=20.0,
-        max_text_words=150,  # Can handle longer sequences
-    )
-
-    def preprocess_function(examples: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return processor.process_sample(examples)
-
-    if accelerator.is_main_process:
-        print("Loading and preprocessing datasets...")
-
+    # ✅ Load raw datasets directly without any mapping or filtering
     train_dataset = load_dataset("librispeech_asr", "clean", split="train.100",
-                                 cache_dir="/workspace/datasets")
+                                 cache_dir="/workspace/datasets",
+                                 num_proc=8)
     val_dataset = load_dataset("librispeech_asr", "clean", split="validation",
-                               cache_dir="/workspace/datasets")
+                               cache_dir="/workspace/datasets",
+                               num_proc=8)
 
-    # Preprocess datasets
-    with accelerator.main_process_first():
-        # Get column names for removal
-        train_columns = (
-            list(train_dataset.column_names)
-            if hasattr(train_dataset, "column_names")
-            else []
-        )
-        train_dataset = train_dataset.map(
-            preprocess_function,
-            num_proc=8 if accelerator.num_processes == 1 else 1,
-            # Use all 8 vCPUs
-            remove_columns=train_columns,
-            batch_size=100,  # Process in larger batches
-        ).filter(lambda x: x["spectrogram"] is not None)
-
-        # Get column names for removal
-        val_columns = (
-            list(val_dataset.column_names)
-            if hasattr(val_dataset, "column_names")
-            else []
-        )
-        val_dataset = val_dataset.map(
-            preprocess_function,
-            num_proc=8 if accelerator.num_processes == 1 else 1,
-            # Use all 8 vCPUs
-            remove_columns=val_columns,
-            batch_size=100,  # Process in larger batches
-        ).filter(lambda x: x["spectrogram"] is not None)
-
+    # Reset default device after loading
+    if torch.cuda.is_available():
+        torch.set_default_device(None)
+        
     if accelerator.is_main_process:
-        print(
-            f"✅ Datasets ready. Train: {len(train_dataset)}, "
-            f"Val: {len(val_dataset)}"
-        )
+        print(f"✅ Raw datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+        print("Preprocessing will be done on-the-fly by the data collator.")
 
-    # Create data collator and loaders
-    collator = DataCollator(tokenizer)
+    # ✅ Instantiate the new, unified collator
+    collator = UnifiedDataCollator(tokenizer)
 
+    # ✅ Create data loaders with the raw datasets and the new collator
     train_dataloader = DataLoader(
-        train_dataset.with_format("torch"), 
+        train_dataset,
         batch_size=training_cfg.per_device_train_batch_size,
         shuffle=True,
         collate_fn=collator,
-        num_workers=8,  # Use all 8 vCPUs
+        num_workers=2,
         pin_memory=True,
-        prefetch_factor=4,  # Prefetch more batches
-        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=4,
+        persistent_workers=True,
     )
 
     val_dataloader = DataLoader(
-        val_dataset.with_format("torch"), 
+        val_dataset,
         batch_size=training_cfg.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=8,  # Use all 8 vCPUs
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
@@ -581,7 +577,7 @@ def train_with_accelerate() -> None:
         weight_decay=training_cfg.weight_decay,
         betas=(0.9, 0.999),
         eps=1e-8,
-        fused=use_fused,  # Use fused optimizer on A100
+        fused=use_fused,
     )
     if use_fused and accelerator.is_main_process:
         print("✅ Using fused AdamW optimizer for A100")
@@ -642,8 +638,11 @@ def train_with_accelerate() -> None:
 
     for epoch in range(math.ceil(num_training_steps / len(train_dataloader))):
         for batch in train_dataloader:
+            # If the collator returned an empty batch, skip it
+            if not batch:
+                continue
+
             with accelerator.accumulate(model):
-                # Forward pass
                 outputs = model(
                     input_values=batch["input_values"],
                     input_lengths=batch["input_lengths"],
@@ -652,17 +651,12 @@ def train_with_accelerate() -> None:
                 )
                 loss = outputs.loss
 
-                # Backward pass
                 accelerator.backward(loss)
-
-                # Gradient clipping
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Logging
             if global_step % training_cfg.logging_steps == 0:
                 accelerator.log(
                     {
@@ -673,7 +667,6 @@ def train_with_accelerate() -> None:
                     step=global_step,
                 )
 
-            # Evaluation
             if global_step % training_cfg.eval_steps == 0 and global_step > 0:
                 model.eval()
                 val_loss = 0
@@ -686,6 +679,9 @@ def train_with_accelerate() -> None:
                         desc="Evaluating",
                         disable=not accelerator.is_local_main_process,
                     ):
+                        if not val_batch:
+                            continue
+                        
                         outputs = model(
                             input_values=val_batch["input_values"],
                             input_lengths=val_batch["input_lengths"],
@@ -694,7 +690,6 @@ def train_with_accelerate() -> None:
                         )
                         val_loss += outputs.loss.item()
 
-                        # Generate predictions
                         generated_ids = accelerator.unwrap_model(model).generate(
                             input_values=val_batch["input_values"],
                             input_lengths=val_batch["input_lengths"],
@@ -704,7 +699,6 @@ def train_with_accelerate() -> None:
                             eos_token_id=tokenizer.eos_token_id,
                         )
 
-                        # Decode predictions and references
                         predictions = tokenizer.batch_decode(
                             generated_ids, skip_special_tokens=True
                         )
@@ -715,8 +709,7 @@ def train_with_accelerate() -> None:
                         all_predictions.extend(predictions)
                         all_references.extend(references)
 
-                # Calculate WER
-                avg_val_loss = val_loss / len(val_dataloader)
+                avg_val_loss = val_loss / len(val_dataloader) if len(val_dataloader) > 0 else 0
                 wer_score = wer_metric.compute(
                     predictions=all_predictions, references=all_references
                 )
@@ -727,32 +720,24 @@ def train_with_accelerate() -> None:
                         f"WER: {wer_score:.4f}"
                     )
                     accelerator.log(
-                        {
-                            "val_loss": avg_val_loss,
-                            "wer": wer_score,
-                        },
+                        {"val_loss": avg_val_loss, "wer": wer_score},
                         step=global_step,
                     )
 
-                    # Early stopping check
                     if wer_score is not None and float(wer_score) < best_wer:
                         best_wer = wer_score
                         patience_counter = 0
-                        # Save best model
                         accelerator.save_state(f"{training_cfg.output_dir}/best_model")
                         print(f"✅ New best WER: {best_wer:.4f}. Model saved.")
                     else:
                         patience_counter += 1
                         if patience_counter >= early_stopping_patience:
                             print(
-                                f"Early stopping triggered. "
-                                f"Best WER: {best_wer:.4f}"
+                                f"Early stopping triggered. Best WER: {best_wer:.4f}"
                             )
                             break
-
                 model.train()
 
-            # Save checkpoint
             if global_step % training_cfg.save_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
                     accelerator.save_state(
@@ -766,21 +751,15 @@ def train_with_accelerate() -> None:
             if global_step >= num_training_steps:
                 break
 
-        if (
-            global_step >= num_training_steps
-            or patience_counter >= early_stopping_patience
-        ):
+        if (global_step >= num_training_steps or 
+            patience_counter >= early_stopping_patience):
             break
 
-    # End training
     accelerator.end_training()
 
     if accelerator.is_main_process:
         print(f"\n✅ Training completed! Best WER: {best_wer:.4f}")
-        # Save final model
         accelerator.save_state(f"{training_cfg.output_dir}/final_model")
-
-        # Save model in Hugging Face format
         unwrapped_model = accelerator.unwrap_model(model)
         save_path = f"{DATA_PATH}/models/final_model"
         unwrapped_model.save_pretrained(
@@ -791,17 +770,12 @@ def train_with_accelerate() -> None:
         tokenizer.save_pretrained(save_path)
         print(f"✅ Model saved to {save_path}")
 
-        # Push to Hugging Face Hub if configured
         if training_cfg.push_to_hub and hf_write_token:
             try:
                 from huggingface_hub import HfApi
 
                 api = HfApi(token=hf_write_token)
-
-                # Use the hub_model_id directly (already includes username)
                 repo_id = training_cfg.hub_model_id
-
-                # Upload model and tokenizer (assumes repo already exists)
                 print(f"📤 Uploading model to Hugging Face Hub: {repo_id}")
                 api.upload_folder(
                     folder_path=save_path,
@@ -809,8 +783,6 @@ def train_with_accelerate() -> None:
                     repo_type="model",
                     token=hf_write_token,
                 )
-
-                # Create model card
                 model_card = f"""---
 language: en
 license: apache-2.0
@@ -835,19 +807,15 @@ model-index:
     - type: wer
       value: {best_wer:.4f}
 ---
-
 # Conformer-SmolLM2 ASR Model
-
 This model combines a Conformer encoder with SmolLM2 decoder for automatic
 speech recognition.
-
 ## Training Details
 - **Dataset**: LibriSpeech train-clean-100
 - **Best WER**: {best_wer:.4f}
-- **Training Device**: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}  # noqa: E501
+- **Training Device**: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}
 - **GPU Count**: {torch.cuda.device_count()}
 """
-
                 api.upload_file(
                     path_or_fileobj=model_card.encode(),
                     path_in_repo="README.md",
@@ -855,7 +823,6 @@ speech recognition.
                     repo_type="model",
                     token=hf_write_token,
                 )
-
                 print(f"✅ Model uploaded to: https://huggingface.co/{repo_id}")
             except Exception as e:
                 print(f"⚠️  Failed to upload to Hugging Face Hub: {e}")
@@ -863,7 +830,6 @@ speech recognition.
 
 def main() -> None:
     """Main entry point for the training script."""
-    # Parse command line arguments for RunPod
     parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
     parser.add_argument(
         "--push-to-hub", action="store_true", help="Push model to Hugging Face Hub"
@@ -883,10 +849,10 @@ def main() -> None:
     parser.add_argument(
         "--batch-size", type=int, default=None, help="Override automatic batch size"
     )
-
     args = parser.parse_args()
 
     # Override config with command line arguments
+    # Note: Using class attributes directly for simplicity in this script
     if args.push_to_hub:
         TrainingConfig.push_to_hub = True
     if args.hub_model_id:

@@ -1,3 +1,13 @@
 #!/bin/bash
-scp -P 46885 -i ~/.ssh/id_ed25519 train.py root@62.169.158.26:/workspace/
-scp -P 46885 -i ~/.ssh/id_ed25519 requirements.txt root@62.169.158.26:/workspace/
+
+# SSH Configuration
+SSH_HOST="69.30.85.23"
+SSH_PORT="22101"
+SSH_USER="root"
+SSH_KEY="~/.ssh/id_ed25519"
+REMOTE_PATH="/workspace/"
+
+# Copy files to remote server
+scp -P ${SSH_PORT} -i ${SSH_KEY} train.py ${SSH_USER}@${SSH_HOST}:${REMOTE_PATH}
+scp -P ${SSH_PORT} -i ${SSH_KEY} requirements.txt ${SSH_USER}@${SSH_HOST}:${REMOTE_PATH}
+scp -P ${SSH_PORT} -i ${SSH_KEY} install_dependencies.sh ${SSH_USER}@${SSH_HOST}:${REMOTE_PATH}

@@ -19,9 +19,11 @@ fsspec
 gitdb
 GitPython
 grpcio
+hf-transfer
 hf-xet
 huggingface-hub
 idna
+jiwer
 Jinja2
 Markdown
 MarkupSafe
@@ -54,6 +56,7 @@ safetensors
 sentencepiece
 sentry-sdk
 six
+soundfile
 smmap
 sympy
 tensorboard
@@ -61,6 +64,7 @@ tensorboard-data-server
 tokenizers
 torch
 torchaudio
+torchcodec
 torchvision
 tqdm
 transformers
