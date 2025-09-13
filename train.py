@@ -150,11 +150,6 @@ class SpecAugment(nn.Module):
             x = time_mask(x)
         return x
 
-
-#
-# 🛑 REMOVE your old ConformerEncoder class.
-# ✅ REPLACE it with this new version that uses a standard nn.TransformerEncoder.
-#
 class ConformerEncoder(nn.Module):
     def __init__(self, config: ConformerConfig):
         super().__init__()
@@ -170,8 +165,6 @@ class ConformerEncoder(nn.Module):
         )
         self.dropout = nn.Dropout(config.dropout)
         
-        # CHANGE #1: Use torch.nn.TransformerEncoder instead of T_models.Conformer
-        # This is a more stable and standard PyTorch component.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.n_head,
