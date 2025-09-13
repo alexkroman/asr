@@ -14,13 +14,19 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, cast, Tuple
 
+# Set Hugging Face cache directory to /workspace BEFORE importing any HF libraries
+os.environ["HF_HOME"] = "/workspace"
+os.environ["HF_DATASETS_CACHE"] = "/workspace/datasets"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hub"
+os.environ["XDG_CACHE_HOME"] = "/workspace"  # Some libraries use this as fallback
+
 import evaluate
 import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio.models as T_models
 import torchaudio.transforms as T
-from accelerate import Accelerator 
+from accelerate import Accelerator
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from einops import rearrange
@@ -501,8 +507,10 @@ def train_with_accelerate() -> None:
     if accelerator.is_main_process:
         print("Loading and preprocessing datasets...")
 
-    train_dataset = load_dataset("librispeech_asr", "clean", split="train.100")
-    val_dataset = load_dataset("librispeech_asr", "clean", split="validation")
+    train_dataset = load_dataset("librispeech_asr", "clean", split="train.100",
+                                 cache_dir="/workspace/datasets")
+    val_dataset = load_dataset("librispeech_asr", "clean", split="validation",
+                               cache_dir="/workspace/datasets")
 
     # Preprocess datasets
     with accelerator.main_process_first():

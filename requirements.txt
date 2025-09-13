@@ -71,7 +71,6 @@ typing_extensions
 mypy
 types-PyYAML
 types-setuptools
-torch-stubs
 tzdata
 urllib3
 wandb
