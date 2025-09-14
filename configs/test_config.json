@@ -24,7 +24,7 @@
   "max_audio_seconds": 10.0,
   "max_text_words": 50,
   "sample_rate": 16000,
-  "dataset_cache_dir": "~/datasets",
+  "dataset_cache_dir": "./datasets_cache",
   "num_proc": 1,
 
   "output_dir": "./test_output",

@@ -12,8 +12,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple, cast
 
 # Minimal environment setup - Accelerate handles the rest
-os.environ["HF_HOME"] = "/workspace"
-os.environ["HF_DATASETS_CACHE"] = "/workspace/datasets"
+# Use local directories if /workspace doesn't exist (e.g., on Mac)
+import os
+workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
+os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
+os.environ["HF_DATASETS_CACHE"] = os.environ.get("HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets"))
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import torch
@@ -38,38 +41,19 @@ from accelerate import Accelerator
 warnings.filterwarnings("ignore")
 logging.set_verbosity_error()
 
-# Data path for outputs
-DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized"
+# Data path for outputs - use local directory on Mac
+DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized" if os.path.exists("/workspace") else "./ASR_output"
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
-# Initialize Accelerator - it will handle all hardware optimization
-accelerator = Accelerator()
+# Accelerator will be initialized in main function
 
 # Handle Hugging Face authentication
 hf_write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
 hf_read_token = os.environ.get("HF_READ_TOKEN")
 
-if hf_read_token:
-    from huggingface_hub import login
-    login(token=hf_read_token)
-    if accelerator.is_main_process:
-        print("✅ Logged in to Hugging Face Hub with read token")
-elif hf_write_token:
-    from huggingface_hub import login
-    login(token=hf_write_token)
-    if accelerator.is_main_process:
-        print("✅ Logged in to Hugging Face Hub with write token")
-else:
-    if accelerator.is_main_process:
-        print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
-
-# Optional: Setup WandB if available
-if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
-    import wandb
-    wandb.login(key=os.environ.get("WANDB_API_KEY"))
-    print("✅ Logged in to Weights & Biases")
+# Authentication will be handled in main function
 
 
 @dataclass
@@ -281,7 +265,7 @@ class SmolLM2Decoder(nn.Module):
                 task_type=TaskType.CAUSAL_LM,
             )
             self.model = get_peft_model(self.model, lora_config)
-            if hasattr(self.model, "print_trainable_parameters") and accelerator.is_main_process:
+            if hasattr(self.model, "print_trainable_parameters"):
                 self.model.print_trainable_parameters()
 
 
@@ -388,7 +372,7 @@ class DataCollator:
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def __call__(self, features: List[Dict[str, Union[str, Dict[str, Union[str, List[float]]]]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: List[Dict[str, Union[str, Dict]]]) -> Dict[str, torch.Tensor]:
         # Filter samples that are too long
         valid_features = []
         for f in features:
@@ -471,7 +455,7 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
     return {"wer": wer if wer is not None else 0.0}
 
 
-def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, TrainingArguments]:
+def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArguments, DataArguments, TrainingArguments]:
     """Parse configuration from JSON file."""
     import os
     import sys
@@ -512,7 +496,7 @@ def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, Train
     return model_args, data_args, training_args
 
 
-def initialize_model(model_args: ModelArguments) -> Tuple[ASRModel, AutoTokenizer]:
+def initialize_model(model_args: ModelArguments, accelerator: Accelerator) -> Tuple[ASRModel, AutoTokenizer]:
     """Initialize the ASR model and tokenizer."""
     if accelerator.is_main_process:
         print("🚀 Initializing model and tokenizer...")
@@ -528,7 +512,13 @@ def initialize_model(model_args: ModelArguments) -> Tuple[ASRModel, AutoTokenize
                 print("✅ Gradient checkpointing enabled")
 
     # Model compilation with torch.compile (if supported)
-    if torch.__version__ >= "2.0.0" and accelerator.state.distributed_type == "NO":
+    # Skip compilation on distributed training
+    try:
+        is_distributed = accelerator.num_processes > 1
+    except:
+        is_distributed = False
+
+    if torch.__version__ >= "2.0.0" and not is_distributed:
         if accelerator.is_main_process:
             print("🚀 Compiling model with torch.compile...")
         model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
@@ -538,7 +528,7 @@ def initialize_model(model_args: ModelArguments) -> Tuple[ASRModel, AutoTokenize
 
     return model, tokenizer
 
-def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
+def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
@@ -599,7 +589,7 @@ def setup_trainer(
 
     return trainer
 
-def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: TrainingArguments) -> None:
+def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: TrainingArguments, accelerator: Accelerator) -> None:
     """Run the training and save the model."""
     # Start training
     if accelerator.is_main_process:
@@ -629,6 +619,30 @@ def main() -> None:
     """Main training function - simplified with Accelerate."""
     import sys
 
+    # Initialize Accelerator
+    accelerator = Accelerator()
+
+    # Handle Hugging Face authentication
+    if hf_read_token:
+        from huggingface_hub import login
+        login(token=hf_read_token)
+        if accelerator.is_main_process:
+            print("✅ Logged in to Hugging Face Hub with read token")
+    elif hf_write_token:
+        from huggingface_hub import login
+        login(token=hf_write_token)
+        if accelerator.is_main_process:
+            print("✅ Logged in to Hugging Face Hub with write token")
+    else:
+        if accelerator.is_main_process:
+            print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
+
+    # Optional: Setup WandB if available
+    if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
+        import wandb
+        wandb.login(key=os.environ.get("WANDB_API_KEY"))
+        print("✅ Logged in to Weights & Biases")
+
     # Require a config file to be provided
     if len(sys.argv) < 2 or sys.argv[1] != "--config":
         print("❌ Error: Config file is required!")
@@ -645,13 +659,13 @@ def main() -> None:
     config_file = sys.argv[2]
 
     # Parse configuration
-    model_args, data_args, training_args = parse_config(config_file)
+    model_args, data_args, training_args = parse_config(config_file, accelerator)
 
     # Initialize model
-    model, tokenizer = initialize_model(model_args)
+    model, tokenizer = initialize_model(model_args, accelerator)
 
     # Load datasets
-    train_dataset, val_dataset = load_datasets(data_args)
+    train_dataset, val_dataset = load_datasets(data_args, accelerator)
 
     # Setup trainer
     trainer = setup_trainer(
@@ -665,7 +679,7 @@ def main() -> None:
     )
 
     # Run training
-    run_training(trainer, tokenizer, training_args)
+    run_training(trainer, tokenizer, training_args, accelerator)
 
 
 if __name__ == "__main__":

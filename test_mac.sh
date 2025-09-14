@@ -29,7 +29,7 @@ echo "🏃 Running training with test configuration..."
 echo "----------------------------------------------"
 
 # Run with accelerate using the Mac config
-accelerate launch --config_file accelerate_config_mac.yaml train.py --config test_config.json
+accelerate launch --config_file accelerate_configs/accelerate_config_mac.yaml train.py --config configs/test_config.json
 
 echo ""
 echo "✅ Test complete!"

@@ -4,7 +4,7 @@ This setup allows you to test the ASR training pipeline on your Mac with minimal
 
 ## Configuration Files
 
-### 1. `test_config.json`
+### 1. `configs/test_config.json`
 A minimal configuration for testing that:
 - Uses tiny model sizes (128 d_model, 2 layers, 4 attention heads)
 - Uses the smallest SmolLM2 model (135M parameters)
@@ -13,7 +13,7 @@ A minimal configuration for testing that:
 - Saves checkpoints every 20 steps
 - Evaluates every 10 steps
 
-### 2. `accelerate_config_mac.yaml`
+### 2. `accelerate_configs/accelerate_config_mac.yaml`
 Accelerate configuration optimized for Mac:
 - Single machine, single process
 - No distributed training
@@ -47,7 +47,7 @@ export TOKENIZERS_PARALLELISM=false
 
 3. Run training:
 ```bash
-accelerate launch --config_file accelerate_config_mac.yaml train.py --config test_config.json
+accelerate launch --config_file accelerate_configs/accelerate_config_mac.yaml train.py --config configs/test_config.json
 ```
 
 ## Monitoring Progress
