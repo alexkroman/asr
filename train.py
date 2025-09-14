@@ -14,9 +14,13 @@ from typing import Dict, List, Optional, Union, Tuple
 
 # Minimal environment setup - Accelerate handles the rest
 # Use local directories if /workspace doesn't exist (e.g., on Mac)
-workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
+workspace_dir = (
+    "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
+)
 os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
-os.environ["HF_DATASETS_CACHE"] = os.environ.get("HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets"))
+os.environ["HF_DATASETS_CACHE"] = os.environ.get(
+    "HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets")
+)
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import torch
@@ -40,7 +44,11 @@ from accelerate import Accelerator
 warnings.filterwarnings("ignore")
 
 # Data path for outputs - use local directory on Mac
-DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized" if os.path.exists("/workspace") else "./ASR_output"
+DATA_PATH = (
+    "/workspace/ASR_Conformer_SmolLM2_Optimized"
+    if os.path.exists("/workspace")
+    else "./ASR_output"
+)
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
@@ -57,21 +65,18 @@ hf_read_token = os.environ.get("HF_READ_TOKEN")
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
     """Extended TrainingArguments with custom fields for testing."""
+
     do_generation_test: bool = field(
-        default=False,
-        metadata={"help": "Whether to test generation after training"}
+        default=False, metadata={"help": "Whether to test generation after training"}
     )
     generation_max_length: int = field(
-        default=50,
-        metadata={"help": "Maximum length for generation test"}
+        default=50, metadata={"help": "Maximum length for generation test"}
     )
     test_checkpoint_loading: bool = field(
-        default=False,
-        metadata={"help": "Whether to test checkpoint loading"}
+        default=False, metadata={"help": "Whether to test checkpoint loading"}
     )
     resume_from_checkpoint: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to checkpoint to resume training from"}
+        default=None, metadata={"help": "Path to checkpoint to resume training from"}
     )
 
 
@@ -80,13 +85,18 @@ class ModelArguments:
     """
     Unified configuration for all model components.
     """
+
     # Conformer Config
     n_mels: int = field(default=80, metadata={"help": "Number of Mel bands."})
     d_model: int = field(default=512, metadata={"help": "Dimension of the model."})
     n_head: int = field(default=8, metadata={"help": "Number of attention heads."})
     num_layers: int = field(default=12, metadata={"help": "Number of encoder layers."})
-    kernel_size: int = field(default=15, metadata={"help": "Kernel size for Conformer."})
-    conformer_dropout: float = field(default=0.1, metadata={"help": "Dropout for Conformer."})
+    kernel_size: int = field(
+        default=15, metadata={"help": "Kernel size for Conformer."}
+    )
+    conformer_dropout: float = field(
+        default=0.1, metadata={"help": "Dropout for Conformer."}
+    )
 
     # SmolLM2 Config
     decoder_model_name: str = field(
@@ -103,9 +113,15 @@ class ModelArguments:
     )
 
     # Projector Config
-    num_queries: int = field(default=24, metadata={"help": "Number of queries for projector."})
-    projector_num_heads: int = field(default=8, metadata={"help": "Number of heads for projector."})
-    projector_dropout: float = field(default=0.1, metadata={"help": "Dropout for projector."})
+    num_queries: int = field(
+        default=24, metadata={"help": "Number of queries for projector."}
+    )
+    projector_num_heads: int = field(
+        default=8, metadata={"help": "Number of heads for projector."}
+    )
+    projector_dropout: float = field(
+        default=0.1, metadata={"help": "Dropout for projector."}
+    )
 
 
 @dataclass
@@ -113,6 +129,7 @@ class DataArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
+
     dataset_name: str = field(
         default="librispeech_asr", metadata={"help": "The name of the dataset to use."}
     )
@@ -131,17 +148,13 @@ class DataArguments:
     max_text_words: int = field(
         default=150, metadata={"help": "Filter out text samples longer than this."}
     )
-    sample_rate: int = field(
-        default=16000, metadata={"help": "Audio sample rate."}
-    )
+    sample_rate: int = field(default=16000, metadata={"help": "Audio sample rate."})
     dataset_cache_dir: str = field(
         default="/workspace/datasets", metadata={"help": "Directory to cache datasets."}
     )
     num_proc: int = field(
         default=8, metadata={"help": "Number of processes for dataset loading."}
     )
-
-
 
 
 class SpecAugment(nn.Module):
@@ -303,12 +316,14 @@ class ASRModel(nn.Module):
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing for the decoder model."""
-        if hasattr(self.decoder.model, 'gradient_checkpointing_enable'):
-            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
+            self.decoder.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs
+            )
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing for the decoder model."""
-        if hasattr(self.decoder.model, 'gradient_checkpointing_disable'):
+        if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
             self.decoder.model.gradient_checkpointing_disable()
 
     def forward(
@@ -372,8 +387,9 @@ class ASRModel(nn.Module):
         )
 
         # Only return loss and logits to avoid DynamicCache padding issues
-        if hasattr(outputs, 'loss') and hasattr(outputs, 'logits'):
+        if hasattr(outputs, "loss") and hasattr(outputs, "logits"):
             from transformers.modeling_outputs import CausalLMOutputWithPast
+
             return CausalLMOutputWithPast(
                 loss=outputs.loss,
                 logits=outputs.logits,
@@ -385,7 +401,10 @@ class ASRModel(nn.Module):
 
     @torch.inference_mode()
     def generate(
-        self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs: Dict[str, Union[int, float, torch.Tensor]]
+        self,
+        input_values: torch.Tensor,
+        input_lengths: torch.Tensor,
+        **kwargs: Dict[str, Union[int, float, torch.Tensor]],
     ) -> torch.Tensor:
         # Ensure input has the same dtype as model
         model_dtype = next(self.parameters()).dtype
@@ -424,7 +443,9 @@ class DataCollator:
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def __call__(self, features: List[Dict[str, Union[str, Dict]]]) -> Dict[str, torch.Tensor]:
+    def __call__(
+        self, features: List[Dict[str, Union[str, Dict]]]
+    ) -> Dict[str, torch.Tensor]:
         # Filter samples that are too long
         valid_features = []
         for f in features:
@@ -464,9 +485,11 @@ class DataCollator:
         # Pad spectrograms to the same length within the batch
         input_lengths = torch.tensor([s.shape[1] for s in specs], dtype=torch.long)
         specs_transposed = [s.transpose(0, 1) for s in specs]
-        padded_specs = torch.nn.utils.rnn.pad_sequence(
-            specs_transposed, batch_first=True
-        ).permute(0, 2, 1).contiguous()
+        padded_specs = (
+            torch.nn.utils.rnn.pad_sequence(specs_transposed, batch_first=True)
+            .permute(0, 2, 1)
+            .contiguous()
+        )
 
         # Tokenize and pad text labels
         labels = self.tokenizer(
@@ -481,7 +504,11 @@ class DataCollator:
         }
 
 
-def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_metric: evaluate.EvaluationModule) -> Dict[str, float]:
+def compute_metrics(
+    eval_pred: EvalPrediction,
+    tokenizer: AutoTokenizer,
+    wer_metric: evaluate.EvaluationModule,
+) -> Dict[str, float]:
     """Compute metrics for ASR evaluation."""
     predictions = eval_pred.predictions
     labels = eval_pred.label_ids
@@ -506,20 +533,27 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
     decoded_labels = [label.strip().lower() for label in decoded_labels]
 
     # Filter out empty pairs to avoid WER calculation issues
-    valid_pairs = [(pred, label) for pred, label in zip(decoded_preds, decoded_labels)
-                   if label.strip()]  # Only keep pairs where label is not empty
+    valid_pairs = [
+        (pred, label)
+        for pred, label in zip(decoded_preds, decoded_labels)
+        if label.strip()
+    ]  # Only keep pairs where label is not empty
 
     if valid_pairs:
         valid_preds, valid_labels = zip(*valid_pairs)
         # Compute WER
-        wer = wer_metric.compute(predictions=list(valid_preds), references=list(valid_labels))
+        wer = wer_metric.compute(
+            predictions=list(valid_preds), references=list(valid_labels)
+        )
     else:
         wer = 1.0  # If no valid pairs, return worst possible WER
 
     return {"wer": wer if wer is not None else 0.0}
 
 
-def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
+def parse_config(
+    config_file: str, accelerator: Accelerator
+) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
     import sys
 
@@ -531,8 +565,7 @@ def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArgum
 
     try:
         model_args, data_args, training_args = parser.parse_json_file(
-            json_file=config_file,
-            allow_extra_keys=True
+            json_file=config_file, allow_extra_keys=True
         )
     except Exception as e:
         print(f"❌ Error parsing config file: {e}")
@@ -553,13 +586,17 @@ def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArgum
     # Hub settings validation
     if training_args.push_to_hub and not hf_write_token:
         if accelerator.is_main_process:
-            print("⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. Disabling hub upload.")
+            print(
+                "⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. Disabling hub upload."
+            )
         training_args.push_to_hub = False
 
     return model_args, data_args, training_args
 
 
-def initialize_model(model_args: ModelArguments, accelerator: Accelerator) -> Tuple[ASRModel, AutoTokenizer]:
+def initialize_model(
+    model_args: ModelArguments, accelerator: Accelerator
+) -> Tuple[ASRModel, AutoTokenizer]:
     """Initialize the ASR model and tokenizer."""
     if accelerator.is_main_process:
         print("🚀 Initializing model and tokenizer...")
@@ -572,7 +609,10 @@ def initialize_model(model_args: ModelArguments, accelerator: Accelerator) -> Tu
 
     return model, tokenizer
 
-def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[Dataset, Dataset]:
+
+def load_datasets(
+    data_args: DataArguments, accelerator: Accelerator
+) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
@@ -593,9 +633,12 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     )
 
     if accelerator.is_main_process:
-        print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+        print(
+            f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}"
+        )
 
     return train_dataset, val_dataset
+
 
 def setup_trainer(
     model: ASRModel,
@@ -618,7 +661,9 @@ def setup_trainer(
 
     # Setup metrics computation
     wer_metric = evaluate.load("wer")
-    compute_metrics_fn = lambda eval_pred: compute_metrics(eval_pred, tokenizer, wer_metric)
+    compute_metrics_fn = lambda eval_pred: compute_metrics(
+        eval_pred, tokenizer, wer_metric
+    )
 
     # Initialize Trainer
     trainer = Trainer(
@@ -633,8 +678,15 @@ def setup_trainer(
 
     return trainer
 
-def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTokenizer,
-                           data_collator: DataCollator, device: torch.device, num_samples: int = 10) -> None:
+
+def show_sample_predictions(
+    model: ASRModel,
+    dataset: Dataset,
+    tokenizer: AutoTokenizer,
+    data_collator: DataCollator,
+    device: torch.device,
+    num_samples: int = 10,
+) -> None:
     """Show sample predictions from the validation set."""
     model.eval()
 
@@ -657,7 +709,7 @@ def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTo
             outputs = model(
                 input_values=batch["input_values"],
                 input_lengths=batch["input_lengths"],
-                labels=batch["labels"]
+                labels=batch["labels"],
             )
 
             # Get predicted token IDs
@@ -677,7 +729,9 @@ def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTo
 
             # Calculate sample WER for display
             if true_text != "[EMPTY]":
-                sample_wer = wer_metric.compute(predictions=[pred_text], references=[true_text])
+                sample_wer = wer_metric.compute(
+                    predictions=[pred_text], references=[true_text]
+                )
                 print(f"\nSample {i} (WER: {sample_wer:.2f}):")
             else:
                 print(f"\nSample {i}:")
@@ -685,7 +739,12 @@ def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTo
             print(f"  Pred:  {pred_text}")
 
 
-def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Accelerator, max_length: int = 50) -> None:
+def test_generation(
+    model: ASRModel,
+    tokenizer: AutoTokenizer,
+    accelerator: Accelerator,
+    max_length: int = 50,
+) -> None:
     """Test the model's generation capability."""
     try:
         # Set pad token if not set
@@ -694,7 +753,9 @@ def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Acce
 
         # Create a dummy audio input with correct dtype
         model_dtype = next(model.parameters()).dtype
-        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(accelerator.device)  # (batch, n_mels, time)
+        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(
+            accelerator.device
+        )  # (batch, n_mels, time)
         dummy_lengths = torch.tensor([100]).to(accelerator.device)
 
         # Temporarily disable gradient checkpointing for generation
@@ -722,14 +783,18 @@ def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Acce
         print(f"   ⚠️ Generation test failed: {e}")
 
 
-def test_checkpoint_loading(save_path: str, model_args: ModelArguments, accelerator: Accelerator) -> None:
+def test_checkpoint_loading(
+    save_path: str, model_args: ModelArguments, accelerator: Accelerator
+) -> None:
     """Test loading a saved checkpoint."""
     try:
         # Create a new model instance
         new_model = ASRModel(model_args).to(accelerator.device)
 
         # Load the saved state dict
-        state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
+        state_dict = torch.load(
+            f"{save_path}/pytorch_model.bin", map_location=accelerator.device
+        )
         new_model.load_state_dict(state_dict)
 
         # Test that the model can do a forward pass
@@ -751,8 +816,14 @@ def test_checkpoint_loading(save_path: str, model_args: ModelArguments, accelera
         print(f"   ⚠️ Checkpoint loading test failed: {e}")
 
 
-def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: CustomTrainingArguments, accelerator: Accelerator,
-                data_args: DataArguments = None, model_args: ModelArguments = None) -> None:
+def run_training(
+    trainer: Trainer,
+    tokenizer: AutoTokenizer,
+    training_args: CustomTrainingArguments,
+    accelerator: Accelerator,
+    data_args: DataArguments = None,
+    model_args: ModelArguments = None,
+) -> None:
     """Run the training and save the model."""
     # Start training
     if accelerator.is_main_process:
@@ -762,8 +833,12 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
         print(f"   Mixed precision: {accelerator.mixed_precision}")
 
     # Resume from checkpoint if specified
-    if training_args.resume_from_checkpoint and os.path.exists(training_args.resume_from_checkpoint):
-        print(f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}")
+    if training_args.resume_from_checkpoint and os.path.exists(
+        training_args.resume_from_checkpoint
+    ):
+        print(
+            f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}"
+        )
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
@@ -772,10 +847,13 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
     if accelerator.is_main_process:
         print("💾 Saving final model...")
         # Use different save paths based on model size to avoid conflicts
-        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        model_size = (
+            f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        )
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         # Use state_dict to avoid shared tensor issues
         import os
+
         os.makedirs(save_path, exist_ok=True)
         torch.save(trainer.model.state_dict(), f"{save_path}/pytorch_model.bin")
         tokenizer.save_pretrained(save_path)
@@ -784,8 +862,12 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
         # Test generation if requested
         if training_args.do_generation_test:
             print("\n🧪 Testing model generation...")
-            test_generation(trainer.model, tokenizer, accelerator,
-                          max_length=training_args.generation_max_length)
+            test_generation(
+                trainer.model,
+                tokenizer,
+                accelerator,
+                max_length=training_args.generation_max_length,
+            )
 
         # Test checkpoint loading if requested
         if training_args.test_checkpoint_loading:
@@ -796,7 +878,9 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
         if training_args.push_to_hub and hf_write_token:
             print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
             trainer.push_to_hub()
-            print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
+            print(
+                f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}"
+            )
 
 
 def main() -> None:
@@ -816,21 +900,26 @@ def main() -> None:
     # Handle Hugging Face authentication
     if hf_read_token:
         from huggingface_hub import login
+
         login(token=hf_read_token)
         if accelerator.is_main_process:
             print("✅ Logged in to Hugging Face Hub with read token")
     elif hf_write_token:
         from huggingface_hub import login
+
         login(token=hf_write_token)
         if accelerator.is_main_process:
             print("✅ Logged in to Hugging Face Hub with write token")
     else:
         if accelerator.is_main_process:
-            print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
+            print(
+                "⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped."
+            )
 
     # Optional: Setup WandB if available
     if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
         import wandb
+
         wandb.login(key=os.environ.get("WANDB_API_KEY"))
         print("✅ Logged in to Weights & Biases")
 
@@ -872,11 +961,15 @@ def main() -> None:
     if eval_only:
         # Load saved model if it exists
         # Use different save paths based on model size to avoid conflicts
-        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        model_size = (
+            f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        )
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         if os.path.exists(f"{save_path}/pytorch_model.bin"):
             print(f"📂 Loading model from {save_path}")
-            state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
+            state_dict = torch.load(
+                f"{save_path}/pytorch_model.bin", map_location=accelerator.device
+            )
             model.load_state_dict(state_dict)
             print("✅ Model loaded successfully")
         else:
@@ -903,17 +996,23 @@ def main() -> None:
             tokenizer=tokenizer,
             data_collator=trainer.data_collator,
             device=accelerator.device,
-            num_samples=10
+            num_samples=10,
         )
 
         # Optionally run generation test
         if training_args.do_generation_test:
             print("\n🧪 Testing model generation...")
-            test_generation(model, tokenizer, accelerator,
-                          max_length=training_args.generation_max_length)
+            test_generation(
+                model,
+                tokenizer,
+                accelerator,
+                max_length=training_args.generation_max_length,
+            )
     else:
         # Run training
-        run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
+        run_training(
+            trainer, tokenizer, training_args, accelerator, data_args, model_args
+        )
 
 
 if __name__ == "__main__":
