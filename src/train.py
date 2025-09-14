@@ -892,8 +892,43 @@ def load_checkpoint(checkpoint_dir: str, model: ASRModel, accelerator: Accelerat
     """Load a checkpoint into the model. Returns True if successful."""
     try:
         # Check if it's a LoRA model or full model
-        if os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json")):
+        decoder_path = os.path.join(checkpoint_dir, "decoder")
+
+        if os.path.exists(os.path.join(decoder_path, "adapter_config.json")):
+            # Load LoRA adapters from decoder directory
             print("   Loading LoRA adapters...")
+            from peft import PeftModel
+
+            # Get the base model (without LoRA)
+            if hasattr(model.decoder.model, 'base_model'):
+                base_model = model.decoder.model.base_model.model
+            else:
+                base_model = model.decoder.model
+
+            # Load the LoRA adapters
+            model.decoder.model = PeftModel.from_pretrained(
+                base_model,
+                decoder_path,
+                device_map=accelerator.device,
+            )
+
+            # Load encoder and projector
+            if os.path.exists(os.path.join(checkpoint_dir, "encoder.bin")):
+                model.encoder.load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "encoder.bin"), map_location=accelerator.device
+                    )
+                )
+            if os.path.exists(os.path.join(checkpoint_dir, "projector.bin")):
+                model.audio_projector.load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "projector.bin"),
+                        map_location=accelerator.device,
+                    )
+                )
+        elif os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json")):
+            # Old format - LoRA at root level
+            print("   Loading LoRA adapters (old format)...")
             from peft import PeftModel
 
             model.decoder.model = PeftModel.from_pretrained(
@@ -909,14 +944,12 @@ def load_checkpoint(checkpoint_dir: str, model: ASRModel, accelerator: Accelerat
                 )
                 model.encoder.load_state_dict(audio_components["encoder"])
                 model.audio_projector.load_state_dict(audio_components["audio_projector"])
-        elif os.path.exists(os.path.join(checkpoint_dir, "decoder")):
-            # Load from CustomTrainer saved format
-            print("   Loading from checkpoint format...")
-            decoder_path = os.path.join(checkpoint_dir, "decoder")
-            if os.path.exists(decoder_path):
-                model.decoder.model = AutoModelForCausalLM.from_pretrained(
-                    decoder_path, device_map=accelerator.device, dtype=torch.bfloat16
-                )
+        elif os.path.exists(decoder_path):
+            # Load full model from decoder directory
+            print("   Loading full model from checkpoint...")
+            model.decoder.model = AutoModelForCausalLM.from_pretrained(
+                decoder_path, device_map=accelerator.device, dtype=torch.bfloat16
+            )
             if os.path.exists(os.path.join(checkpoint_dir, "encoder.bin")):
                 model.encoder.load_state_dict(
                     torch.load(
