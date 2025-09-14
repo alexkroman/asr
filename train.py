@@ -6,14 +6,14 @@ All GPU detection, optimization flags, and distributed training is handled by Ac
 """
 
 import os
+import random
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Tuple, cast
+from typing import Dict, List, Optional, Union, Tuple
 
 # Minimal environment setup - Accelerate handles the rest
 # Use local directories if /workspace doesn't exist (e.g., on Mac)
-import os
 workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
 os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
 os.environ["HF_DATASETS_CACHE"] = os.environ.get("HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets"))
@@ -33,13 +33,11 @@ from transformers import (
     Trainer,
     TrainingArguments,
     HfArgumentParser,
-    logging,
     EvalPrediction,
 )
 from accelerate import Accelerator
 
 warnings.filterwarnings("ignore")
-logging.set_verbosity_error()
 
 # Data path for outputs - use local directory on Mac
 DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized" if os.path.exists("/workspace") else "./ASR_output"
@@ -523,7 +521,6 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
 
 def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
-    import os
     import sys
 
     if not os.path.exists(config_file):
@@ -570,28 +567,8 @@ def initialize_model(model_args: ModelArguments, accelerator: Accelerator) -> Tu
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
 
-    # Enable gradient checkpointing
-    if hasattr(model.decoder.model, "gradient_checkpointing_enable"):
-        if callable(model.decoder.model.gradient_checkpointing_enable):
-            model.decoder.model.gradient_checkpointing_enable()
-            if accelerator.is_main_process:
-                print("✅ Gradient checkpointing enabled")
-
-    # Model compilation with torch.compile (if supported)
-    # Skip compilation when using Trainer (compatibility issues with accelerate)
-    # Uncomment the following lines if you want to use torch.compile without Trainer
-    # try:
-    #     is_distributed = accelerator.num_processes > 1
-    # except:
-    #     is_distributed = False
-    #
-    # if torch.__version__ >= "2.0.0" and not is_distributed:
-    #     if accelerator.is_main_process:
-    #         print("🚀 Compiling model with torch.compile...")
-    #     model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-    #     model.audio_projector = torch.compile(model.audio_projector, mode="reduce-overhead")
-    #     if accelerator.is_main_process:
-    #         print("✅ Model compilation complete")
+    # Note: Gradient checkpointing is handled by Trainer based on training_args.gradient_checkpointing
+    # The model has gradient_checkpointing_enable/disable methods that Trainer will call
 
     return model, tokenizer
 
@@ -662,8 +639,6 @@ def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTo
     model.eval()
 
     # Get random samples from the dataset
-    import random
-    import evaluate
     wer_metric = evaluate.load("wer")
     indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
 
@@ -825,7 +800,6 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
 def main() -> None:
     """Main training function - simplified with Accelerate."""
     import sys
-    import os
 
     # Check for eval-only mode
     eval_only = False
