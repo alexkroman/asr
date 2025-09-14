@@ -389,8 +389,17 @@ class ASRModel(nn.Module):
     def generate(
         self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs: Dict[str, Union[int, float, torch.Tensor]]
     ) -> torch.Tensor:
+        # Ensure input has the same dtype as model
+        model_dtype = next(self.parameters()).dtype
+        input_values = input_values.to(dtype=model_dtype)
+
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
+
+        # Ensure audio_prefix has the same dtype as decoder
+        decoder_dtype = next(self.decoder.model.parameters()).dtype
+        audio_prefix = audio_prefix.to(dtype=decoder_dtype)
+
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
 
 
@@ -498,8 +507,16 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
     decoded_preds = [pred.strip().lower() for pred in decoded_preds]
     decoded_labels = [label.strip().lower() for label in decoded_labels]
 
-    # Compute WER
-    wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
+    # Filter out empty pairs to avoid WER calculation issues
+    valid_pairs = [(pred, label) for pred, label in zip(decoded_preds, decoded_labels)
+                   if label.strip()]  # Only keep pairs where label is not empty
+
+    if valid_pairs:
+        valid_preds, valid_labels = zip(*valid_pairs)
+        # Compute WER
+        wer = wer_metric.compute(predictions=list(valid_preds), references=list(valid_labels))
+    else:
+        wer = 1.0  # If no valid pairs, return worst possible WER
 
     return {"wer": wer if wer is not None else 0.0}
 
@@ -639,12 +656,74 @@ def setup_trainer(
 
     return trainer
 
+def show_sample_predictions(model: ASRModel, dataset: Dataset, tokenizer: AutoTokenizer,
+                           data_collator: DataCollator, device: torch.device, num_samples: int = 10) -> None:
+    """Show sample predictions from the validation set."""
+    model.eval()
+
+    # Get random samples from the dataset
+    import random
+    import evaluate
+    wer_metric = evaluate.load("wer")
+    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
+
+    with torch.no_grad():
+        for i, idx in enumerate(indices, 1):
+            # Get sample and collate it
+            sample = dataset[idx]
+            batch = data_collator([sample])
+
+            # Move to device
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device)
+
+            # Get model predictions
+            outputs = model(
+                input_values=batch["input_values"],
+                input_lengths=batch["input_lengths"],
+                labels=batch["labels"]
+            )
+
+            # Get predicted token IDs
+            predictions = torch.argmax(outputs.logits, dim=-1)
+
+            # Decode predictions and labels
+            pred_text = tokenizer.decode(predictions[0], skip_special_tokens=True)
+
+            # Get ground truth, handling -100 padding
+            labels = batch["labels"][0]
+            labels = torch.where(labels == -100, tokenizer.pad_token_id, labels)
+            true_text = tokenizer.decode(labels, skip_special_tokens=True)
+
+            # Clean up and truncate texts
+            pred_text = pred_text.strip()[:100] if pred_text.strip() else "[EMPTY]"
+            true_text = true_text.strip()[:100] if true_text.strip() else "[EMPTY]"
+
+            # Calculate sample WER for display
+            if true_text != "[EMPTY]":
+                sample_wer = wer_metric.compute(predictions=[pred_text], references=[true_text])
+                print(f"\nSample {i} (WER: {sample_wer:.2f}):")
+            else:
+                print(f"\nSample {i}:")
+            print(f"  Truth: {true_text}")
+            print(f"  Pred:  {pred_text}")
+
+
 def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Accelerator, max_length: int = 50) -> None:
     """Test the model's generation capability."""
     try:
-        # Create a dummy audio input
-        dummy_audio = torch.randn(1, 80, 100).to(accelerator.device)  # (batch, n_mels, time)
+        # Set pad token if not set
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        # Create a dummy audio input with correct dtype
+        model_dtype = next(model.parameters()).dtype
+        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(accelerator.device)  # (batch, n_mels, time)
         dummy_lengths = torch.tensor([100]).to(accelerator.device)
+
+        # Temporarily disable gradient checkpointing for generation
+        model.gradient_checkpointing_disable()
 
         # Generate text
         with torch.no_grad():
@@ -654,12 +733,16 @@ def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Acce
                 max_length=max_length,
                 num_beams=1,
                 do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
             )
 
         # Decode the generated text
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print(f"   Generated text: '{generated_text[:100]}...'")
         print("   ✅ Generation test passed!")
+
+        # Re-enable gradient checkpointing if it was enabled
+        model.gradient_checkpointing_enable()
     except Exception as e:
         print(f"   ⚠️ Generation test failed: {e}")
 
@@ -675,7 +758,8 @@ def test_checkpoint_loading(save_path: str, model_args: ModelArguments, accelera
         new_model.load_state_dict(state_dict)
 
         # Test that the model can do a forward pass
-        dummy_audio = torch.randn(1, 80, 100).to(accelerator.device)
+        model_dtype = next(new_model.parameters()).dtype
+        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(accelerator.device)
         dummy_lengths = torch.tensor([100]).to(accelerator.device)
         dummy_labels = torch.randint(0, 1000, (1, 10)).to(accelerator.device)
 
@@ -741,6 +825,14 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
 def main() -> None:
     """Main training function - simplified with Accelerate."""
     import sys
+    import os
+
+    # Check for eval-only mode
+    eval_only = False
+    if "--eval-only" in sys.argv:
+        eval_only = True
+        sys.argv.remove("--eval-only")
+        print("🔍 Running in evaluation-only mode")
 
     # Initialize Accelerator
     accelerator = Accelerator()
@@ -801,8 +893,49 @@ def main() -> None:
         data_args=data_args,
     )
 
-    # Run training
-    run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
+    if eval_only:
+        # Load saved model if it exists
+        save_path = f"{DATA_PATH}/models/final_model"
+        if os.path.exists(f"{save_path}/pytorch_model.bin"):
+            print(f"📂 Loading model from {save_path}")
+            state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
+            model.load_state_dict(state_dict)
+            print("✅ Model loaded successfully")
+        else:
+            print(f"⚠️  No saved model found at {save_path}, using initialized model")
+
+        # Run evaluation
+        print("\n📊 Running evaluation...")
+        metrics = trainer.evaluate()
+
+        # Print metrics
+        print("\n📈 Evaluation Results:")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"   {key}: {value:.4f}")
+            else:
+                print(f"   {key}: {value}")
+
+        # Show sample predictions
+        print("\n📝 Sample Predictions (10 samples):")
+        print("-" * 80)
+        show_sample_predictions(
+            model=model,
+            dataset=val_dataset,
+            tokenizer=tokenizer,
+            data_collator=trainer.data_collator,
+            device=accelerator.device,
+            num_samples=10
+        )
+
+        # Optionally run generation test
+        if training_args.do_generation_test:
+            print("\n🧪 Testing model generation...")
+            test_generation(model, tokenizer, accelerator,
+                          max_length=training_args.generation_max_length)
+    else:
+        # Run training
+        run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
 
 
 if __name__ == "__main__":

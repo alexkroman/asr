@@ -23,6 +23,3 @@ dynamo:
 deepspeed_config: {}
 fsdp_config: {}
 megatron_lm_config: {}
-
-# Set via command line instead:
-# OMP_NUM_THREADS=9 accelerate launch --config_file accelerate_configs/a40_optimized.yaml train_accelerate.py
