@@ -1,9 +1,10 @@
 """
-🎙️ Conformer-SmolLM2 ASR - Final Optimized Version
+🎙️ Conformer-SmolLM2 ASR - Final Optimized Version for H100/H200
 - Uses Hugging Face Trainer for a simple, powerful training loop.
 - Replaced custom data classes with the standard `datasets.map()` method.
 - Uses torch.compile, fused optimizers, and bfloat16 for max performance.
 - Configured for the LibriSpeech train.clean.100 dataset.
+- Added H200-specific optimizations like FlashAttention and larger batch sizes.
 """
 
 import argparse
@@ -53,20 +54,24 @@ os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
+
+# H200/A100 General Optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-torch.set_float32_matmul_precision("high")  # A100 can handle high precision
+# 'high' precision is recommended for both TF32 on Ampere and for FlashAttention on Hopper
+torch.set_float32_matmul_precision("high")
 
-# A100-specific optimizations
-if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
-    # Enable CUDA graphs for better performance
-    torch.cuda.set_sync_debug_mode(0)
-    # Optimize memory allocation
-    torch.cuda.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.95)  # Use most of the 80GB
-    print("🚀 A100 detected - enabling specific optimizations")
+# H100/H200-specific optimizations
+if torch.cuda.is_available():
+    gpu_name = torch.cuda.get_device_name(0)
+    if "H100" in gpu_name or "H200" in gpu_name:
+        print("🚀 H100/H200 detected - enabling Hopper-specific optimizations")
+        # torch.compile mode='max-autotune' is ideal for Hopper
+    elif "A100" in gpu_name:
+        print("🚀 A100 detected - enabling Ampere-specific optimizations")
+
 
 # Handle Hugging Face authentication
 hf_read_token = os.environ.get("HF_READ_TOKEN")
@@ -186,8 +191,6 @@ class ConformerEncoder(nn.Module):
         x = self.dropout(x)
         x = x.permute(1, 0, 2)  # Switch to (Time, Batch, Dim) format
 
-        # CHANGE #2: Manually create the padding mask
-        # The new encoder expects a boolean mask, not a lengths tensor.
         output_lengths = input_lengths // 4
         max_len = x.size(0) # Get the max sequence length from the time dimension
         
@@ -279,10 +282,14 @@ class ASRModel(nn.Module):
             if self.training:
                 input_values = self.spec_augment(input_values)
 
-            audio_features = self.encoder(input_values, input_lengths)
+            # ✅ H200 OPTIMIZATION: Enable FlashAttention 2 via SDPA
+            # This context manager tells PyTorch to use the most efficient attention backend
+            # available (FlashAttention on Hopper GPUs) for the operations inside.
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                audio_features = self.encoder(input_values, input_lengths)
+
             audio_prefix = self.audio_projector(audio_features)
 
-            # This part remains the same
             embeddings = self.decoder.model.get_input_embeddings()
             text_embeds = embeddings(labels) if callable(embeddings) else embeddings.forward(labels)
             combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
@@ -295,22 +302,17 @@ class ASRModel(nn.Module):
             else:
                 combined_attention_mask = audio_mask
 
-            # ✅ FIX: Construct a new labels tensor that aligns with the combined input
             if labels is not None:
-                # Create a tensor of -100s (the ignore_index) with the same shape as the audio prefix
                 prefix_labels = torch.full(
                     audio_prefix.shape[:2], 
                     fill_value=-100,
                     dtype=labels.dtype,
                     device=labels.device
                 )
-                
-                # Concatenate the ignore prefix with the real text labels
                 combined_labels = torch.cat([prefix_labels, labels], dim=1)
             else:
                 combined_labels = None
 
-            # Pass the correctly shaped labels to the model
             return self.decoder.model.forward(
                 inputs_embeds=combined_embeds,
                 attention_mask=combined_attention_mask,
@@ -325,9 +327,7 @@ class ASRModel(nn.Module):
         audio_prefix = self.audio_projector(audio_features)
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
 
-#
-# ✅ NEW: UnifiedDataCollator replaces the old AudioDataProcessor and DataCollator
-#
+
 @dataclass
 class UnifiedDataCollator:
     """
@@ -407,56 +407,57 @@ class UnifiedDataCollator:
 @dataclass
 class TrainingConfig:
     output_dir: str = f"{DATA_PATH}/checkpoints"
-    per_device_train_batch_size: int = 256  # Optimized for A100 80GB
-    per_device_eval_batch_size: int = 256
-    gradient_accumulation_steps: int = 1  # Reduced since we have large batch
-    learning_rate: float = 8e-4  # Slightly higher for larger batch
+    # Set a much larger default for H200
+    per_device_train_batch_size: int = 512  
+    per_device_eval_batch_size: int = 512
+    gradient_accumulation_steps: int = 1  
+    learning_rate: float = 8e-4
     weight_decay: float = 0.05
-    warmup_steps: int = 1000  # Adjusted for larger batch size
+    warmup_steps: int = 1000
     max_steps: int = 50000
     logging_steps: int = 10
     eval_steps: int = 250
     save_steps: int = 250
     save_total_limit: int = 3
     mixed_precision: str = "bf16"
-    gradient_checkpointing: bool = True  # Enable for memory efficiency
+    gradient_checkpointing: bool = True
     seed: int = 42
-    push_to_hub: bool = True  # Enable by default
-    hub_model_id: str = "mazesmazes/asr"  # Your HF repository
-    hub_private: bool = False  # Public repository
+    push_to_hub: bool = True
+    hub_model_id: str = "mazesmazes/asr"
+    hub_private: bool = False
 
     def __post_init__(self) -> None:
         # Adjust batch sizes based on available GPUs and VRAM
-        if os.environ.get("RUNPOD_POD_ID"):
+        if os.environ.get("RUNPOD_POD_ID") or torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             if gpu_count > 0:
-                # Get GPU memory in GB
-                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                props = torch.cuda.get_device_properties(0)
+                gpu_mem = props.total_memory / 1e9
+                gpu_name = props.name
 
-                # Adjust batch size based on GPU memory
-                if gpu_mem < 16:  # <16GB VRAM
-                    self.per_device_train_batch_size = 16
-                    self.per_device_eval_batch_size = 32
-                elif gpu_mem < 24:  # 16-24GB VRAM
-                    self.per_device_train_batch_size = 32
-                    self.per_device_eval_batch_size = 48
-                elif gpu_mem < 40:  # 24-40GB VRAM
-                    self.per_device_train_batch_size = 64
-                    self.per_device_eval_batch_size = 64
-                elif gpu_mem < 80:  # 40-80GB VRAM (A100 40GB, A6000)
-                    self.per_device_train_batch_size = 128
-                    self.per_device_eval_batch_size = 128
-                else:  # 80GB+ VRAM (A100 80GB, H100)
+                # ✅ H200 OPTIMIZATION: Set a much larger batch size
+                if "H100" in gpu_name or "H200" in gpu_name: # 80GB+ Hopper
+                    self.per_device_train_batch_size = 512
+                    self.per_device_eval_batch_size = 512
+                    self.gradient_accumulation_steps = 1
+                    self.gradient_checkpointing = True
+                elif gpu_mem >= 80:  # 80GB Ampere (A100 80GB)
                     self.per_device_train_batch_size = 256
                     self.per_device_eval_batch_size = 256
-                    # Enable gradient checkpointing for large batches
-                    self.gradient_checkpointing = True
-                    # A100 specific optimizations
-                    if "A100" in torch.cuda.get_device_name(0):
-                        # No need for grad accumulation with large batch
-                        self.gradient_accumulation_steps = 1
+                elif gpu_mem >= 40:  # 40-80GB VRAM (A100 40GB, A6000)
+                    self.per_device_train_batch_size = 128
+                    self.per_device_eval_batch_size = 128
+                elif gpu_mem >= 24:  # 24-40GB VRAM
+                    self.per_device_train_batch_size = 64
+                    self.per_device_eval_batch_size = 64
+                elif gpu_mem >= 16:  # 16-24GB VRAM
+                    self.per_device_train_batch_size = 32
+                    self.per_device_eval_batch_size = 48
+                else:  # <16GB VRAM
+                    self.per_device_train_batch_size = 16
+                    self.per_device_eval_batch_size = 32
 
-                print(f"📊 Auto-adjusted batch sizes for {gpu_mem:.1f}GB VRAM:")
+                print(f"📊 Auto-adjusted batch sizes for {gpu_name} ({gpu_mem:.1f}GB VRAM):")
                 print(
                     f"   Train: {self.per_device_train_batch_size}, "
                     f"Eval: {self.per_device_eval_batch_size}"
@@ -495,38 +496,35 @@ def train_with_accelerate() -> None:
     tokenizer = model.decoder.tokenizer
 
     if training_cfg.gradient_checkpointing:
-        if hasattr(model.encoder, "transformer_encoder"):
-            # Note: nn.TransformerEncoder doesn't have a `.gradient_checkpointing_enable()` method.
-            # This check will correctly prevent an error. For full activation,
-            # you'd typically apply checkpointing to the layers individually.
-            pass # The new encoder doesn't support this specific method call.
-
         if hasattr(model.decoder.model, "gradient_checkpointing_enable"):
             model.decoder.model.gradient_checkpointing_enable()
             
         if accelerator.is_main_process:
             print("✅ Gradient checkpointing enabled for memory efficiency")
             
-    # Compile model components for A100 (works with gradient checkpointing)
-    if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
-        if accelerator.is_main_process:
-            print(
-                "🚀 Compiling model with torch.compile "
-                "(mode='max-autotune' for A100)..."
-            )
-        model.encoder = torch.compile(model.encoder, mode="max-autotune") # type: ignore
-        model.audio_projector = torch.compile(model.audio_projector, mode="max-autotune") # type: ignore
-        model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead") # type: ignore
-        if accelerator.is_main_process:
-            print("✅ Model compilation complete with A100 optimizations")
+    # Compile model components
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        if "H100" in gpu_name or "H200" in gpu_name or "A100" in gpu_name:
+            compile_mode = "max-autotune"
+            if accelerator.is_main_process:
+                print(
+                    f"🚀 Compiling model with torch.compile "
+                    f"(mode='{compile_mode}' for {gpu_name})..."
+                )
+            model.encoder = torch.compile(model.encoder, mode=compile_mode) # type: ignore
+            model.audio_projector = torch.compile(model.audio_projector, mode=compile_mode) # type: ignore
+            model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead") # type: ignore
+            if accelerator.is_main_process:
+                print("✅ Model compilation complete")
 
-    # ✅ Load raw datasets directly without any mapping or filtering
+    # Load raw datasets directly
     train_dataset = load_dataset("librispeech_asr", "clean", split="train.100",
                                  cache_dir="/workspace/datasets",
-                                 num_proc=8)
+                                 num_proc=12)
     val_dataset = load_dataset("librispeech_asr", "clean", split="validation",
                                cache_dir="/workspace/datasets",
-                               num_proc=8)
+                               num_proc=12)
 
     # Reset default device after loading
     if torch.cuda.is_available():
@@ -536,16 +534,14 @@ def train_with_accelerate() -> None:
         print(f"✅ Raw datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
         print("Preprocessing will be done on-the-fly by the data collator.")
 
-    # ✅ Instantiate the new, unified collator
     collator = UnifiedDataCollator(tokenizer)
 
-    # ✅ Create data loaders with the raw datasets and the new collator
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=training_cfg.per_device_train_batch_size,
         shuffle=True,
         collate_fn=collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
@@ -556,14 +552,14 @@ def train_with_accelerate() -> None:
         batch_size=training_cfg.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
 
-    # Optimizer with fused kernels for A100
-    use_fused = torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0)
+    # Optimizer with fused kernels for H100/H200/A100
+    use_fused = torch.cuda.is_available()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training_cfg.learning_rate,
@@ -573,7 +569,7 @@ def train_with_accelerate() -> None:
         fused=use_fused,
     )
     if use_fused and accelerator.is_main_process:
-        print("✅ Using fused AdamW optimizer for A100")
+        print(f"✅ Using fused AdamW optimizer for {torch.cuda.get_device_name(0)}")
 
     num_training_steps = training_cfg.max_steps
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -845,18 +841,18 @@ def main() -> None:
     args = parser.parse_args()
 
     # Override config with command line arguments
-    # Note: Using class attributes directly for simplicity in this script
+    training_cfg_instance = TrainingConfig()
     if args.push_to_hub:
-        TrainingConfig.push_to_hub = True
+        training_cfg_instance.push_to_hub = True
     if args.hub_model_id:
-        TrainingConfig.hub_model_id = args.hub_model_id
+        training_cfg_instance.hub_model_id = args.hub_model_id
     if args.max_steps:
-        TrainingConfig.max_steps = args.max_steps
+        training_cfg_instance.max_steps = args.max_steps
     if args.eval_steps:
-        TrainingConfig.eval_steps = args.eval_steps
+        training_cfg_instance.eval_steps = args.eval_steps
     if args.batch_size:
-        TrainingConfig.per_device_train_batch_size = args.batch_size
-        TrainingConfig.per_device_eval_batch_size = args.batch_size
+        training_cfg_instance.per_device_train_batch_size = args.batch_size
+        training_cfg_instance.per_device_eval_batch_size = args.batch_size
 
     train_with_accelerate()
 

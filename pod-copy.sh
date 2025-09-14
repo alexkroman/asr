@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # SSH Configuration
-SSH_HOST="69.30.85.23"
-SSH_PORT="22101"
+SSH_HOST="103.196.86.163"
+SSH_PORT="16392"
 SSH_USER="root"
 SSH_KEY="~/.ssh/id_ed25519"
 REMOTE_PATH="/workspace/"
