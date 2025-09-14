@@ -1,31 +1,20 @@
+#!/usr/bin/env python3
 """
-🎙️ Conformer-SmolLM2 ASR - Hugging Face Trainer Version
-- Uses Hugging Face Trainer for training loop
-- Optimized for A40 GPUs with 9 vCPUs
-- Configured for the LibriSpeech train.clean.100 dataset
+🎙️ Conformer-SmolLM2 ASR - Accelerate Version
+Simplified training script using Accelerate for hardware management.
+All GPU detection, optimization flags, and distributed training is handled by Accelerate.
 """
 
-import argparse
 import os
 import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Tuple
 
-# Set Hugging Face cache directory to /workspace BEFORE importing any HF libraries
+# Minimal environment setup - Accelerate handles the rest
 os.environ["HF_HOME"] = "/workspace"
 os.environ["HF_DATASETS_CACHE"] = "/workspace/datasets"
-os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hub"
-os.environ["XDG_CACHE_HOME"] = "/workspace"  # Some libraries use this as fallback
-
-# Optimize data downloading
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Use faster hf_transfer for downloads
-os.environ["HF_DATASETS_DOWNLOAD_MANAGER_MAX_WORKERS"] = "8"  # Parallel downloads
-
-# Optimize for A40 with 9 vCPUs
-os.environ["OMP_NUM_THREADS"] = "9"
-os.environ["MKL_NUM_THREADS"] = "9"
-os.environ["NUMEXPR_NUM_THREADS"] = "9"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import torch
 import torch.nn as nn
@@ -40,61 +29,117 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
+    HfArgumentParser,
     logging,
     EvalPrediction,
 )
+from accelerate import Accelerator
 
 warnings.filterwarnings("ignore")
 logging.set_verbosity_error()
+
+# Data path for outputs
 DATA_PATH = "/workspace/ASR_Conformer_SmolLM2_Optimized"
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
-# A40 Optimizations (NVIDIA Ampere architecture)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-torch.set_float32_matmul_precision("high")
-
-# Detect GPU type
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name(0)
-    if "A40" in gpu_name:
-        print("🚀 A40 detected - enabling Ampere-specific optimizations")
-        # Set specific optimizations for A40
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Use most of available memory
-    elif "H100" in gpu_name or "H200" in gpu_name:
-        print("🚀 H100/H200 detected - enabling Hopper-specific optimizations")
-    elif "A100" in gpu_name:
-        print("🚀 A100 detected - enabling Ampere-specific optimizations")
+# Initialize Accelerator - it will handle all hardware optimization
+accelerator = Accelerator()
 
 # Handle Hugging Face authentication
-hf_read_token = os.environ.get("HF_READ_TOKEN")
 hf_write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
+hf_read_token = os.environ.get("HF_READ_TOKEN")
 
 if hf_read_token:
     from huggingface_hub import login
-
     login(token=hf_read_token)
-    print("✅ Logged in to Hugging Face Hub with read token")
+    if accelerator.is_main_process:
+        print("✅ Logged in to Hugging Face Hub with read token")
 elif hf_write_token:
     from huggingface_hub import login
-
     login(token=hf_write_token)
-    print("✅ Logged in to Hugging Face Hub with write token")
+    if accelerator.is_main_process:
+        print("✅ Logged in to Hugging Face Hub with write token")
 else:
-    print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
+    if accelerator.is_main_process:
+        print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
 
 # Optional: Setup WandB if available
-if os.environ.get("WANDB_API_KEY"):
+if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
     import wandb
-
     wandb.login(key=os.environ.get("WANDB_API_KEY"))
     print("✅ Logged in to Weights & Biases")
 
 
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune.
+    """
+    # Conformer Config
+    n_mels: int = field(default=80, metadata={"help": "Number of Mel bands."})
+    d_model: int = field(default=512, metadata={"help": "Dimension of the model."})
+    n_head: int = field(default=8, metadata={"help": "Number of attention heads."})
+    num_layers: int = field(default=12, metadata={"help": "Number of encoder layers."})
+    kernel_size: int = field(default=15, metadata={"help": "Kernel size for Conformer."})
+    conformer_dropout: float = field(default=0.1, metadata={"help": "Dropout for Conformer."})
+
+    # SmolLM2 Config
+    decoder_model_name: str = field(
+        default="HuggingFaceTB/SmolLM2-360M-Instruct",
+        metadata={"help": "The decoder model name or path."},
+    )
+    use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})
+    lora_r: int = field(default=8, metadata={"help": "LoRA attention dimension."})
+    lora_alpha: int = field(default=16, metadata={"help": "LoRA scaling factor."})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout."})
+    lora_target_modules: List[str] = field(
+        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"],
+        metadata={"help": "Modules to apply LoRA to."},
+    )
+
+    # Projector Config
+    num_queries: int = field(default=24, metadata={"help": "Number of queries for projector."})
+    projector_num_heads: int = field(default=8, metadata={"help": "Number of heads for projector."})
+    projector_dropout: float = field(default=0.1, metadata={"help": "Dropout for projector."})
+
+
+@dataclass
+class DataArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+    dataset_name: str = field(
+        default="librispeech_asr", metadata={"help": "The name of the dataset to use."}
+    )
+    dataset_config_name: str = field(
+        default="clean", metadata={"help": "The configuration name of the dataset."}
+    )
+    train_split: str = field(
+        default="train.100", metadata={"help": "The training split to use."}
+    )
+    eval_split: str = field(
+        default="validation", metadata={"help": "The evaluation split to use."}
+    )
+    max_audio_seconds: float = field(
+        default=20.0, metadata={"help": "Filter out audio samples longer than this."}
+    )
+    max_text_words: int = field(
+        default=150, metadata={"help": "Filter out text samples longer than this."}
+    )
+    sample_rate: int = field(
+        default=16000, metadata={"help": "Audio sample rate."}
+    )
+    dataset_cache_dir: str = field(
+        default="/workspace/datasets", metadata={"help": "Directory to cache datasets."}
+    )
+    num_proc: int = field(
+        default=8, metadata={"help": "Number of processes for dataset loading."}
+    )
+
+
+# Keep original dataclasses for internal use
 @dataclass
 class ConformerConfig:
     n_mels: int = 80
@@ -264,7 +309,7 @@ class SmolLM2Decoder(nn.Module):
                 task_type=TaskType.CAUSAL_LM,
             )
             self.model = get_peft_model(self.model, lora_config)
-            if hasattr(self.model, "print_trainable_parameters"):
+            if hasattr(self.model, "print_trainable_parameters") and accelerator.is_main_process:
                 self.model.print_trainable_parameters()
 
 
@@ -304,7 +349,7 @@ class ASRModel(nn.Module):
         if self.training:
             input_values = self.spec_augment(input_values)
 
-        # Enable FlashAttention 2 via SDPA (works on A40 too)
+        # Use SDPA for attention (Accelerate will optimize this for the hardware)
         with torch.backends.cuda.sdp_kernel(
             enable_flash=True, enable_math=False, enable_mem_efficient=True
         ):
@@ -433,26 +478,6 @@ class DataCollator:
         }
 
 
-def compute_metrics(
-    eval_pred: EvalPrediction, tokenizer: Any, wer_metric: Any
-) -> Dict[str, float]:
-    """Compute WER metric for evaluation."""
-    predictions = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    if predictions is None or label_ids is None:
-        return {"wer": 0.0}
-
-    # Decode predictions and labels
-    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-    decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-
-    # Compute WER
-    wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
-
-    return {"wer": wer if wer is not None else 0.0}
-
-
 class ASRTrainer(Trainer):
     """Custom trainer with ASR-specific generate method for evaluation."""
 
@@ -543,110 +568,87 @@ class ASRTrainer(Trainer):
         return metrics
 
 
-def get_training_args(
-    output_dir: str = f"{DATA_PATH}/checkpoints",
-) -> TrainingArguments:
-    """Get optimized training arguments for A40 GPU with 9 vCPUs."""
-    # Detect GPU and adjust batch size
-    batch_size = 16  # default
-    num_workers = 4  # default for data loading
-
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        props = torch.cuda.get_device_properties(0)
-        gpu_mem = props.total_memory / 1e9
-
-        # A40 specific optimizations
-        if "A40" in gpu_name:
-            batch_size = 96  # A40 has 48GB VRAM, optimal batch size
-            num_workers = 8  # Use most of the 9 vCPUs for data loading
-            print(f"📊 A40 detected ({gpu_mem:.1f}GB VRAM) with 9 vCPUs")
-            print(f"   Optimized batch size: {batch_size}, Data workers: {num_workers}")
-        elif "H100" in gpu_name or "H200" in gpu_name:
-            batch_size = 512
-            num_workers = 8
-        elif gpu_mem >= 80:  # A100 80GB
-            batch_size = 256
-            num_workers = 8
-        elif gpu_mem >= 40:  # A100 40GB, RTX 6000 Ada
-            batch_size = 128
-            num_workers = 6
-        elif gpu_mem >= 24:
-            batch_size = 64
-            num_workers = 4
-        elif gpu_mem >= 16:
-            batch_size = 32
-            num_workers = 4
-        else:
-            print(
-                f"📊 Auto-adjusted batch size for {gpu_name} ({gpu_mem:.1f}GB VRAM): {batch_size}"
-            )
-
-    return TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=1,
-        learning_rate=8e-4,
-        weight_decay=0.05,
-        warmup_steps=1000,
-        max_steps=50000,
-        logging_steps=10,
-        eval_strategy="steps",
-        eval_steps=250,
-        save_strategy="steps",
-        save_steps=250,
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_wer",
-        greater_is_better=False,
-        bf16=True,
-        gradient_checkpointing=True,
-        dataloader_num_workers=num_workers,
-        dataloader_pin_memory=True,
-        dataloader_prefetch_factor=2,  # Optimize for A40's memory bandwidth
-        dataloader_persistent_workers=True,  # Keep workers alive between epochs
-        remove_unused_columns=False,
-        label_names=["labels"],
-        report_to=(
-            ["tensorboard", "wandb"]
-            if os.environ.get("WANDB_API_KEY")
-            else ["tensorboard"]
-        ),
-        push_to_hub=bool(hf_write_token),
-        hub_model_id="mazesmazes/asr" if hf_write_token else None,
-        hub_strategy="checkpoint",
-        seed=42,
-    )
-
-
 def main() -> None:
-    """Main training function."""
-    parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
-    parser.add_argument(
-        "--push-to-hub", action="store_true", help="Push model to HF Hub"
-    )
-    parser.add_argument(
-        "--hub-model-id", type=str, default="mazesmazes/asr", help="Hub model ID"
-    )
-    parser.add_argument(
-        "--max-steps", type=int, default=50000, help="Maximum training steps"
-    )
-    parser.add_argument(
-        "--eval-steps", type=int, default=250, help="Evaluation frequency"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=None, help="Override batch size"
-    )
-    args = parser.parse_args()
+    """Main training function - simplified with Accelerate."""
+    import sys
 
-    # Initialize configs
-    conformer_cfg = ConformerConfig()
-    smollm2_cfg = SmolLM2Config()
-    proj_cfg = ProjectorConfig()
+    # Require a config file to be provided
+    if len(sys.argv) < 2 or sys.argv[1] != "--config":
+        print("❌ Error: Config file is required!")
+        print("Usage: accelerate launch train.py --config <config_file.json>")
+        print("\nExample:")
+        print("  accelerate launch train.py --config experiment_config.json")
+        sys.exit(1)
+
+    if len(sys.argv) < 3:
+        print("❌ Error: Config file path is missing!")
+        print("Usage: accelerate launch train.py --config <config_file.json>")
+        sys.exit(1)
+
+    config_file = sys.argv[2]
+
+    # Check if config file exists
+    import os
+    if not os.path.exists(config_file):
+        print(f"❌ Error: Config file '{config_file}' not found!")
+        sys.exit(1)
+
+    # Parse configuration from JSON file only (no overrides)
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+
+    try:
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=config_file,
+            allow_extra_keys=True
+        )
+    except Exception as e:
+        print(f"❌ Error parsing config file: {e}")
+        sys.exit(1)
+
+    if accelerator.is_main_process:
+        print(f"✅ Loaded configuration from: {config_file}")
+
+    # Only apply essential runtime settings that shouldn't be in config
+    training_args.remove_unused_columns = False
+    training_args.label_names = ["labels"]
+
+    # Set report_to based on environment (not config)
+    if os.environ.get("WANDB_API_KEY"):
+        if "wandb" not in training_args.report_to:
+            training_args.report_to.append("wandb")
+
+    # Hub settings validation
+    if training_args.push_to_hub and not hf_write_token:
+        if accelerator.is_main_process:
+            print("⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. Disabling hub upload.")
+        training_args.push_to_hub = False
+
+    # 2. Initialize configs from the parsed arguments
+    conformer_cfg = ConformerConfig(
+        n_mels=model_args.n_mels,
+        d_model=model_args.d_model,
+        n_head=model_args.n_head,
+        num_layers=model_args.num_layers,
+        kernel_size=model_args.kernel_size,
+        dropout=model_args.conformer_dropout,
+    )
+    smollm2_cfg = SmolLM2Config(
+        model_name=model_args.decoder_model_name,
+        use_lora=model_args.use_lora,
+        lora_r=model_args.lora_r,
+        lora_alpha=model_args.lora_alpha,
+        lora_dropout=model_args.lora_dropout,
+        lora_target_modules=model_args.lora_target_modules,
+    )
+    proj_cfg = ProjectorConfig(
+        num_queries=model_args.num_queries,
+        num_heads=model_args.projector_num_heads,
+        dropout=model_args.projector_dropout,
+    )
 
     # Initialize model and tokenizer
-    print("🚀 Initializing model and tokenizer...")
+    if accelerator.is_main_process:
+        print("🚀 Initializing model and tokenizer...")
     model = ASRModel(conformer_cfg, smollm2_cfg, proj_cfg)
     tokenizer = model.decoder.tokenizer
 
@@ -654,64 +656,50 @@ def main() -> None:
     if hasattr(model.decoder.model, "gradient_checkpointing_enable"):
         if callable(model.decoder.model.gradient_checkpointing_enable):
             model.decoder.model.gradient_checkpointing_enable()
-            print("✅ Gradient checkpointing enabled")
+            if accelerator.is_main_process:
+                print("✅ Gradient checkpointing enabled")
 
-    # Compile model components for better performance
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        if "A40" in gpu_name:
-            # A40 optimizations
-            compile_mode = "reduce-overhead"  # Better for A40
-            print(
-                f"🚀 Compiling model for A40 with torch.compile (mode='{compile_mode}')..."
-            )
-            model.encoder = torch.compile(model.encoder, mode=compile_mode)  # type: ignore
-            model.audio_projector = torch.compile(model.audio_projector, mode=compile_mode)  # type: ignore
-            # Don't compile decoder for A40 to avoid OOM
-            print("✅ Model compilation complete (encoder and projector only for A40)")
-        elif "H100" in gpu_name or "H200" in gpu_name or "A100" in gpu_name:
-            compile_mode = "max-autotune"
-            print(f"🚀 Compiling model with torch.compile (mode='{compile_mode}')...")
-            model.encoder = torch.compile(model.encoder, mode=compile_mode)  # type: ignore
-            model.audio_projector = torch.compile(model.audio_projector, mode=compile_mode)  # type: ignore
-            model.decoder.model = torch.compile(model.decoder.model, mode="reduce-overhead")  # type: ignore
+    # Model compilation with torch.compile (if supported)
+    if torch.__version__ >= "2.0.0" and accelerator.state.distributed_type == "NO":
+        if accelerator.is_main_process:
+            print("🚀 Compiling model with torch.compile...")
+        model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+        model.audio_projector = torch.compile(model.audio_projector, mode="reduce-overhead")
+        if accelerator.is_main_process:
             print("✅ Model compilation complete")
 
-    # Load datasets with optimized settings for 9 vCPUs
-    print("📦 Loading datasets...")
+    # 3. Load datasets
+    if accelerator.is_main_process:
+        print("📦 Loading datasets...")
+
     train_dataset = load_dataset(
-        "librispeech_asr",
-        "clean",
-        split="train.100",
-        cache_dir="/workspace/datasets",
-        num_proc=8,  # Use 8 of 9 CPUs for loading
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        split=data_args.train_split,
+        cache_dir=data_args.dataset_cache_dir,
+        num_proc=data_args.num_proc if not accelerator.is_main_process else None,
     )
     val_dataset = load_dataset(
-        "librispeech_asr",
-        "clean",
-        split="validation",
-        cache_dir="/workspace/datasets",
-        num_proc=8,
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        split=data_args.eval_split,
+        cache_dir=data_args.dataset_cache_dir,
+        num_proc=data_args.num_proc if not accelerator.is_main_process else None,
     )
-    print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    if accelerator.is_main_process:
+        print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     # Create data collator
-    data_collator = DataCollator(tokenizer)
+    data_collator = DataCollator(
+        tokenizer=tokenizer,
+        sample_rate=data_args.sample_rate,
+        n_mels=model_args.n_mels,
+        max_audio_seconds=data_args.max_audio_seconds,
+        max_text_words=data_args.max_text_words,
+    )
 
-    # Get training arguments
-    training_args = get_training_args()
-    if args.push_to_hub:
-        training_args.push_to_hub = True
-        training_args.hub_model_id = args.hub_model_id
-    if args.max_steps:
-        training_args.max_steps = args.max_steps
-    if args.eval_steps:
-        training_args.eval_steps = args.eval_steps
-    if args.batch_size:
-        training_args.per_device_train_batch_size = args.batch_size
-        training_args.per_device_eval_batch_size = args.batch_size
-
-    # Initialize trainer
+    # 4. Initialize Trainer with the populated training_args
     trainer = ASRTrainer(
         model=model,
         args=training_args,
@@ -722,21 +710,27 @@ def main() -> None:
     )
 
     # Start training
-    print("🚀 Starting training...")
+    if accelerator.is_main_process:
+        print("🚀 Starting training...")
+        print(f"   Device: {accelerator.device}")
+        print(f"   Distributed: {accelerator.state.distributed_type}")
+        print(f"   Mixed precision: {accelerator.mixed_precision}")
+
     trainer.train()
 
-    # Save final model
-    print("💾 Saving final model...")
-    save_path = f"{DATA_PATH}/models/final_model"
-    trainer.save_model(save_path)
-    tokenizer.save_pretrained(save_path)
-    print(f"✅ Model saved to {save_path}")
+    # Save final model (only on main process)
+    if accelerator.is_main_process:
+        print("💾 Saving final model...")
+        save_path = f"{DATA_PATH}/models/final_model"
+        trainer.save_model(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"✅ Model saved to {save_path}")
 
-    # Push to hub if requested
-    if training_args.push_to_hub and hf_write_token:
-        print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
-        trainer.push_to_hub()
-        print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
+        # Push to hub if requested
+        if training_args.push_to_hub and hf_write_token:
+            print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
+            trainer.push_to_hub()
+            print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
 
 
 if __name__ == "__main__":
