@@ -9,7 +9,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union, Tuple, cast
 
 # Minimal environment setup - Accelerate handles the rest
 os.environ["HF_HOME"] = "/workspace"
@@ -21,7 +21,7 @@ import torch.nn as nn
 import evaluate
 import numpy as np
 import torchaudio.transforms as T
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from einops import rearrange
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
@@ -75,7 +75,7 @@ if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
 @dataclass
 class ModelArguments:
     """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune.
+    Unified configuration for all model components.
     """
     # Conformer Config
     n_mels: int = field(default=80, metadata={"help": "Number of Mel bands."})
@@ -139,34 +139,6 @@ class DataArguments:
     )
 
 
-# Keep original dataclasses for internal use
-@dataclass
-class ConformerConfig:
-    n_mels: int = 80
-    d_model: int = 512
-    n_head: int = 8
-    num_layers: int = 12
-    kernel_size: int = 15
-    dropout: float = 0.1
-
-
-@dataclass
-class SmolLM2Config:
-    model_name: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
-    use_lora: bool = True
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
-    )
-
-
-@dataclass
-class ProjectorConfig:
-    num_queries: int = 24
-    num_heads: int = 8
-    dropout: float = 0.1
 
 
 class SpecAugment(nn.Module):
@@ -200,7 +172,7 @@ class SpecAugment(nn.Module):
 
 
 class ConformerEncoder(nn.Module):
-    def __init__(self, config: ConformerConfig):
+    def __init__(self, config: ModelArguments):
         super().__init__()
         self.config = config
         self.subsample = nn.Sequential(
@@ -212,13 +184,13 @@ class ConformerEncoder(nn.Module):
         self.input_proj = nn.Linear(
             config.d_model * (config.n_mels // 4), config.d_model
         )
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(config.conformer_dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.n_head,
             dim_feedforward=config.d_model * 4,
-            dropout=config.dropout,
+            dropout=config.conformer_dropout,
             activation="gelu",
             batch_first=False,  # We will feed it Time-first data
             norm_first=True,
@@ -251,21 +223,21 @@ class ConformerEncoder(nn.Module):
 
 
 class LightweightAudioProjector(nn.Module):
-    def __init__(self, audio_dim: int, text_dim: int, config: ProjectorConfig):
+    def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
         self.audio_proj = nn.Linear(audio_dim, text_dim)
         self.queries = nn.Parameter(torch.randn(config.num_queries, text_dim))
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=text_dim,
-            num_heads=config.num_heads,
-            dropout=config.dropout,
+            num_heads=config.projector_num_heads,
+            dropout=config.projector_dropout,
             batch_first=True,
         )
         self.mlp = nn.Sequential(
             nn.LayerNorm(text_dim),
             nn.Linear(text_dim, text_dim * 2),
             nn.GELU(),
-            nn.Dropout(config.dropout),
+            nn.Dropout(config.projector_dropout),
             nn.Linear(text_dim * 2, text_dim),
             nn.LayerNorm(text_dim),
         )
@@ -280,12 +252,12 @@ class LightweightAudioProjector(nn.Module):
 
 
 class SmolLM2Decoder(nn.Module):
-    def __init__(self, config: SmolLM2Config):
+    def __init__(self, config: ModelArguments):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
-            config.model_name, torch_dtype=torch.bfloat16
+            config.decoder_model_name, torch_dtype=torch.bfloat16
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
             self.model.resize_token_embeddings(len(self.tokenizer))
@@ -314,18 +286,13 @@ class SmolLM2Decoder(nn.Module):
 
 
 class ASRModel(nn.Module):
-    def __init__(
-        self,
-        conformer_cfg: ConformerConfig,
-        smollm2_cfg: SmolLM2Config,
-        proj_cfg: ProjectorConfig,
-    ) -> None:
+    def __init__(self, config: ModelArguments) -> None:
         super().__init__()
-        self.encoder = ConformerEncoder(conformer_cfg)
-        self.decoder = SmolLM2Decoder(smollm2_cfg)
+        self.encoder = ConformerEncoder(config)
+        self.decoder = SmolLM2Decoder(config)
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
         self.audio_projector = LightweightAudioProjector(
-            conformer_cfg.d_model, text_dim, proj_cfg
+            config.d_model, text_dim, config
         )
         self.spec_augment = SpecAugment()
 
@@ -335,8 +302,8 @@ class ASRModel(nn.Module):
         input_lengths: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
         # Handle dict input from Trainer
         if input_values is None and "input_values" in kwargs:
             input_values = kwargs["input_values"]
@@ -391,8 +358,8 @@ class ASRModel(nn.Module):
 
     @torch.inference_mode()
     def generate(
-        self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs: Any
-    ) -> Any:
+        self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs: Dict[str, Union[int, float, torch.Tensor]]
+    ) -> torch.Tensor:
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
@@ -402,7 +369,7 @@ class ASRModel(nn.Module):
 class DataCollator:
     """Data collator that performs preprocessing on-the-fly."""
 
-    tokenizer: Any
+    tokenizer: AutoTokenizer
     sample_rate: int = 16000
     n_mels: int = 80
     max_audio_seconds: float = 20.0
@@ -421,7 +388,7 @@ class DataCollator:
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: List[Dict[str, Union[str, Dict[str, Union[str, List[float]]]]]) -> Dict[str, torch.Tensor]:
         # Filter samples that are too long
         valid_features = []
         for f in features:
@@ -478,122 +445,41 @@ class DataCollator:
         }
 
 
-class ASRTrainer(Trainer):
-    """Custom trainer with ASR-specific generate method for evaluation."""
+def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_metric: evaluate.EvaluationModule) -> Dict[str, float]:
+    """Compute metrics for ASR evaluation."""
+    predictions = eval_pred.predictions
+    labels = eval_pred.label_ids
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.wer_metric = evaluate.load("wer")
+    # Handle the case where predictions might be a tuple
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
 
-    def compute_loss(
-        self,
-        model: nn.Module,
-        inputs: Dict[str, Any],
-        return_outputs: bool = False,
-        num_items_in_batch: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
-        """Compute loss with proper input handling."""
-        outputs = model(**inputs)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-        return (loss, outputs) if return_outputs else loss
+    # Replace -100 with pad token id for proper decoding
+    labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
 
-    def evaluation_loop(
-        self,
-        dataloader: Any,
-        description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-    ) -> Any:
-        """Custom evaluation loop with WER computation."""
-        model = self._wrap_model(self.model, training=False)
-        model.eval()
+    # Decode predictions and labels
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        all_preds: List[np.ndarray] = []
-        all_labels: List[np.ndarray] = []
-        total_loss = 0.0
+    # Normalize text (remove extra spaces, convert to lowercase)
+    decoded_preds = [pred.strip().lower() for pred in decoded_preds]
+    decoded_labels = [label.strip().lower() for label in decoded_labels]
 
-        for step, inputs in enumerate(dataloader):
-            inputs = self._prepare_inputs(inputs)
+    # Compute WER
+    wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
 
-            with torch.no_grad():
-                # Compute loss
-                outputs = model(**inputs)
-                loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-                total_loss += loss.item()
-
-                # Generate predictions for WER
-                if hasattr(model, "module"):
-                    generate_fn = model.module.generate
-                else:
-                    generate_fn = model.generate
-
-                if self.tokenizer is not None:
-                    predictions = generate_fn(
-                        input_values=inputs["input_values"],
-                        input_lengths=inputs["input_lengths"],
-                        max_new_tokens=150,
-                        num_beams=5,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
-
-                    all_preds.extend(predictions.cpu().numpy())
-                    all_labels.extend(inputs["labels"].cpu().numpy())
-
-        # Compute metrics
-        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
-
-        # Decode and compute WER
-        if self.tokenizer is not None and all_preds:
-            decoded_preds = self.tokenizer.batch_decode(
-                all_preds, skip_special_tokens=True
-            )
-            decoded_labels = self.tokenizer.batch_decode(
-                all_labels, skip_special_tokens=True
-            )
-            wer = self.wer_metric.compute(
-                predictions=decoded_preds, references=decoded_labels
-            )
-        else:
-            wer = 0.0
-
-        metrics = {
-            f"{metric_key_prefix}_loss": avg_loss,
-            f"{metric_key_prefix}_wer": wer if wer is not None else 0.0,
-        }
-
-        self.log(metrics)
-
-        return metrics
+    return {"wer": wer if wer is not None else 0.0}
 
 
-def main() -> None:
-    """Main training function - simplified with Accelerate."""
+def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, TrainingArguments]:
+    """Parse configuration from JSON file."""
+    import os
     import sys
 
-    # Require a config file to be provided
-    if len(sys.argv) < 2 or sys.argv[1] != "--config":
-        print("❌ Error: Config file is required!")
-        print("Usage: accelerate launch train.py --config <config_file.json>")
-        print("\nExample:")
-        print("  accelerate launch train.py --config experiment_config.json")
-        sys.exit(1)
-
-    if len(sys.argv) < 3:
-        print("❌ Error: Config file path is missing!")
-        print("Usage: accelerate launch train.py --config <config_file.json>")
-        sys.exit(1)
-
-    config_file = sys.argv[2]
-
-    # Check if config file exists
-    import os
     if not os.path.exists(config_file):
         print(f"❌ Error: Config file '{config_file}' not found!")
         sys.exit(1)
 
-    # Parse configuration from JSON file only (no overrides)
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
 
     try:
@@ -608,11 +494,11 @@ def main() -> None:
     if accelerator.is_main_process:
         print(f"✅ Loaded configuration from: {config_file}")
 
-    # Only apply essential runtime settings that shouldn't be in config
+    # Apply essential runtime settings
     training_args.remove_unused_columns = False
     training_args.label_names = ["labels"]
 
-    # Set report_to based on environment (not config)
+    # Set report_to based on environment
     if os.environ.get("WANDB_API_KEY"):
         if "wandb" not in training_args.report_to:
             training_args.report_to.append("wandb")
@@ -623,33 +509,15 @@ def main() -> None:
             print("⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. Disabling hub upload.")
         training_args.push_to_hub = False
 
-    # 2. Initialize configs from the parsed arguments
-    conformer_cfg = ConformerConfig(
-        n_mels=model_args.n_mels,
-        d_model=model_args.d_model,
-        n_head=model_args.n_head,
-        num_layers=model_args.num_layers,
-        kernel_size=model_args.kernel_size,
-        dropout=model_args.conformer_dropout,
-    )
-    smollm2_cfg = SmolLM2Config(
-        model_name=model_args.decoder_model_name,
-        use_lora=model_args.use_lora,
-        lora_r=model_args.lora_r,
-        lora_alpha=model_args.lora_alpha,
-        lora_dropout=model_args.lora_dropout,
-        lora_target_modules=model_args.lora_target_modules,
-    )
-    proj_cfg = ProjectorConfig(
-        num_queries=model_args.num_queries,
-        num_heads=model_args.projector_num_heads,
-        dropout=model_args.projector_dropout,
-    )
+    return model_args, data_args, training_args
 
-    # Initialize model and tokenizer
+
+def initialize_model(model_args: ModelArguments) -> Tuple[ASRModel, AutoTokenizer]:
+    """Initialize the ASR model and tokenizer."""
     if accelerator.is_main_process:
         print("🚀 Initializing model and tokenizer...")
-    model = ASRModel(conformer_cfg, smollm2_cfg, proj_cfg)
+
+    model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
 
     # Enable gradient checkpointing
@@ -668,7 +536,10 @@ def main() -> None:
         if accelerator.is_main_process:
             print("✅ Model compilation complete")
 
-    # 3. Load datasets
+    return model, tokenizer
+
+def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
+    """Load training and validation datasets."""
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
 
@@ -690,6 +561,18 @@ def main() -> None:
     if accelerator.is_main_process:
         print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
+    return train_dataset, val_dataset
+
+def setup_trainer(
+    model: ASRModel,
+    tokenizer: AutoTokenizer,
+    training_args: TrainingArguments,
+    train_dataset: Dataset,
+    val_dataset: Dataset,
+    model_args: ModelArguments,
+    data_args: DataArguments,
+) -> Trainer:
+    """Setup the trainer with data collator and compute metrics."""
     # Create data collator
     data_collator = DataCollator(
         tokenizer=tokenizer,
@@ -699,16 +582,25 @@ def main() -> None:
         max_text_words=data_args.max_text_words,
     )
 
-    # 4. Initialize Trainer with the populated training_args
-    trainer = ASRTrainer(
+    # Setup metrics computation
+    wer_metric = evaluate.load("wer")
+    compute_metrics_fn = lambda eval_pred: compute_metrics(eval_pred, tokenizer, wer_metric)
+
+    # Initialize Trainer
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
+        compute_metrics=compute_metrics_fn,
     )
 
+    return trainer
+
+def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: TrainingArguments) -> None:
+    """Run the training and save the model."""
     # Start training
     if accelerator.is_main_process:
         print("🚀 Starting training...")
@@ -731,6 +623,49 @@ def main() -> None:
             print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
             trainer.push_to_hub()
             print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
+
+
+def main() -> None:
+    """Main training function - simplified with Accelerate."""
+    import sys
+
+    # Require a config file to be provided
+    if len(sys.argv) < 2 or sys.argv[1] != "--config":
+        print("❌ Error: Config file is required!")
+        print("Usage: accelerate launch train.py --config <config_file.json>")
+        print("\nExample:")
+        print("  accelerate launch train.py --config experiment_config.json")
+        sys.exit(1)
+
+    if len(sys.argv) < 3:
+        print("❌ Error: Config file path is missing!")
+        print("Usage: accelerate launch train.py --config <config_file.json>")
+        sys.exit(1)
+
+    config_file = sys.argv[2]
+
+    # Parse configuration
+    model_args, data_args, training_args = parse_config(config_file)
+
+    # Initialize model
+    model, tokenizer = initialize_model(model_args)
+
+    # Load datasets
+    train_dataset, val_dataset = load_datasets(data_args)
+
+    # Setup trainer
+    trainer = setup_trainer(
+        model=model,
+        tokenizer=tokenizer,
+        training_args=training_args,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        model_args=model_args,
+        data_args=data_args,
+    )
+
+    # Run training
+    run_training(trainer, tokenizer, training_args)
 
 
 if __name__ == "__main__":
