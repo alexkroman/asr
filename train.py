@@ -260,12 +260,12 @@ class SmolLM2Decoder(nn.Module):
     def __init__(self, config: ModelArguments):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
-            config.decoder_model_name, torch_dtype=torch.bfloat16
+            config.decoder_model_name, dtype=torch.bfloat16
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=False)
             with torch.no_grad():
                 embeddings = self.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, "weight"):
@@ -771,7 +771,9 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Cust
     # Save final model (only on main process)
     if accelerator.is_main_process:
         print("💾 Saving final model...")
-        save_path = f"{DATA_PATH}/models/final_model"
+        # Use different save paths based on model size to avoid conflicts
+        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         # Use state_dict to avoid shared tensor issues
         import os
         os.makedirs(save_path, exist_ok=True)
@@ -869,7 +871,9 @@ def main() -> None:
 
     if eval_only:
         # Load saved model if it exists
-        save_path = f"{DATA_PATH}/models/final_model"
+        # Use different save paths based on model size to avoid conflicts
+        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+        save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         if os.path.exists(f"{save_path}/pytorch_model.bin"):
             print(f"📂 Loading model from {save_path}")
             state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
