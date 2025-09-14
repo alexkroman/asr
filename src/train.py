@@ -63,12 +63,6 @@ hf_read_token = os.environ.get("HF_READ_TOKEN")
 class CustomTrainingArguments(TrainingArguments):
     """Extended TrainingArguments with custom fields for testing."""
 
-    do_generation_test: bool = field(
-        default=False, metadata={"help": "Whether to test generation after training"}
-    )
-    generation_max_length: int = field(
-        default=50, metadata={"help": "Maximum length for generation test"}
-    )
     test_checkpoint_loading: bool = field(
         default=False, metadata={"help": "Whether to test checkpoint loading"}
     )
@@ -449,6 +443,41 @@ class SmolLM2Decoder(nn.Module):
                 self.model.print_trainable_parameters()
 
 
+class CustomTrainer(Trainer):
+    """Custom trainer that handles tied embeddings properly during saving."""
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        """Override save to handle tied embeddings in the decoder."""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save the model using save_model which handles tied embeddings
+        if self.model is not None:
+            self._save_model(output_dir, state_dict)
+
+        # Save tokenizer
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(output_dir)
+
+        # Save training args
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+    def _save_model(self, output_dir, state_dict=None):
+        """Save model handling tied embeddings properly."""
+        # Use the model's save_pretrained if available (for HF models)
+        if hasattr(self.model, 'decoder') and hasattr(self.model.decoder.model, 'save_pretrained'):
+            # Save decoder with tied embeddings handled properly
+            decoder_path = os.path.join(output_dir, "decoder")
+            self.model.decoder.model.save_pretrained(decoder_path)
+
+            # Save encoder and projector separately
+            torch.save(self.model.encoder.state_dict(), os.path.join(output_dir, "encoder.bin"))
+            torch.save(self.model.audio_projector.state_dict(), os.path.join(output_dir, "projector.bin"))
+        else:
+            # Fallback to standard save
+            super()._save(output_dir, state_dict)
+
+
 class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
@@ -772,8 +801,8 @@ def setup_trainer(
         max_text_words=data_args.max_text_words,
     )
 
-    # Initialize standard Trainer
-    trainer = Trainer(
+    # Initialize CustomTrainer to handle tied embeddings properly
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -840,50 +869,6 @@ def show_sample_predictions(
                 print(f"\nSample {i}:")
             print(f"  Truth: {true_text}")
             print(f"  Pred:  {pred_text}")
-
-
-def test_generation(
-    model: ASRModel,
-    tokenizer: AutoTokenizer,
-    accelerator: Accelerator,
-    max_length: int = 50,
-) -> None:
-    """Test the model's generation capability."""
-    try:
-        # Set pad token if not set
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-        # Create a dummy audio input with correct dtype
-        model_dtype = next(model.parameters()).dtype
-        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(
-            accelerator.device
-        )  # (batch, n_mels, time)
-        dummy_lengths = torch.tensor([100]).to(accelerator.device)
-
-        # Temporarily disable gradient checkpointing for generation
-        model.gradient_checkpointing_disable()
-
-        # Generate text
-        with torch.no_grad():
-            generated_ids = model.generate(
-                input_values=dummy_audio,
-                input_lengths=dummy_lengths,
-                max_length=max_length,
-                num_beams=1,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        # Decode the generated text
-        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print(f"   Generated text: '{generated_text[:100]}...'")
-        print("   ✅ Generation test passed!")
-
-        # Re-enable gradient checkpointing if it was enabled
-        model.gradient_checkpointing_enable()
-    except Exception as e:
-        print(f"   ⚠️ Generation test failed: {e}")
 
 
 def test_checkpoint_loading(
@@ -953,48 +938,12 @@ def run_training(
     else:
         trainer.train()
 
-    # Save final model (only on main process)
-    if accelerator.is_main_process:
-        print("💾 Saving final model...")
-        # Use different save paths based on model size to avoid conflicts
-        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
-        save_path = f"{DATA_PATH}/models/final_model_{model_size}"
 
-        import os
-        os.makedirs(save_path, exist_ok=True)
-
-        # Save only LoRA adapters (small file)
-        print("   Saving LoRA adapters...")
-        trainer.model.decoder.model.save_pretrained(save_path)
-        tokenizer.save_pretrained(save_path)
-
-        # Also save encoder and projector separately
-        torch.save({
-            'encoder': trainer.model.encoder.state_dict(),
-            'audio_projector': trainer.model.audio_projector.state_dict(),
-        }, f"{save_path}/audio_components.bin")
-        print(f"✅ LoRA adapters and audio components saved to {save_path}")
-
-        # Test generation if requested
-        if training_args.do_generation_test:
-            print("\n🧪 Testing model generation...")
-            test_generation(
-                trainer.model,
-                tokenizer,
-                accelerator,
-                max_length=training_args.generation_max_length,
-            )
-
-        # Test checkpoint loading if requested
-        if training_args.test_checkpoint_loading:
-            print("\n🧪 Testing checkpoint loading...")
-            test_checkpoint_loading(save_path, model_args, accelerator)
-
-        # Push to hub if requested
-        if training_args.push_to_hub and hf_write_token:
-            print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
-            trainer.push_to_hub()
-            print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
+    # Push to hub if requested
+    if training_args.push_to_hub and hf_write_token:
+        print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
+        trainer.push_to_hub()
+        print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
 
 
 def main() -> None:
@@ -1119,15 +1068,6 @@ def main() -> None:
             num_samples=10,
         )
 
-        # Optionally run generation test
-        if training_args.do_generation_test:
-            print("\n🧪 Testing model generation...")
-            test_generation(
-                model,
-                tokenizer,
-                accelerator,
-                max_length=training_args.generation_max_length,
-            )
     else:
         # Run training
         run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)

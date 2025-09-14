@@ -143,7 +143,7 @@ train-mac = "accelerate launch --config_file configs/accelerate/accelerate_confi
 train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
 
 # Evaluation
-eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --eval-only --config {args:configs/experiments/test_config.json}"
+eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
 
 # Development tools
 lint = [
@@ -198,7 +198,7 @@ MPS_ALLOCATOR_POLICY = "default"
 [tool.hatch.envs.mac.scripts]
 train-development = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json}"
 train-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
-eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --eval-only --config {args:configs/experiments/test_config.json}"
+eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
 
 [tool.hatch.envs.test]
 dependencies = [
