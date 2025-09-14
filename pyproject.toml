@@ -1,0 +1,289 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "asr-conformer-smollm2"
+dynamic = ["version"]
+description = "Automatic Speech Recognition training pipeline combining Conformer encoder with SmolLM2 decoder"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["speech-recognition", "asr", "conformer", "smollm2", "transformers", "deep-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    # Core ML frameworks
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchvision>=0.15.0",
+    "transformers>=4.35.0",
+    "accelerate>=0.24.0",
+    "datasets>=2.14.0",
+
+    # Model components
+    "einops>=0.7.0",
+    "peft>=0.6.0",
+
+    # Evaluation and metrics
+    "evaluate>=0.4.0",
+    "jiwer>=3.0.0",
+
+    # Audio processing
+    "soundfile>=0.12.0",
+
+    # Training utilities
+    "tensorboard>=2.14.0",
+    "wandb>=0.15.0",
+
+    # HuggingFace ecosystem
+    "huggingface-hub>=0.16.0",
+    "safetensors>=0.3.0",
+    "tokenizers>=0.14.0",
+    "sentencepiece>=0.1.99",
+
+    # Data processing
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "pyarrow>=12.0.0",
+
+    # General utilities
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "requests>=2.31.0",
+    "psutil>=5.9.0",
+    "packaging>=23.0",
+
+    # Interface (optional)
+    "gradio>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+    "isort>=5.12.0",
+    "pre-commit>=3.3.0",
+    # Type stubs
+    "types-PyYAML>=6.0.0",
+    "types-requests>=2.31.0",
+    "types-tqdm>=4.65.0",
+    "types-setuptools>=68.0.0",
+]
+
+optimized = [
+    "optimum>=1.13.0",
+    "hf-transfer>=0.1.0",
+]
+
+cuda = [
+    "nvidia-ml-py>=12.535.0",
+    "triton>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/asr-conformer-smollm2"
+Documentation = "https://github.com/yourusername/asr-conformer-smollm2#readme"
+Repository = "https://github.com/yourusername/asr-conformer-smollm2"
+Issues = "https://github.com/yourusername/asr-conformer-smollm2/issues"
+
+[tool.hatch.version]
+path = "src/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/configs",
+    "/scripts",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+# Hatch environments
+[tool.hatch.envs.default]
+dependencies = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+    "isort>=5.12.0",
+]
+
+[tool.hatch.envs.default.scripts]
+# Training scripts
+train = "accelerate launch src/train.py --config {args:configs/experiments/small_test.json}"
+train-prod = "accelerate launch src/train.py --config configs/experiments/production.json"
+train-test = "accelerate launch src/train.py --config configs/experiments/test_config.json"
+train-multi = "accelerate launch --multi_gpu src/train.py --config {args:experiment_config.json}"
+
+# Mac-specific scripts
+train-mac = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/test_config.json"
+train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
+
+# Evaluation
+eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --eval-only --config {args:configs/experiments/test_config.json}"
+
+# Development tools
+lint = [
+    "black --check src scripts",
+    "isort --check-only src scripts",
+    "flake8 src scripts",
+]
+format = [
+    "black src scripts",
+    "isort src scripts",
+]
+typecheck = "mypy src"
+test = "pytest tests -v"
+test-cov = "pytest tests --cov=src --cov-report=term-missing"
+
+# Utilities
+tensorboard = "python -m tensorboard.main --logdir {args:./test_logs}"
+clean = [
+    "rm -rf test_output test_logs small_test_output small_test_logs mac_minimal_output mac_minimal_logs",
+    "rm -rf __pycache__ .mypy_cache .pytest_cache",
+    "find . -type d -name __pycache__ -exec rm -rf {} +",
+]
+
+# Setup scripts
+setup-mac = [
+    "export PYTORCH_ENABLE_MPS_FALLBACK=1",
+    "export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0",
+    "export TOKENIZERS_PARALLELISM=false",
+]
+
+# Pod deployment
+pod-copy = "bash scripts/pod_copy.sh"
+install-deps = "bash scripts/install_dependencies.sh"
+
+[tool.hatch.envs.cuda]
+template = "default"
+features = ["cuda", "optimized"]
+
+[tool.hatch.envs.cuda.scripts]
+train-a40 = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config {args:experiment_config.json}"
+train-a100 = "accelerate launch --config_file configs/accelerate/a100_optimized.yaml src/train.py --config {args:experiment_config.json}"
+
+[tool.hatch.envs.mac]
+template = "default"
+env-vars = [
+    "PYTORCH_ENABLE_MPS_FALLBACK=1",
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0",
+    "TOKENIZERS_PARALLELISM=false",
+    "MPS_ALLOCATOR_POLICY=default",
+]
+
+[tool.hatch.envs.mac.scripts]
+train = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json}"
+train-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
+eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --eval-only --config {args:configs/experiments/test_config.json}"
+
+[tool.hatch.envs.test]
+dependencies = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.3.0",
+    "pytest-mock>=3.11.0",
+]
+
+[tool.hatch.envs.test.scripts]
+run = "pytest {args:tests}"
+cov = "pytest --cov=src --cov-report=html --cov-report=term {args:tests}"
+parallel = "pytest -n auto {args:tests}"
+
+# Code quality tools configuration
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "normal"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/test_*.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "DTZ", # flake8-datetimez
+    "T10", # flake8-debugger
+    "ISC", # flake8-implicit-str-concat
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "PTH", # flake8-use-pathlib
+]
+ignore = [
+    "E501",  # line too long (handled by black)
+    "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip() without an explicit strict= parameter
+]

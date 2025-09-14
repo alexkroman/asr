@@ -10,44 +10,40 @@ import random
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+import evaluate
+import numpy as np
+import torch
+import torch.nn as nn
+import torchaudio.transforms as T
+from accelerate import Accelerator
+from datasets import Dataset, load_dataset
+from einops import rearrange
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    EvalPrediction,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+)
 
 # Minimal environment setup - Accelerate handles the rest
 # Use local directories if /workspace doesn't exist (e.g., on Mac)
-workspace_dir = (
-    "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
-)
+workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
 os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
 os.environ["HF_DATASETS_CACHE"] = os.environ.get(
     "HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets")
 )
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-import torch
-import torch.nn as nn
-import evaluate
-import numpy as np
-import torchaudio.transforms as T
-from datasets import load_dataset, Dataset
-from einops import rearrange
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    HfArgumentParser,
-    EvalPrediction,
-)
-from accelerate import Accelerator
-
 warnings.filterwarnings("ignore")
 
 # Data path for outputs - use local directory on Mac
 DATA_PATH = (
-    "/workspace/ASR_Conformer_SmolLM2_Optimized"
-    if os.path.exists("/workspace")
-    else "./ASR_output"
+    "/workspace/ASR_Conformer_SmolLM2_Optimized" if os.path.exists("/workspace") else "./ASR_output"
 )
 os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
 os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
@@ -91,12 +87,8 @@ class ModelArguments:
     d_model: int = field(default=512, metadata={"help": "Dimension of the model."})
     n_head: int = field(default=8, metadata={"help": "Number of attention heads."})
     num_layers: int = field(default=12, metadata={"help": "Number of encoder layers."})
-    kernel_size: int = field(
-        default=15, metadata={"help": "Kernel size for Conformer."}
-    )
-    conformer_dropout: float = field(
-        default=0.1, metadata={"help": "Dropout for Conformer."}
-    )
+    kernel_size: int = field(default=15, metadata={"help": "Kernel size for Conformer."})
+    conformer_dropout: float = field(default=0.1, metadata={"help": "Dropout for Conformer."})
 
     # SmolLM2 Config
     decoder_model_name: str = field(
@@ -113,15 +105,9 @@ class ModelArguments:
     )
 
     # Projector Config
-    num_queries: int = field(
-        default=24, metadata={"help": "Number of queries for projector."}
-    )
-    projector_num_heads: int = field(
-        default=8, metadata={"help": "Number of heads for projector."}
-    )
-    projector_dropout: float = field(
-        default=0.1, metadata={"help": "Dropout for projector."}
-    )
+    num_queries: int = field(default=24, metadata={"help": "Number of queries for projector."})
+    projector_num_heads: int = field(default=8, metadata={"help": "Number of heads for projector."})
+    projector_dropout: float = field(default=0.1, metadata={"help": "Dropout for projector."})
 
 
 @dataclass
@@ -136,12 +122,8 @@ class DataArguments:
     dataset_config_name: str = field(
         default="clean", metadata={"help": "The configuration name of the dataset."}
     )
-    train_split: str = field(
-        default="train.100", metadata={"help": "The training split to use."}
-    )
-    eval_split: str = field(
-        default="validation", metadata={"help": "The evaluation split to use."}
-    )
+    train_split: str = field(default="train.100", metadata={"help": "The training split to use."})
+    eval_split: str = field(default="validation", metadata={"help": "The evaluation split to use."})
     max_audio_seconds: float = field(
         default=20.0, metadata={"help": "Filter out audio samples longer than this."}
     )
@@ -152,9 +134,7 @@ class DataArguments:
     dataset_cache_dir: str = field(
         default="/workspace/datasets", metadata={"help": "Directory to cache datasets."}
     )
-    num_proc: int = field(
-        default=8, metadata={"help": "Number of processes for dataset loading."}
-    )
+    num_proc: int = field(default=8, metadata={"help": "Number of processes for dataset loading."})
 
 
 class SpecAugment(nn.Module):
@@ -167,16 +147,10 @@ class SpecAugment(nn.Module):
     ) -> None:
         super().__init__()
         self.freq_masks = nn.ModuleList(
-            [
-                T.FrequencyMasking(freq_mask_param=freq_mask_param)
-                for _ in range(n_freq_masks)
-            ]
+            [T.FrequencyMasking(freq_mask_param=freq_mask_param) for _ in range(n_freq_masks)]
         )
         self.time_masks = nn.ModuleList(
-            [
-                T.TimeMasking(time_mask_param=time_mask_param)
-                for _ in range(n_time_masks)
-            ]
+            [T.TimeMasking(time_mask_param=time_mask_param) for _ in range(n_time_masks)]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -197,9 +171,7 @@ class ConformerEncoder(nn.Module):
             nn.Conv2d(config.d_model, config.d_model, 3, 2, 1),
             nn.SiLU(),
         )
-        self.input_proj = nn.Linear(
-            config.d_model * (config.n_mels // 4), config.d_model
-        )
+        self.input_proj = nn.Linear(config.d_model * (config.n_mels // 4), config.d_model)
         self.dropout = nn.Dropout(config.conformer_dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -229,9 +201,7 @@ class ConformerEncoder(nn.Module):
         max_len = x.size(0)  # Get the max sequence length from the time dimension
 
         # Create a mask of shape (Batch, Time)
-        mask = (
-            torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
-        )
+        mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
 
         # Pass the tensor and the mask to the transformer encoder
         x = self.transformer_encoder(x, src_key_padding_mask=mask)
@@ -290,9 +260,7 @@ class SmolLM2Decoder(nn.Module):
                 r=config.lora_r,
                 lora_alpha=config.lora_alpha,
                 target_modules=(
-                    list(config.lora_target_modules)
-                    if config.lora_target_modules
-                    else None
+                    list(config.lora_target_modules) if config.lora_target_modules else None
                 ),
                 lora_dropout=config.lora_dropout,
                 bias="none",
@@ -309,17 +277,13 @@ class ASRModel(nn.Module):
         self.encoder = ConformerEncoder(config)
         self.decoder = SmolLM2Decoder(config)
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
-        self.audio_projector = LightweightAudioProjector(
-            config.d_model, text_dim, config
-        )
+        self.audio_projector = LightweightAudioProjector(config.d_model, text_dim, config)
         self.spec_augment = SpecAugment()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing for the decoder model."""
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
-            self.decoder.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs
-            )
+            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing for the decoder model."""
@@ -443,9 +407,7 @@ class DataCollator:
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"[^\w\s'\-]", "", text.lower().strip())
 
-    def __call__(
-        self, features: List[Dict[str, Union[str, Dict]]]
-    ) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: List[Dict[str, Union[str, Dict]]]) -> Dict[str, torch.Tensor]:
         # Filter samples that are too long
         valid_features = []
         for f in features:
@@ -473,9 +435,7 @@ class DataCollator:
         specs = []
         texts = []
         for f in valid_features:
-            audio_array = torch.from_numpy(
-                np.array(f["audio"]["array"], dtype=np.float32)
-            )
+            audio_array = torch.from_numpy(np.array(f["audio"]["array"], dtype=np.float32))
             spec = self.mel_transform(audio_array)
             spec_db = self.amp_to_db(spec)
             spec_norm = (spec_db - spec_db.mean()) / (spec_db.std() + 1e-8)
@@ -492,9 +452,7 @@ class DataCollator:
         )
 
         # Tokenize and pad text labels
-        labels = self.tokenizer(
-            texts, padding="longest", truncation=True, return_tensors="pt"
-        )
+        labels = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt")
 
         return {
             "input_values": padded_specs,
@@ -534,17 +492,13 @@ def compute_metrics(
 
     # Filter out empty pairs to avoid WER calculation issues
     valid_pairs = [
-        (pred, label)
-        for pred, label in zip(decoded_preds, decoded_labels)
-        if label.strip()
+        (pred, label) for pred, label in zip(decoded_preds, decoded_labels) if label.strip()
     ]  # Only keep pairs where label is not empty
 
     if valid_pairs:
         valid_preds, valid_labels = zip(*valid_pairs)
         # Compute WER
-        wer = wer_metric.compute(
-            predictions=list(valid_preds), references=list(valid_labels)
-        )
+        wer = wer_metric.compute(predictions=list(valid_preds), references=list(valid_labels))
     else:
         wer = 1.0  # If no valid pairs, return worst possible WER
 
@@ -587,7 +541,8 @@ def parse_config(
     if training_args.push_to_hub and not hf_write_token:
         if accelerator.is_main_process:
             print(
-                "⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. Disabling hub upload."
+                "⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. "
+                "Disabling hub upload."
             )
         training_args.push_to_hub = False
 
@@ -604,15 +559,14 @@ def initialize_model(
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
 
-    # Note: Gradient checkpointing is handled by Trainer based on training_args.gradient_checkpointing
-    # The model has gradient_checkpointing_enable/disable methods that Trainer will call
+    # Note: Gradient checkpointing is handled by Trainer based on
+    # training_args.gradient_checkpointing. The model has
+    # gradient_checkpointing_enable/disable methods that Trainer will call
 
     return model, tokenizer
 
 
-def load_datasets(
-    data_args: DataArguments, accelerator: Accelerator
-) -> Tuple[Dataset, Dataset]:
+def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
@@ -633,9 +587,7 @@ def load_datasets(
     )
 
     if accelerator.is_main_process:
-        print(
-            f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}"
-        )
+        print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     return train_dataset, val_dataset
 
@@ -661,9 +613,9 @@ def setup_trainer(
 
     # Setup metrics computation
     wer_metric = evaluate.load("wer")
-    compute_metrics_fn = lambda eval_pred: compute_metrics(
-        eval_pred, tokenizer, wer_metric
-    )
+
+    def compute_metrics_fn(eval_pred):
+        return compute_metrics(eval_pred, tokenizer, wer_metric)
 
     # Initialize Trainer
     trainer = Trainer(
@@ -729,9 +681,7 @@ def show_sample_predictions(
 
             # Calculate sample WER for display
             if true_text != "[EMPTY]":
-                sample_wer = wer_metric.compute(
-                    predictions=[pred_text], references=[true_text]
-                )
+                sample_wer = wer_metric.compute(predictions=[pred_text], references=[true_text])
                 print(f"\nSample {i} (WER: {sample_wer:.2f}):")
             else:
                 print(f"\nSample {i}:")
@@ -792,9 +742,7 @@ def test_checkpoint_loading(
         new_model = ASRModel(model_args).to(accelerator.device)
 
         # Load the saved state dict
-        state_dict = torch.load(
-            f"{save_path}/pytorch_model.bin", map_location=accelerator.device
-        )
+        state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
         new_model.load_state_dict(state_dict)
 
         # Test that the model can do a forward pass
@@ -836,9 +784,7 @@ def run_training(
     if training_args.resume_from_checkpoint and os.path.exists(
         training_args.resume_from_checkpoint
     ):
-        print(
-            f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}"
-        )
+        print(f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}")
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
@@ -847,9 +793,7 @@ def run_training(
     if accelerator.is_main_process:
         print("💾 Saving final model...")
         # Use different save paths based on model size to avoid conflicts
-        model_size = (
-            f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
-        )
+        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         # Use state_dict to avoid shared tensor issues
         import os
@@ -878,9 +822,7 @@ def run_training(
         if training_args.push_to_hub and hf_write_token:
             print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
             trainer.push_to_hub()
-            print(
-                f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}"
-            )
+            print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
 
 
 def main() -> None:
@@ -912,9 +854,7 @@ def main() -> None:
             print("✅ Logged in to Hugging Face Hub with write token")
     else:
         if accelerator.is_main_process:
-            print(
-                "⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped."
-            )
+            print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
 
     # Optional: Setup WandB if available
     if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
@@ -961,9 +901,7 @@ def main() -> None:
     if eval_only:
         # Load saved model if it exists
         # Use different save paths based on model size to avoid conflicts
-        model_size = (
-            f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
-        )
+        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
         if os.path.exists(f"{save_path}/pytorch_model.bin"):
             print(f"📂 Loading model from {save_path}")
@@ -1010,9 +948,7 @@ def main() -> None:
             )
     else:
         # Run training
-        run_training(
-            trainer, tokenizer, training_args, accelerator, data_args, model_args
-        )
+        run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
 
 
 if __name__ == "__main__":
