@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 from accelerate import Accelerator
+import datasets
 from datasets import Dataset, load_dataset
 from einops import rearrange
 from peft import LoraConfig, TaskType, get_peft_model
@@ -243,9 +244,9 @@ class SmolLM2Decoder(nn.Module):
     def __init__(self, config: ModelArguments):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
-            config.decoder_model_name, dtype=torch.bfloat16
+            config.decoder_model_name, dtype=torch.bfloat16, token=False
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
             self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=False)
@@ -571,6 +572,7 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
 
+    # Load datasets
     train_dataset = load_dataset(
         data_args.dataset_name,
         data_args.dataset_config_name,
