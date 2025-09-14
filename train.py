@@ -57,6 +57,27 @@ hf_read_token = os.environ.get("HF_READ_TOKEN")
 
 
 @dataclass
+class CustomTrainingArguments(TrainingArguments):
+    """Extended TrainingArguments with custom fields for testing."""
+    do_generation_test: bool = field(
+        default=False,
+        metadata={"help": "Whether to test generation after training"}
+    )
+    generation_max_length: int = field(
+        default=50,
+        metadata={"help": "Maximum length for generation test"}
+    )
+    test_checkpoint_loading: bool = field(
+        default=False,
+        metadata={"help": "Whether to test checkpoint loading"}
+    )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to checkpoint to resume training from"}
+    )
+
+
+@dataclass
 class ModelArguments:
     """
     Unified configuration for all model components.
@@ -185,6 +206,8 @@ class ConformerEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        # Ensure tensor is contiguous for MPS compatibility
+        x = x.contiguous()
         x = self.subsample(x.unsqueeze(1))
         x = rearrange(x, "b c f t -> b t (c f)")
         x = self.input_proj(x)
@@ -280,6 +303,16 @@ class ASRModel(nn.Module):
         )
         self.spec_augment = SpecAugment()
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing for the decoder model."""
+        if hasattr(self.decoder.model, 'gradient_checkpointing_enable'):
+            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the decoder model."""
+        if hasattr(self.decoder.model, 'gradient_checkpointing_disable'):
+            self.decoder.model.gradient_checkpointing_disable()
+
     def forward(
         self,
         input_values: Optional[torch.Tensor] = None,
@@ -334,11 +367,23 @@ class ASRModel(nn.Module):
         else:
             combined_labels = None
 
-        return self.decoder.model.forward(
+        outputs = self.decoder.model.forward(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attention_mask,
             labels=combined_labels,
         )
+
+        # Only return loss and logits to avoid DynamicCache padding issues
+        if hasattr(outputs, 'loss') and hasattr(outputs, 'logits'):
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(
+                loss=outputs.loss,
+                logits=outputs.logits,
+                past_key_values=None,  # Don't return cache
+                hidden_states=None,
+                attentions=None,
+            )
+        return outputs
 
     @torch.inference_mode()
     def generate(
@@ -414,7 +459,7 @@ class DataCollator:
         specs_transposed = [s.transpose(0, 1) for s in specs]
         padded_specs = torch.nn.utils.rnn.pad_sequence(
             specs_transposed, batch_first=True
-        ).permute(0, 2, 1)
+        ).permute(0, 2, 1).contiguous()
 
         # Tokenize and pad text labels
         labels = self.tokenizer(
@@ -438,6 +483,10 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
     if isinstance(predictions, tuple):
         predictions = predictions[0]
 
+    # Get predicted token IDs from logits
+    if len(predictions.shape) == 3:  # (batch_size, sequence_length, vocab_size)
+        predictions = np.argmax(predictions, axis=-1)
+
     # Replace -100 with pad token id for proper decoding
     labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
 
@@ -455,7 +504,7 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer, wer_met
     return {"wer": wer if wer is not None else 0.0}
 
 
-def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArguments, DataArguments, TrainingArguments]:
+def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
     import os
     import sys
@@ -464,7 +513,7 @@ def parse_config(config_file: str, accelerator: Accelerator) -> Tuple[ModelArgum
         print(f"❌ Error: Config file '{config_file}' not found!")
         sys.exit(1)
 
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
 
     try:
         model_args, data_args, training_args = parser.parse_json_file(
@@ -512,19 +561,20 @@ def initialize_model(model_args: ModelArguments, accelerator: Accelerator) -> Tu
                 print("✅ Gradient checkpointing enabled")
 
     # Model compilation with torch.compile (if supported)
-    # Skip compilation on distributed training
-    try:
-        is_distributed = accelerator.num_processes > 1
-    except:
-        is_distributed = False
-
-    if torch.__version__ >= "2.0.0" and not is_distributed:
-        if accelerator.is_main_process:
-            print("🚀 Compiling model with torch.compile...")
-        model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-        model.audio_projector = torch.compile(model.audio_projector, mode="reduce-overhead")
-        if accelerator.is_main_process:
-            print("✅ Model compilation complete")
+    # Skip compilation when using Trainer (compatibility issues with accelerate)
+    # Uncomment the following lines if you want to use torch.compile without Trainer
+    # try:
+    #     is_distributed = accelerator.num_processes > 1
+    # except:
+    #     is_distributed = False
+    #
+    # if torch.__version__ >= "2.0.0" and not is_distributed:
+    #     if accelerator.is_main_process:
+    #         print("🚀 Compiling model with torch.compile...")
+    #     model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+    #     model.audio_projector = torch.compile(model.audio_projector, mode="reduce-overhead")
+    #     if accelerator.is_main_process:
+    #         print("✅ Model compilation complete")
 
     return model, tokenizer
 
@@ -556,7 +606,7 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
 def setup_trainer(
     model: ASRModel,
     tokenizer: AutoTokenizer,
-    training_args: TrainingArguments,
+    training_args: CustomTrainingArguments,
     train_dataset: Dataset,
     val_dataset: Dataset,
     model_args: ModelArguments,
@@ -589,7 +639,61 @@ def setup_trainer(
 
     return trainer
 
-def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: TrainingArguments, accelerator: Accelerator) -> None:
+def test_generation(model: ASRModel, tokenizer: AutoTokenizer, accelerator: Accelerator, max_length: int = 50) -> None:
+    """Test the model's generation capability."""
+    try:
+        # Create a dummy audio input
+        dummy_audio = torch.randn(1, 80, 100).to(accelerator.device)  # (batch, n_mels, time)
+        dummy_lengths = torch.tensor([100]).to(accelerator.device)
+
+        # Generate text
+        with torch.no_grad():
+            generated_ids = model.generate(
+                input_values=dummy_audio,
+                input_lengths=dummy_lengths,
+                max_length=max_length,
+                num_beams=1,
+                do_sample=False,
+            )
+
+        # Decode the generated text
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print(f"   Generated text: '{generated_text[:100]}...'")
+        print("   ✅ Generation test passed!")
+    except Exception as e:
+        print(f"   ⚠️ Generation test failed: {e}")
+
+
+def test_checkpoint_loading(save_path: str, model_args: ModelArguments, accelerator: Accelerator) -> None:
+    """Test loading a saved checkpoint."""
+    try:
+        # Create a new model instance
+        new_model = ASRModel(model_args).to(accelerator.device)
+
+        # Load the saved state dict
+        state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
+        new_model.load_state_dict(state_dict)
+
+        # Test that the model can do a forward pass
+        dummy_audio = torch.randn(1, 80, 100).to(accelerator.device)
+        dummy_lengths = torch.tensor([100]).to(accelerator.device)
+        dummy_labels = torch.randint(0, 1000, (1, 10)).to(accelerator.device)
+
+        with torch.no_grad():
+            outputs = new_model(
+                input_values=dummy_audio,
+                input_lengths=dummy_lengths,
+                labels=dummy_labels,
+            )
+
+        print(f"   Loaded model loss: {outputs.loss.item():.4f}")
+        print("   ✅ Checkpoint loading test passed!")
+    except Exception as e:
+        print(f"   ⚠️ Checkpoint loading test failed: {e}")
+
+
+def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: CustomTrainingArguments, accelerator: Accelerator,
+                data_args: DataArguments = None, model_args: ModelArguments = None) -> None:
     """Run the training and save the model."""
     # Start training
     if accelerator.is_main_process:
@@ -598,15 +702,34 @@ def run_training(trainer: Trainer, tokenizer: AutoTokenizer, training_args: Trai
         print(f"   Distributed: {accelerator.state.distributed_type}")
         print(f"   Mixed precision: {accelerator.mixed_precision}")
 
-    trainer.train()
+    # Resume from checkpoint if specified
+    if training_args.resume_from_checkpoint and os.path.exists(training_args.resume_from_checkpoint):
+        print(f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}")
+        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    else:
+        trainer.train()
 
     # Save final model (only on main process)
     if accelerator.is_main_process:
         print("💾 Saving final model...")
         save_path = f"{DATA_PATH}/models/final_model"
-        trainer.save_model(save_path)
+        # Use state_dict to avoid shared tensor issues
+        import os
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(trainer.model.state_dict(), f"{save_path}/pytorch_model.bin")
         tokenizer.save_pretrained(save_path)
         print(f"✅ Model saved to {save_path}")
+
+        # Test generation if requested
+        if training_args.do_generation_test:
+            print("\n🧪 Testing model generation...")
+            test_generation(trainer.model, tokenizer, accelerator,
+                          max_length=training_args.generation_max_length)
+
+        # Test checkpoint loading if requested
+        if training_args.test_checkpoint_loading:
+            print("\n🧪 Testing checkpoint loading...")
+            test_checkpoint_loading(save_path, model_args, accelerator)
 
         # Push to hub if requested
         if training_args.push_to_hub and hf_write_token:
@@ -679,7 +802,7 @@ def main() -> None:
     )
 
     # Run training
-    run_training(trainer, tokenizer, training_args, accelerator)
+    run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
 
 
 if __name__ == "__main__":

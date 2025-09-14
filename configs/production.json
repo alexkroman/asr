@@ -54,5 +54,10 @@
   "max_text_words": 200,
   "sample_rate": 16000,
   "dataset_cache_dir": "/workspace/datasets",
-  "num_proc": 16
+  "num_proc": 16,
+
+  "do_generation_test": false,
+  "generation_max_length": 50,
+  "test_checkpoint_loading": false,
+  "resume_from_checkpoint": null
 }
