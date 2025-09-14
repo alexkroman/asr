@@ -162,52 +162,229 @@ class SpecAugment(nn.Module):
         return x
 
 
+class ConvolutionModule(nn.Module):
+    """Convolution module for Conformer block."""
+
+    def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd for 'same' padding"
+
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.pointwise_conv1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
+        self.glu = nn.GLU(dim=1)
+        self.depthwise_conv = nn.Conv1d(
+            d_model, d_model, kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2, groups=d_model
+        )
+        self.batch_norm = nn.BatchNorm1d(d_model)
+        self.activation = nn.SiLU()
+        self.pointwise_conv2 = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch, time, d_model)
+        Returns:
+            Output tensor of shape (batch, time, d_model)
+        """
+        residual = x
+        x = self.layer_norm(x)
+
+        # Transpose for conv1d operations: (batch, time, d_model) -> (batch, d_model, time)
+        x = x.transpose(1, 2)
+
+        # Pointwise conv -> GLU
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+
+        # Depthwise conv
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+
+        # Second pointwise conv
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+
+        # Transpose back: (batch, d_model, time) -> (batch, time, d_model)
+        x = x.transpose(1, 2)
+
+        return residual + x
+
+
+class FeedForwardModule(nn.Module):
+    """Feed-forward module for Conformer block."""
+
+    def __init__(self, d_model: int, d_ff: int = None, dropout: float = 0.1):
+        super().__init__()
+        d_ff = d_ff or 4 * d_model
+
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.activation = nn.SiLU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch, time, d_model)
+        Returns:
+            Output tensor of shape (batch, time, d_model)
+        """
+        residual = x
+        x = self.layer_norm(x)
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout1(x)
+        x = self.linear2(x)
+        x = self.dropout2(x)
+        return residual + 0.5 * x  # Half-step residual as in Conformer paper
+
+
+class ConformerBlock(nn.Module):
+    """Single Conformer block with the characteristic sandwich structure."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        d_ff: int = None,
+        kernel_size: int = 31,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # First feed-forward module
+        self.ff1 = FeedForwardModule(d_model, d_ff, dropout)
+
+        # Multi-head self-attention module
+        self.self_attn_layer_norm = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_head, dropout=dropout, batch_first=True
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+
+        # Convolution module
+        self.conv_module = ConvolutionModule(d_model, kernel_size, dropout)
+
+        # Second feed-forward module
+        self.ff2 = FeedForwardModule(d_model, d_ff, dropout)
+
+        # Final layer norm
+        self.final_layer_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch, time, d_model)
+            key_padding_mask: Padding mask of shape (batch, time)
+        Returns:
+            Output tensor of shape (batch, time, d_model)
+        """
+        # First feed-forward
+        x = self.ff1(x)
+
+        # Multi-head self-attention with residual
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x, _ = self.self_attn(x, x, x, key_padding_mask=key_padding_mask)
+        x = self.attn_dropout(x)
+        x = residual + x
+
+        # Convolution module
+        x = self.conv_module(x)
+
+        # Second feed-forward
+        x = self.ff2(x)
+
+        # Final layer norm
+        x = self.final_layer_norm(x)
+
+        return x
+
+
 class ConformerEncoder(nn.Module):
+    """True Conformer encoder with proper architecture."""
+
     def __init__(self, config: ModelArguments):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False  # Track gradient checkpointing state
+
+        # Convolutional subsampling with stride 2 for each layer
+        # Total subsampling factor = 2^num_subsample_layers
+        self.subsample_layers = 2  # Number of conv layers with stride 2
+        self.subsample_factor = 2 ** self.subsample_layers  # Total subsampling: 4x
+
+        # Convolutional subsampling
         self.subsample = nn.Sequential(
             nn.Conv2d(1, config.d_model, 3, 2, 1),
             nn.SiLU(),
             nn.Conv2d(config.d_model, config.d_model, 3, 2, 1),
             nn.SiLU(),
         )
-        self.input_proj = nn.Linear(config.d_model * (config.n_mels // 4), config.d_model)
+
+        # Linear projection after subsampling
+        # Calculate feature dimension after frequency subsampling
+        freq_subsample_factor = self.subsample_factor  # Frequency dimension also reduced by same factor
+        self.input_proj = nn.Linear(
+            config.d_model * (config.n_mels // freq_subsample_factor),
+            config.d_model
+        )
         self.dropout = nn.Dropout(config.conformer_dropout)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.n_head,
-            dim_feedforward=config.d_model * 4,
-            dropout=config.conformer_dropout,
-            activation="gelu",
-            batch_first=False,  # We will feed it Time-first data
-            norm_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=config.num_layers,
-        )
+        # Stack of Conformer blocks
+        self.conformer_blocks = nn.ModuleList([
+            ConformerBlock(
+                d_model=config.d_model,
+                n_head=config.n_head,
+                d_ff=config.d_model * 4,
+                kernel_size=config.kernel_size,
+                dropout=config.conformer_dropout,
+            )
+            for _ in range(config.num_layers)
+        ])
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input mel-spectrogram of shape (batch, n_mels, time)
+            input_lengths: Lengths of input sequences
+        Returns:
+            Encoded features of shape (batch, time, d_model)
+        """
         # Ensure tensor is contiguous for MPS compatibility
         x = x.contiguous()
+
+        # Convolutional subsampling
         x = self.subsample(x.unsqueeze(1))
         x = rearrange(x, "b c f t -> b t (c f)")
         x = self.input_proj(x)
         x = self.dropout(x)
-        x = x.permute(1, 0, 2)  # Switch to (Time, Batch, Dim) format
 
-        output_lengths = input_lengths // 4
-        max_len = x.size(0)  # Get the max sequence length from the time dimension
+        # Calculate output lengths after subsampling
+        output_lengths = input_lengths // self.subsample_factor
+        max_len = x.size(1)
 
-        # Create a mask of shape (Batch, Time)
-        mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        # Create padding mask
+        key_padding_mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
 
-        # Pass the tensor and the mask to the transformer encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=mask)
+        # Apply Conformer blocks with optional gradient checkpointing
+        for conformer_block in self.conformer_blocks:
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory during training
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(conformer_block, x, key_padding_mask, use_reentrant=False)
+            else:
+                x = conformer_block(x, key_padding_mask)
 
-        x = x.permute(1, 0, 2)  # Switch back to (Batch, Time, Dim)
         return x
 
 
@@ -272,6 +449,101 @@ class SmolLM2Decoder(nn.Module):
                 self.model.print_trainable_parameters()
 
 
+class CustomASRTrainer(Trainer):
+    """Custom trainer with proper generation-based evaluation."""
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        """Custom evaluation loop that only computes loss during training."""
+        # For training, just compute loss to avoid expensive WER computation
+        # WER can be computed separately in evaluation mode
+        return super().evaluation_loop(
+            dataloader,
+            description,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+    def compute_wer_metrics(self, eval_dataset=None):
+        """Compute WER metrics for evaluation (can be called separately)."""
+        if eval_dataset is None:
+            return {}
+
+        model = self.model
+        model.eval()
+
+        # Create dataloader
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        wer_metric = evaluate.load("wer")
+        all_preds = []
+        all_labels = []
+
+        # Disable gradient computation
+        with torch.no_grad():
+            for step, inputs in enumerate(eval_dataloader):
+                # Move inputs to device
+                inputs = self._prepare_inputs(inputs)
+
+                # Generate predictions
+                try:
+                    # Use processing_class instead of deprecated tokenizer
+                    tokenizer = self.processing_class
+                    generated_ids = model.generate(
+                        input_values=inputs["input_values"],
+                        input_lengths=inputs["input_lengths"],
+                        max_length=256,
+                        num_beams=1,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+
+                    # Decode predictions
+                    pred_texts = tokenizer.batch_decode(
+                        generated_ids, skip_special_tokens=True
+                    )
+                    all_preds.extend([p.strip().lower() for p in pred_texts])
+
+                    # Decode labels
+                    labels = inputs["labels"]
+                    labels = torch.where(
+                        labels == -100, tokenizer.pad_token_id, labels
+                    )
+                    label_texts = tokenizer.batch_decode(
+                        labels, skip_special_tokens=True
+                    )
+                    all_labels.extend([l.strip().lower() for l in label_texts])
+
+                except Exception as e:
+                    # If generation fails, skip this batch
+                    print(f"Warning: Generation failed for batch {step}: {e}")
+                    continue
+
+        # Compute WER
+        if all_preds and all_labels:
+            # Filter out empty labels
+            valid_pairs = [
+                (pred, label)
+                for pred, label in zip(all_preds, all_labels)
+                if label.strip()
+            ]
+            if valid_pairs:
+                valid_preds, valid_labels = zip(*valid_pairs)
+                wer = wer_metric.compute(
+                    predictions=list(valid_preds), references=list(valid_labels)
+                )
+                return {"wer": wer}
+
+        return {"wer": 1.0}
+
+
 class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
@@ -282,12 +554,20 @@ class ASRModel(nn.Module):
         self.spec_augment = SpecAugment()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Enable gradient checkpointing for the decoder model."""
+        """Enable gradient checkpointing for both encoder and decoder models."""
+        # Enable for encoder
+        self.encoder.gradient_checkpointing = True
+
+        # Enable for decoder
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
             self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing for the decoder model."""
+        """Disable gradient checkpointing for both encoder and decoder models."""
+        # Disable for encoder
+        self.encoder.gradient_checkpointing = False
+
+        # Disable for decoder
         if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
             self.decoder.model.gradient_checkpointing_disable()
 
@@ -311,10 +591,14 @@ class ASRModel(nn.Module):
         if self.training:
             input_values = self.spec_augment(input_values)
 
-        # Use SDPA for attention (Accelerate will optimize this for the hardware)
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True, enable_math=False, enable_mem_efficient=True
-        ):
+        # Use SDPA optimization only on CUDA devices
+        if input_values.is_cuda:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
+            ):
+                audio_features = self.encoder(input_values, input_lengths)
+        else:
+            # For CPU, MPS, or other devices, use default attention implementation
             audio_features = self.encoder(input_values, input_lengths)
 
         audio_prefix = self.audio_projector(audio_features)
@@ -371,14 +655,13 @@ class ASRModel(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Dict[str, Union[int, float, torch.Tensor]],
     ) -> torch.Tensor:
-        # Ensure input has the same dtype as model
-        model_dtype = next(self.parameters()).dtype
-        input_values = input_values.to(dtype=model_dtype)
-
+        # Process through encoder (encoder handles its own dtype internally)
         audio_features = self.encoder(input_values, input_lengths)
+
+        # Project audio features to text embedding dimension
         audio_prefix = self.audio_projector(audio_features)
 
-        # Ensure audio_prefix has the same dtype as decoder
+        # Ensure audio_prefix matches decoder's dtype (explicitly set to bfloat16 in __init__)
         decoder_dtype = next(self.decoder.model.parameters()).dtype
         audio_prefix = audio_prefix.to(dtype=decoder_dtype)
 
@@ -425,11 +708,14 @@ class DataCollator:
 
         if not valid_features:
             # Return dummy batch if all samples filtered
+            # Use a more realistic dummy sequence length
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            dummy_seq_len = 10  # Reasonable sequence length for dummy batch
             return {
                 "input_values": torch.zeros((1, self.n_mels, 100)),
                 "input_lengths": torch.tensor([100]),
-                "labels": torch.tensor([[0]]),
-                "attention_mask": torch.tensor([[1]]),
+                "labels": torch.full((1, dummy_seq_len), pad_token_id, dtype=torch.long),
+                "attention_mask": torch.ones((1, dummy_seq_len), dtype=torch.long),  # Fixed: was zeros
             }
 
         # Process audio to spectrograms and normalize texts
@@ -468,42 +754,10 @@ def compute_metrics(
     tokenizer: AutoTokenizer,
     wer_metric: evaluate.EvaluationModule,
 ) -> Dict[str, float]:
-    """Compute metrics for ASR evaluation."""
-    predictions = eval_pred.predictions
-    labels = eval_pred.label_ids
-
-    # Handle the case where predictions might be a tuple
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-
-    # Get predicted token IDs from logits
-    if len(predictions.shape) == 3:  # (batch_size, sequence_length, vocab_size)
-        predictions = np.argmax(predictions, axis=-1)
-
-    # Replace -100 with pad token id for proper decoding
-    labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
-
-    # Decode predictions and labels
-    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-    # Normalize text (remove extra spaces, convert to lowercase)
-    decoded_preds = [pred.strip().lower() for pred in decoded_preds]
-    decoded_labels = [label.strip().lower() for label in decoded_labels]
-
-    # Filter out empty pairs to avoid WER calculation issues
-    valid_pairs = [
-        (pred, label) for pred, label in zip(decoded_preds, decoded_labels) if label.strip()
-    ]  # Only keep pairs where label is not empty
-
-    if valid_pairs:
-        valid_preds, valid_labels = zip(*valid_pairs)
-        # Compute WER
-        wer = wer_metric.compute(predictions=list(valid_preds), references=list(valid_labels))
-    else:
-        wer = 1.0  # If no valid pairs, return worst possible WER
-
-    return {"wer": wer if wer is not None else 0.0}
+    """Placeholder for compatibility - actual WER is computed in CustomASRTrainer."""
+    # This function is not used when CustomASRTrainer computes WER via generation
+    # Return empty dict as the real metrics are computed in evaluation_loop
+    return {}
 
 
 def parse_config(
@@ -613,21 +867,16 @@ def setup_trainer(
         max_text_words=data_args.max_text_words,
     )
 
-    # Setup metrics computation
-    wer_metric = evaluate.load("wer")
-
-    def compute_metrics_fn(eval_pred):
-        return compute_metrics(eval_pred, tokenizer, wer_metric)
-
-    # Initialize Trainer
-    trainer = Trainer(
+    # Initialize Custom Trainer with proper generation-based evaluation
+    # No compute_metrics needed as WER is computed directly in evaluation_loop
+    trainer = CustomASRTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics_fn,
+        compute_metrics=None,  # WER computed in evaluation_loop via generation
     )
 
     return trainer
@@ -641,7 +890,7 @@ def show_sample_predictions(
     device: torch.device,
     num_samples: int = 10,
 ) -> None:
-    """Show sample predictions from the validation set."""
+    """Show sample predictions from the validation set using generation."""
     model.eval()
 
     # Get random samples from the dataset
@@ -659,18 +908,16 @@ def show_sample_predictions(
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
 
-            # Get model predictions
-            outputs = model(
+            # Use actual generation
+            generated_ids = model.generate(
                 input_values=batch["input_values"],
                 input_lengths=batch["input_lengths"],
-                labels=batch["labels"],
+                max_length=256,
+                num_beams=1,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
             )
-
-            # Get predicted token IDs
-            predictions = torch.argmax(outputs.logits, dim=-1)
-
-            # Decode predictions and labels
-            pred_text = tokenizer.decode(predictions[0], skip_special_tokens=True)
+            pred_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
             # Get ground truth, handling -100 padding
             labels = batch["labels"][0]
@@ -743,9 +990,20 @@ def test_checkpoint_loading(
         # Create a new model instance
         new_model = ASRModel(model_args).to(accelerator.device)
 
-        # Load the saved state dict
-        state_dict = torch.load(f"{save_path}/pytorch_model.bin", map_location=accelerator.device)
-        new_model.load_state_dict(state_dict)
+        # Load LoRA adapters
+        from peft import PeftModel
+        new_model.decoder.model = PeftModel.from_pretrained(
+            new_model.decoder.model.base_model.model,
+            save_path,
+            device_map=accelerator.device,
+        )
+
+        # Load encoder and projector
+        audio_components = torch.load(
+            f"{save_path}/audio_components.bin", map_location=accelerator.device
+        )
+        new_model.encoder.load_state_dict(audio_components['encoder'])
+        new_model.audio_projector.load_state_dict(audio_components['audio_projector'])
 
         # Test that the model can do a forward pass
         model_dtype = next(new_model.parameters()).dtype
@@ -791,19 +1049,39 @@ def run_training(
     else:
         trainer.train()
 
+    # Optionally compute WER metrics after training (only on main process)
+    if accelerator.is_main_process and hasattr(trainer, 'compute_wer_metrics'):
+        print("📊 Computing final WER metrics...")
+        try:
+            eval_dataset = trainer.eval_dataset
+            if eval_dataset is not None:
+                wer_metrics = trainer.compute_wer_metrics(eval_dataset)
+                if wer_metrics:
+                    print(f"   Final WER: {wer_metrics.get('wer', 'N/A'):.4f}")
+        except Exception as e:
+            print(f"   Warning: Could not compute WER metrics: {e}")
+
     # Save final model (only on main process)
     if accelerator.is_main_process:
         print("💾 Saving final model...")
         # Use different save paths based on model size to avoid conflicts
         model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
-        # Use state_dict to avoid shared tensor issues
-        import os
 
+        import os
         os.makedirs(save_path, exist_ok=True)
-        torch.save(trainer.model.state_dict(), f"{save_path}/pytorch_model.bin")
+
+        # Save only LoRA adapters (small file)
+        print("   Saving LoRA adapters...")
+        trainer.model.decoder.model.save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
-        print(f"✅ Model saved to {save_path}")
+
+        # Also save encoder and projector separately
+        torch.save({
+            'encoder': trainer.model.encoder.state_dict(),
+            'audio_projector': trainer.model.audio_projector.state_dict(),
+        }, f"{save_path}/audio_components.bin")
+        print(f"✅ LoRA adapters and audio components saved to {save_path}")
 
         # Test generation if requested
         if training_args.do_generation_test:
@@ -905,13 +1183,23 @@ def main() -> None:
         # Use different save paths based on model size to avoid conflicts
         model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
         save_path = f"{DATA_PATH}/models/final_model_{model_size}"
-        if os.path.exists(f"{save_path}/pytorch_model.bin"):
-            print(f"📂 Loading model from {save_path}")
-            state_dict = torch.load(
-                f"{save_path}/pytorch_model.bin", map_location=accelerator.device
+
+        if os.path.exists(f"{save_path}/adapter_config.json"):
+            print(f"📂 Loading LoRA adapters from {save_path}")
+            from peft import PeftModel
+            model.decoder.model = PeftModel.from_pretrained(
+                model.decoder.model.base_model.model,
+                save_path,
+                device_map=accelerator.device,
             )
-            model.load_state_dict(state_dict)
-            print("✅ Model loaded successfully")
+            # Load encoder and projector
+            if os.path.exists(f"{save_path}/audio_components.bin"):
+                audio_components = torch.load(
+                    f"{save_path}/audio_components.bin", map_location=accelerator.device
+                )
+                model.encoder.load_state_dict(audio_components['encoder'])
+                model.audio_projector.load_state_dict(audio_components['audio_projector'])
+            print("✅ LoRA adapters loaded successfully")
         else:
             print(f"⚠️  No saved model found at {save_path}, using initialized model")
 

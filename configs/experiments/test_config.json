@@ -45,7 +45,7 @@
   "save_steps": 20,
   "save_total_limit": 1,
   "load_best_model_at_end": false,
-  "metric_for_best_model": "wer",
+  "metric_for_best_model": "eval_loss",
   "greater_is_better": false,
   "push_to_hub": false,
   "report_to": ["tensorboard"],
