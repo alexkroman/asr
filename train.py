@@ -76,10 +76,12 @@ hf_write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
 
 if hf_read_token:
     from huggingface_hub import login
+
     login(token=hf_read_token)
     print("✅ Logged in to Hugging Face Hub with read token")
 elif hf_write_token:
     from huggingface_hub import login
+
     login(token=hf_write_token)
     print("✅ Logged in to Hugging Face Hub with write token")
 else:
@@ -88,6 +90,7 @@ else:
 # Optional: Setup WandB if available
 if os.environ.get("WANDB_API_KEY"):
     import wandb
+
     wandb.login(key=os.environ.get("WANDB_API_KEY"))
     print("✅ Logged in to Weights & Biases")
 
@@ -123,8 +126,11 @@ class ProjectorConfig:
 
 class SpecAugment(nn.Module):
     def __init__(
-        self, freq_mask_param: int = 27, time_mask_param: int = 100,
-        n_freq_masks: int = 2, n_time_masks: int = 2
+        self,
+        freq_mask_param: int = 27,
+        time_mask_param: int = 100,
+        n_freq_masks: int = 2,
+        n_time_masks: int = 2,
     ) -> None:
         super().__init__()
         self.freq_masks = nn.ModuleList(
@@ -188,7 +194,9 @@ class ConformerEncoder(nn.Module):
         max_len = x.size(0)  # Get the max sequence length from the time dimension
 
         # Create a mask of shape (Batch, Time)
-        mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        mask = (
+            torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        )
 
         # Pass the tensor and the mask to the transformer encoder
         x = self.transformer_encoder(x, src_key_padding_mask=mask)
@@ -238,7 +246,7 @@ class SmolLM2Decoder(nn.Module):
             self.model.resize_token_embeddings(len(self.tokenizer))
             with torch.no_grad():
                 embeddings = self.model.get_input_embeddings()
-                if embeddings is not None and hasattr(embeddings, 'weight'):
+                if embeddings is not None and hasattr(embeddings, "weight"):
                     embedding_weight: torch.nn.Parameter = embeddings.weight  # type: ignore
                     embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -246,23 +254,31 @@ class SmolLM2Decoder(nn.Module):
             lora_config = LoraConfig(
                 r=config.lora_r,
                 lora_alpha=config.lora_alpha,
-                target_modules=list(config.lora_target_modules) if config.lora_target_modules else None,
+                target_modules=(
+                    list(config.lora_target_modules)
+                    if config.lora_target_modules
+                    else None
+                ),
                 lora_dropout=config.lora_dropout,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM,
             )
             self.model = get_peft_model(self.model, lora_config)
-            if hasattr(self.model, 'print_trainable_parameters'):
+            if hasattr(self.model, "print_trainable_parameters"):
                 self.model.print_trainable_parameters()
 
 
 class ASRModel(nn.Module):
-    def __init__(self, conformer_cfg: ConformerConfig, smollm2_cfg: SmolLM2Config,
-                 proj_cfg: ProjectorConfig) -> None:
+    def __init__(
+        self,
+        conformer_cfg: ConformerConfig,
+        smollm2_cfg: SmolLM2Config,
+        proj_cfg: ProjectorConfig,
+    ) -> None:
         super().__init__()
         self.encoder = ConformerEncoder(conformer_cfg)
         self.decoder = SmolLM2Decoder(smollm2_cfg)
-        text_dim = getattr(self.decoder.model.config, 'hidden_size', 768)
+        text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
         self.audio_projector = LightweightAudioProjector(
             conformer_cfg.d_model, text_dim, proj_cfg
         )
@@ -274,7 +290,7 @@ class ASRModel(nn.Module):
         input_lengths: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> Any:
         # Handle dict input from Trainer
         if input_values is None and "input_values" in kwargs:
@@ -289,7 +305,9 @@ class ASRModel(nn.Module):
             input_values = self.spec_augment(input_values)
 
         # Enable FlashAttention 2 via SDPA (works on A40 too)
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True, enable_math=False, enable_mem_efficient=True
+        ):
             audio_features = self.encoder(input_values, input_lengths)
 
         audio_prefix = self.audio_projector(audio_features)
@@ -314,7 +332,7 @@ class ASRModel(nn.Module):
                 audio_prefix.shape[:2],
                 fill_value=-100,
                 dtype=labels.dtype,
-                device=labels.device
+                device=labels.device,
             )
             combined_labels = torch.cat([prefix_labels, labels], dim=1)
         else:
@@ -327,8 +345,9 @@ class ASRModel(nn.Module):
         )
 
     @torch.inference_mode()
-    def generate(self, input_values: torch.Tensor, input_lengths: torch.Tensor,
-                 **kwargs: Any) -> Any:
+    def generate(
+        self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs: Any
+    ) -> Any:
         audio_features = self.encoder(input_values, input_lengths)
         audio_prefix = self.audio_projector(audio_features)
         return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
@@ -337,6 +356,7 @@ class ASRModel(nn.Module):
 @dataclass
 class DataCollator:
     """Data collator that performs preprocessing on-the-fly."""
+
     tokenizer: Any
     sample_rate: int = 16000
     n_mels: int = 80
@@ -363,8 +383,10 @@ class DataCollator:
             try:
                 audio_len_sec = len(f["audio"]["array"]) / self.sample_rate
                 text_len_words = len(self._normalize_text(f["text"]).split())
-                if (audio_len_sec <= self.max_audio_seconds
-                        and text_len_words <= self.max_text_words):
+                if (
+                    audio_len_sec <= self.max_audio_seconds
+                    and text_len_words <= self.max_text_words
+                ):
                     valid_features.append(f)
             except Exception:
                 continue
@@ -382,7 +404,9 @@ class DataCollator:
         specs = []
         texts = []
         for f in valid_features:
-            audio_array = torch.from_numpy(np.array(f["audio"]["array"], dtype=np.float32))
+            audio_array = torch.from_numpy(
+                np.array(f["audio"]["array"], dtype=np.float32)
+            )
             spec = self.mel_transform(audio_array)
             spec_db = self.amp_to_db(spec)
             spec_norm = (spec_db - spec_db.mean()) / (spec_db.std() + 1e-8)
@@ -409,7 +433,9 @@ class DataCollator:
         }
 
 
-def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any, wer_metric: Any) -> Dict[str, float]:
+def compute_metrics(
+    eval_pred: EvalPrediction, tokenizer: Any, wer_metric: Any
+) -> Dict[str, float]:
     """Compute WER metric for evaluation."""
     predictions = eval_pred.predictions
     label_ids = eval_pred.label_ids
@@ -439,11 +465,11 @@ class ASRTrainer(Trainer):
         model: nn.Module,
         inputs: Dict[str, Any],
         return_outputs: bool = False,
-        num_items_in_batch: Optional[torch.Tensor] = None
+        num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         """Compute loss with proper input handling."""
         outputs = model(**inputs)
-        loss = outputs.loss if hasattr(outputs, 'loss') else outputs['loss']
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
         return (loss, outputs) if return_outputs else loss
 
     def evaluation_loop(
@@ -452,7 +478,7 @@ class ASRTrainer(Trainer):
         description: str,
         prediction_loss_only: Optional[bool] = None,
         ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval"
+        metric_key_prefix: str = "eval",
     ) -> Any:
         """Custom evaluation loop with WER computation."""
         model = self._wrap_model(self.model, training=False)
@@ -468,11 +494,11 @@ class ASRTrainer(Trainer):
             with torch.no_grad():
                 # Compute loss
                 outputs = model(**inputs)
-                loss = outputs.loss if hasattr(outputs, 'loss') else outputs['loss']
+                loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
                 total_loss += loss.item()
 
                 # Generate predictions for WER
-                if hasattr(model, 'module'):
+                if hasattr(model, "module"):
                     generate_fn = model.module.generate
                 else:
                     generate_fn = model.generate
@@ -495,9 +521,15 @@ class ASRTrainer(Trainer):
 
         # Decode and compute WER
         if self.tokenizer is not None and all_preds:
-            decoded_preds = self.tokenizer.batch_decode(all_preds, skip_special_tokens=True)
-            decoded_labels = self.tokenizer.batch_decode(all_labels, skip_special_tokens=True)
-            wer = self.wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
+            decoded_preds = self.tokenizer.batch_decode(
+                all_preds, skip_special_tokens=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                all_labels, skip_special_tokens=True
+            )
+            wer = self.wer_metric.compute(
+                predictions=decoded_preds, references=decoded_labels
+            )
         else:
             wer = 0.0
 
@@ -511,7 +543,9 @@ class ASRTrainer(Trainer):
         return metrics
 
 
-def get_training_args(output_dir: str = f"{DATA_PATH}/checkpoints") -> TrainingArguments:
+def get_training_args(
+    output_dir: str = f"{DATA_PATH}/checkpoints",
+) -> TrainingArguments:
     """Get optimized training arguments for A40 GPU with 9 vCPUs."""
     # Detect GPU and adjust batch size
     batch_size = 16  # default
@@ -544,7 +578,9 @@ def get_training_args(output_dir: str = f"{DATA_PATH}/checkpoints") -> TrainingA
             batch_size = 32
             num_workers = 4
         else:
-            print(f"📊 Auto-adjusted batch size for {gpu_name} ({gpu_mem:.1f}GB VRAM): {batch_size}")
+            print(
+                f"📊 Auto-adjusted batch size for {gpu_name} ({gpu_mem:.1f}GB VRAM): {batch_size}"
+            )
 
     return TrainingArguments(
         output_dir=output_dir,
@@ -572,7 +608,11 @@ def get_training_args(output_dir: str = f"{DATA_PATH}/checkpoints") -> TrainingA
         dataloader_persistent_workers=True,  # Keep workers alive between epochs
         remove_unused_columns=False,
         label_names=["labels"],
-        report_to=["tensorboard", "wandb"] if os.environ.get("WANDB_API_KEY") else ["tensorboard"],
+        report_to=(
+            ["tensorboard", "wandb"]
+            if os.environ.get("WANDB_API_KEY")
+            else ["tensorboard"]
+        ),
         push_to_hub=bool(hf_write_token),
         hub_model_id="mazesmazes/asr" if hf_write_token else None,
         hub_strategy="checkpoint",
@@ -583,11 +623,21 @@ def get_training_args(output_dir: str = f"{DATA_PATH}/checkpoints") -> TrainingA
 def main() -> None:
     """Main training function."""
     parser = argparse.ArgumentParser(description="ASR Training with Conformer-SmolLM2")
-    parser.add_argument("--push-to-hub", action="store_true", help="Push model to HF Hub")
-    parser.add_argument("--hub-model-id", type=str, default="mazesmazes/asr", help="Hub model ID")
-    parser.add_argument("--max-steps", type=int, default=50000, help="Maximum training steps")
-    parser.add_argument("--eval-steps", type=int, default=250, help="Evaluation frequency")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+    parser.add_argument(
+        "--push-to-hub", action="store_true", help="Push model to HF Hub"
+    )
+    parser.add_argument(
+        "--hub-model-id", type=str, default="mazesmazes/asr", help="Hub model ID"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=50000, help="Maximum training steps"
+    )
+    parser.add_argument(
+        "--eval-steps", type=int, default=250, help="Evaluation frequency"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None, help="Override batch size"
+    )
     args = parser.parse_args()
 
     # Initialize configs
@@ -612,7 +662,9 @@ def main() -> None:
         if "A40" in gpu_name:
             # A40 optimizations
             compile_mode = "reduce-overhead"  # Better for A40
-            print(f"🚀 Compiling model for A40 with torch.compile (mode='{compile_mode}')...")
+            print(
+                f"🚀 Compiling model for A40 with torch.compile (mode='{compile_mode}')..."
+            )
             model.encoder = torch.compile(model.encoder, mode=compile_mode)  # type: ignore
             model.audio_projector = torch.compile(model.audio_projector, mode=compile_mode)  # type: ignore
             # Don't compile decoder for A40 to avoid OOM
@@ -628,12 +680,18 @@ def main() -> None:
     # Load datasets with optimized settings for 9 vCPUs
     print("📦 Loading datasets...")
     train_dataset = load_dataset(
-        "librispeech_asr", "clean", split="train.100",
-        cache_dir="/workspace/datasets", num_proc=8  # Use 8 of 9 CPUs for loading
+        "librispeech_asr",
+        "clean",
+        split="train.100",
+        cache_dir="/workspace/datasets",
+        num_proc=8,  # Use 8 of 9 CPUs for loading
     )
     val_dataset = load_dataset(
-        "librispeech_asr", "clean", split="validation",
-        cache_dir="/workspace/datasets", num_proc=8
+        "librispeech_asr",
+        "clean",
+        split="validation",
+        cache_dir="/workspace/datasets",
+        num_proc=8,
     )
     print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
