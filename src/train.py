@@ -449,101 +449,6 @@ class SmolLM2Decoder(nn.Module):
                 self.model.print_trainable_parameters()
 
 
-class CustomASRTrainer(Trainer):
-    """Custom trainer with proper generation-based evaluation."""
-
-    def evaluation_loop(
-        self,
-        dataloader,
-        description,
-        prediction_loss_only=None,
-        ignore_keys=None,
-        metric_key_prefix="eval",
-    ):
-        """Custom evaluation loop that only computes loss during training."""
-        # For training, just compute loss to avoid expensive WER computation
-        # WER can be computed separately in evaluation mode
-        return super().evaluation_loop(
-            dataloader,
-            description,
-            prediction_loss_only=prediction_loss_only,
-            ignore_keys=ignore_keys,
-            metric_key_prefix=metric_key_prefix,
-        )
-
-    def compute_wer_metrics(self, eval_dataset=None):
-        """Compute WER metrics for evaluation (can be called separately)."""
-        if eval_dataset is None:
-            return {}
-
-        model = self.model
-        model.eval()
-
-        # Create dataloader
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
-
-        wer_metric = evaluate.load("wer")
-        all_preds = []
-        all_labels = []
-
-        # Disable gradient computation
-        with torch.no_grad():
-            for step, inputs in enumerate(eval_dataloader):
-                # Move inputs to device
-                inputs = self._prepare_inputs(inputs)
-
-                # Generate predictions
-                try:
-                    # Use processing_class instead of deprecated tokenizer
-                    tokenizer = self.processing_class
-                    generated_ids = model.generate(
-                        input_values=inputs["input_values"],
-                        input_lengths=inputs["input_lengths"],
-                        max_length=256,
-                        num_beams=1,
-                        do_sample=False,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-
-                    # Decode predictions
-                    pred_texts = tokenizer.batch_decode(
-                        generated_ids, skip_special_tokens=True
-                    )
-                    all_preds.extend([p.strip().lower() for p in pred_texts])
-
-                    # Decode labels
-                    labels = inputs["labels"]
-                    labels = torch.where(
-                        labels == -100, tokenizer.pad_token_id, labels
-                    )
-                    label_texts = tokenizer.batch_decode(
-                        labels, skip_special_tokens=True
-                    )
-                    all_labels.extend([l.strip().lower() for l in label_texts])
-
-                except Exception as e:
-                    # If generation fails, skip this batch
-                    print(f"Warning: Generation failed for batch {step}: {e}")
-                    continue
-
-        # Compute WER
-        if all_preds and all_labels:
-            # Filter out empty labels
-            valid_pairs = [
-                (pred, label)
-                for pred, label in zip(all_preds, all_labels)
-                if label.strip()
-            ]
-            if valid_pairs:
-                valid_preds, valid_labels = zip(*valid_pairs)
-                wer = wer_metric.compute(
-                    predictions=list(valid_preds), references=list(valid_labels)
-                )
-                return {"wer": wer}
-
-        return {"wer": 1.0}
-
-
 class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
@@ -867,16 +772,15 @@ def setup_trainer(
         max_text_words=data_args.max_text_words,
     )
 
-    # Initialize Custom Trainer with proper generation-based evaluation
-    # No compute_metrics needed as WER is computed directly in evaluation_loop
-    trainer = CustomASRTrainer(
+    # Initialize standard Trainer
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        compute_metrics=None,  # WER computed in evaluation_loop via generation
+        compute_metrics=None,  # Using eval_loss for model selection
     )
 
     return trainer
@@ -1048,18 +952,6 @@ def run_training(
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
-
-    # Optionally compute WER metrics after training (only on main process)
-    if accelerator.is_main_process and hasattr(trainer, 'compute_wer_metrics'):
-        print("📊 Computing final WER metrics...")
-        try:
-            eval_dataset = trainer.eval_dataset
-            if eval_dataset is not None:
-                wer_metrics = trainer.compute_wer_metrics(eval_dataset)
-                if wer_metrics:
-                    print(f"   Final WER: {wer_metrics.get('wer', 'N/A'):.4f}")
-        except Exception as e:
-            print(f"   Warning: Could not compute WER metrics: {e}")
 
     # Save final model (only on main process)
     if accelerator.is_main_process:
