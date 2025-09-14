@@ -2,6 +2,7 @@
 datasets_cache
 myenv
 test_output
+mac_minimal_output
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

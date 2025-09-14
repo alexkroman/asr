@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 from accelerate import Accelerator
-import datasets
 from datasets import Dataset, load_dataset
 from einops import rearrange
 from peft import LoraConfig, TaskType, get_peft_model
@@ -167,8 +166,11 @@ class ConvolutionModule(nn.Module):
         self.pointwise_conv1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
         self.glu = nn.GLU(dim=1)
         self.depthwise_conv = nn.Conv1d(
-            d_model, d_model, kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2, groups=d_model
+            d_model,
+            d_model,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            groups=d_model,
         )
         self.batch_norm = nn.BatchNorm1d(d_model)
         self.activation = nn.SiLU()
@@ -210,7 +212,7 @@ class ConvolutionModule(nn.Module):
 class FeedForwardModule(nn.Module):
     """Feed-forward module for Conformer block."""
 
-    def __init__(self, d_model: int, d_ff: int = None, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
         d_ff = d_ff or 4 * d_model
 
@@ -245,7 +247,7 @@ class ConformerBlock(nn.Module):
         self,
         d_model: int,
         n_head: int,
-        d_ff: int = None,
+        d_ff: Optional[int] = None,
         kernel_size: int = 31,
         dropout: float = 0.1,
     ):
@@ -256,9 +258,7 @@ class ConformerBlock(nn.Module):
 
         # Multi-head self-attention module
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(
-            d_model, n_head, dropout=dropout, batch_first=True
-        )
+        self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
         self.attn_dropout = nn.Dropout(dropout)
 
         # Convolution module
@@ -315,7 +315,7 @@ class ConformerEncoder(nn.Module):
         # Convolutional subsampling with stride 2 for each layer
         # Total subsampling factor = 2^num_subsample_layers
         self.subsample_layers = 2  # Number of conv layers with stride 2
-        self.subsample_factor = 2 ** self.subsample_layers  # Total subsampling: 4x
+        self.subsample_factor = 2**self.subsample_layers  # Total subsampling: 4x
 
         # Convolutional subsampling
         self.subsample = nn.Sequential(
@@ -327,24 +327,27 @@ class ConformerEncoder(nn.Module):
 
         # Linear projection after subsampling
         # Calculate feature dimension after frequency subsampling
-        freq_subsample_factor = self.subsample_factor  # Frequency dimension also reduced by same factor
+        freq_subsample_factor = (
+            self.subsample_factor
+        )  # Frequency dimension also reduced by same factor
         self.input_proj = nn.Linear(
-            config.d_model * (config.n_mels // freq_subsample_factor),
-            config.d_model
+            config.d_model * (config.n_mels // freq_subsample_factor), config.d_model
         )
         self.dropout = nn.Dropout(config.conformer_dropout)
 
         # Stack of Conformer blocks
-        self.conformer_blocks = nn.ModuleList([
-            ConformerBlock(
-                d_model=config.d_model,
-                n_head=config.n_head,
-                d_ff=config.d_model * 4,
-                kernel_size=config.kernel_size,
-                dropout=config.conformer_dropout,
-            )
-            for _ in range(config.num_layers)
-        ])
+        self.conformer_blocks = nn.ModuleList(
+            [
+                ConformerBlock(
+                    d_model=config.d_model,
+                    n_head=config.n_head,
+                    d_ff=config.d_model * 4,
+                    kernel_size=config.kernel_size,
+                    dropout=config.conformer_dropout,
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
         """
@@ -368,13 +371,16 @@ class ConformerEncoder(nn.Module):
         max_len = x.size(1)
 
         # Create padding mask
-        key_padding_mask = torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        key_padding_mask = (
+            torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
+        )
 
         # Apply Conformer blocks with optional gradient checkpointing
         for conformer_block in self.conformer_blocks:
             if self.gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training
                 from torch.utils.checkpoint import checkpoint
+
                 x = checkpoint(conformer_block, x, key_padding_mask, use_reentrant=False)
             else:
                 x = conformer_block(x, key_padding_mask)
@@ -449,30 +455,37 @@ class CustomTrainer(Trainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Override save to handle tied embeddings in the decoder."""
         output_dir = output_dir if output_dir is not None else self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
 
         # Save the model using save_model which handles tied embeddings
         if self.model is not None:
             self._save_model(output_dir, state_dict)
 
         # Save tokenizer
-        if self.tokenizer is not None:
+        if self.tokenizer is not None and output_dir is not None:
             self.tokenizer.save_pretrained(output_dir)
 
         # Save training args
-        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        if output_dir is not None:
+            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
     def _save_model(self, output_dir, state_dict=None):
         """Save model handling tied embeddings properly."""
         # Use the model's save_pretrained if available (for HF models)
-        if hasattr(self.model, 'decoder') and hasattr(self.model.decoder.model, 'save_pretrained'):
+        if hasattr(self.model, "decoder") and hasattr(self.model.decoder, "model") and hasattr(self.model.decoder.model, "save_pretrained"):
             # Save decoder with tied embeddings handled properly
-            decoder_path = os.path.join(output_dir, "decoder")
-            self.model.decoder.model.save_pretrained(decoder_path)
+            if output_dir is not None:
+                decoder_path = os.path.join(output_dir, "decoder")
+                self.model.decoder.model.save_pretrained(decoder_path)
 
             # Save encoder and projector separately
-            torch.save(self.model.encoder.state_dict(), os.path.join(output_dir, "encoder.bin"))
-            torch.save(self.model.audio_projector.state_dict(), os.path.join(output_dir, "projector.bin"))
+            if output_dir is not None and hasattr(self.model, "encoder"):
+                torch.save(self.model.encoder.state_dict(), os.path.join(output_dir, "encoder.bin"))
+            if output_dir is not None and hasattr(self.model, "audio_projector"):
+                torch.save(
+                    self.model.audio_projector.state_dict(), os.path.join(output_dir, "projector.bin")
+                )
         else:
             # Fallback to standard save
             super()._save(output_dir, state_dict)
@@ -643,13 +656,17 @@ class DataCollator:
         if not valid_features:
             # Return dummy batch if all samples filtered
             # Use a more realistic dummy sequence length
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            pad_token_id = (
+                self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            )
             dummy_seq_len = 10  # Reasonable sequence length for dummy batch
             return {
                 "input_values": torch.zeros((1, self.n_mels, 100)),
                 "input_lengths": torch.tensor([100]),
                 "labels": torch.full((1, dummy_seq_len), pad_token_id, dtype=torch.long),
-                "attention_mask": torch.ones((1, dummy_seq_len), dtype=torch.long),  # Fixed: was zeros
+                "attention_mask": torch.ones(
+                    (1, dummy_seq_len), dtype=torch.long
+                ),  # Fixed: was zeros
             }
 
         # Process audio to spectrograms and normalize texts
@@ -871,46 +888,89 @@ def show_sample_predictions(
             print(f"  Pred:  {pred_text}")
 
 
-def test_checkpoint_loading(
-    save_path: str, model_args: ModelArguments, accelerator: Accelerator
-) -> None:
-    """Test loading a saved checkpoint."""
+def load_checkpoint(checkpoint_dir: str, model: ASRModel, accelerator: Accelerator) -> bool:
+    """Load a checkpoint into the model. Returns True if successful."""
     try:
-        # Create a new model instance
-        new_model = ASRModel(model_args).to(accelerator.device)
+        # Check if it's a LoRA model or full model
+        if os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json")):
+            print("   Loading LoRA adapters...")
+            from peft import PeftModel
 
-        # Load LoRA adapters
-        from peft import PeftModel
-        new_model.decoder.model = PeftModel.from_pretrained(
-            new_model.decoder.model.base_model.model,
-            save_path,
-            device_map=accelerator.device,
-        )
-
-        # Load encoder and projector
-        audio_components = torch.load(
-            f"{save_path}/audio_components.bin", map_location=accelerator.device
-        )
-        new_model.encoder.load_state_dict(audio_components['encoder'])
-        new_model.audio_projector.load_state_dict(audio_components['audio_projector'])
-
-        # Test that the model can do a forward pass
-        model_dtype = next(new_model.parameters()).dtype
-        dummy_audio = torch.randn(1, 80, 100, dtype=model_dtype).to(accelerator.device)
-        dummy_lengths = torch.tensor([100]).to(accelerator.device)
-        dummy_labels = torch.randint(0, 1000, (1, 10)).to(accelerator.device)
-
-        with torch.no_grad():
-            outputs = new_model(
-                input_values=dummy_audio,
-                input_lengths=dummy_lengths,
-                labels=dummy_labels,
+            model.decoder.model = PeftModel.from_pretrained(
+                model.decoder.model.base_model.model,
+                checkpoint_dir,
+                device_map=accelerator.device,
             )
+            # Load encoder and projector if they exist
+            if os.path.exists(os.path.join(checkpoint_dir, "audio_components.bin")):
+                audio_components = torch.load(
+                    os.path.join(checkpoint_dir, "audio_components.bin"),
+                    map_location=accelerator.device,
+                )
+                model.encoder.load_state_dict(audio_components["encoder"])
+                model.audio_projector.load_state_dict(audio_components["audio_projector"])
+        elif os.path.exists(os.path.join(checkpoint_dir, "decoder")):
+            # Load from CustomTrainer saved format
+            print("   Loading from checkpoint format...")
+            decoder_path = os.path.join(checkpoint_dir, "decoder")
+            if os.path.exists(decoder_path):
+                model.decoder.model = AutoModelForCausalLM.from_pretrained(
+                    decoder_path, device_map=accelerator.device, dtype=torch.bfloat16
+                )
+            if os.path.exists(os.path.join(checkpoint_dir, "encoder.bin")):
+                model.encoder.load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "encoder.bin"), map_location=accelerator.device
+                    )
+                )
+            if os.path.exists(os.path.join(checkpoint_dir, "projector.bin")):
+                model.audio_projector.load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "projector.bin"),
+                        map_location=accelerator.device,
+                    )
+                )
+        else:
+            print(f"⚠️  Unknown checkpoint format in {checkpoint_dir}")
+            return False
 
-        print(f"   Loaded model loss: {outputs.loss.item():.4f}")
-        print("   ✅ Checkpoint loading test passed!")
+        print("✅ Model loaded successfully")
+        return True
     except Exception as e:
-        print(f"   ⚠️ Checkpoint loading test failed: {e}")
+        print(f"⚠️  Failed to load checkpoint: {e}")
+        return False
+
+
+def find_latest_checkpoint(output_dir: str, model_args: ModelArguments) -> Optional[str]:
+    """Find the latest checkpoint, either final model or training checkpoint."""
+    # First, check for final model
+    model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
+    save_path = f"{DATA_PATH}/models/final_model_{model_size}"
+
+    if os.path.exists(f"{save_path}/adapter_config.json") or os.path.exists(f"{save_path}/decoder"):
+        print(f"📂 Found final model at {save_path}")
+        return save_path
+
+    # Look for latest checkpoint in output_dir
+    if os.path.exists(output_dir):
+        checkpoint_dirs = [
+            d
+            for d in os.listdir(output_dir)
+            if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))
+        ]
+
+        if checkpoint_dirs:
+            # Sort by step number and get the latest
+            checkpoint_dirs.sort(key=lambda x: int(x.split("-")[-1]))
+            checkpoint_dir = os.path.join(output_dir, checkpoint_dirs[-1])
+            print(f"📂 Found checkpoint at {checkpoint_dir}")
+            return checkpoint_dir
+        else:
+            print(f"⚠️  No checkpoints found in {output_dir}")
+    else:
+        print(f"⚠️  Output directory {output_dir} does not exist")
+
+    return None
 
 
 def run_training(
@@ -937,7 +997,6 @@ def run_training(
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
-
 
     # Push to hub if requested
     if training_args.push_to_hub and hf_write_token:
@@ -1020,29 +1079,13 @@ def main() -> None:
     )
 
     if eval_only:
-        # Load saved model if it exists
-        # Use different save paths based on model size to avoid conflicts
-        model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
-        save_path = f"{DATA_PATH}/models/final_model_{model_size}"
+        # Find and load the latest checkpoint
+        checkpoint_dir = find_latest_checkpoint(training_args.output_dir, model_args)
 
-        if os.path.exists(f"{save_path}/adapter_config.json"):
-            print(f"📂 Loading LoRA adapters from {save_path}")
-            from peft import PeftModel
-            model.decoder.model = PeftModel.from_pretrained(
-                model.decoder.model.base_model.model,
-                save_path,
-                device_map=accelerator.device,
-            )
-            # Load encoder and projector
-            if os.path.exists(f"{save_path}/audio_components.bin"):
-                audio_components = torch.load(
-                    f"{save_path}/audio_components.bin", map_location=accelerator.device
-                )
-                model.encoder.load_state_dict(audio_components['encoder'])
-                model.audio_projector.load_state_dict(audio_components['audio_projector'])
-            print("✅ LoRA adapters loaded successfully")
+        if checkpoint_dir:
+            load_checkpoint(checkpoint_dir, model, accelerator)
         else:
-            print(f"⚠️  No saved model found at {save_path}, using initialized model")
+            print("⚠️  No saved model or checkpoint found, using initialized model")
 
         # Run evaluation
         print("\n📊 Running evaluation...")

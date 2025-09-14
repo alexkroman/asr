@@ -198,6 +198,8 @@ MPS_ALLOCATOR_POLICY = "default"
 [tool.hatch.envs.mac.scripts]
 train-development = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json}"
 train-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
+
+[tool.hatch.scripts]
 eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
 
 [tool.hatch.envs.test]
@@ -226,7 +228,7 @@ multi_line_output = 3
 include_trailing_comma = true
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
