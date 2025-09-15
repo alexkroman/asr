@@ -60,11 +60,8 @@ hf_read_token = os.environ.get("HF_READ_TOKEN")
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
-    """Extended TrainingArguments with custom fields for testing."""
+    """Extended TrainingArguments with custom fields."""
 
-    test_checkpoint_loading: bool = field(
-        default=False, metadata={"help": "Whether to test checkpoint loading"}
-    )
     resume_from_checkpoint: Optional[str] = field(
         default=None, metadata={"help": "Path to checkpoint to resume training from"}
     )
@@ -102,6 +99,7 @@ class ModelArguments:
     num_queries: int = field(default=24, metadata={"help": "Number of queries for projector."})
     projector_num_heads: int = field(default=8, metadata={"help": "Number of heads for projector."})
     projector_dropout: float = field(default=0.1, metadata={"help": "Dropout for projector."})
+    projector_num_layers: int = field(default=2, metadata={"help": "Number of layers in the deep projector."})
 
 
 @dataclass
@@ -367,7 +365,6 @@ class ConformerEncoder(nn.Module):
         Returns:
             Encoded features of shape (batch, time, d_model)
         """
-        # Ensure tensor is contiguous for MPS compatibility
         x = x.contiguous()
 
         # Convolutional subsampling
@@ -416,53 +413,67 @@ class ConformerEncoder(nn.Module):
     def _checkpoint_forward(self, module, *args):
         """Helper method for gradient checkpointing with proper handling."""
         from torch.utils.checkpoint import checkpoint
-        # Use checkpoint with use_reentrant=False for better memory efficiency
-        # and compatibility with autocast
         return checkpoint(module, *args, use_reentrant=False)
 
     @property
     def gradient_checkpointing(self):
-        """Property for compatibility with Trainer."""
         return self._gradient_checkpointing
 
     @gradient_checkpointing.setter
     def gradient_checkpointing(self, value):
-        """Property setter for compatibility with Trainer."""
         self._gradient_checkpointing = value
 
 
-class LightweightAudioProjector(nn.Module):
+class DeepAudioProjector(nn.Module):
     def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
+        self.num_layers = config.projector_num_layers
+
         self.audio_proj = nn.Linear(audio_dim, text_dim, bias=False)
-        # Initialize queries with smaller values for numerical stability
         self.queries = nn.Parameter(torch.zeros(config.num_queries, text_dim))
         nn.init.normal_(self.queries, mean=0.0, std=0.01)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=text_dim,
-            num_heads=config.projector_num_heads,
-            dropout=config.projector_dropout,
-            batch_first=True,
-            bias=False,
-        )
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(text_dim),
-            nn.Linear(text_dim, text_dim * 2, bias=False),
-            nn.GELU(),
-            nn.Dropout(config.projector_dropout),
-            nn.Linear(text_dim * 2, text_dim, bias=False),
-            nn.LayerNorm(text_dim),
-        )
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'cross_attn': nn.MultiheadAttention(
+                    embed_dim=text_dim,
+                    num_heads=config.projector_num_heads,
+                    dropout=config.projector_dropout,
+                    batch_first=True,
+                ),
+                'self_attn': nn.MultiheadAttention(
+                    embed_dim=text_dim,
+                    num_heads=config.projector_num_heads,
+                    dropout=config.projector_dropout,
+                    batch_first=True,
+                ),
+                'mlp': nn.Sequential(
+                    nn.LayerNorm(text_dim),
+                    nn.Linear(text_dim, text_dim * 4),
+                    nn.GELU(),
+                    nn.Linear(text_dim * 4, text_dim),
+                ),
+                'norm1': nn.LayerNorm(text_dim),
+                'norm2': nn.LayerNorm(text_dim),
+            }) for _ in range(self.num_layers)
+        ])
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         B = audio_features.shape[0]
-
         audio_proj = self.audio_proj(audio_features)
-        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
-        attn_out, _ = self.cross_attn(queries, audio_proj, audio_proj)
-        result: torch.Tensor = self.mlp(attn_out + queries)
 
-        return result
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)
+
+        for layer in self.layers:
+            attn_out, _ = layer['cross_attn'](q, audio_proj, audio_proj)
+            q = layer['norm1'](q + attn_out)
+
+            self_attn_out, _ = layer['self_attn'](q, q, q)
+            q = layer['norm2'](q + self_attn_out)
+
+            q = q + layer['mlp'](q)
+
+        return q
 
 
 class SmolLM2Decoder(nn.Module):
@@ -557,9 +568,7 @@ class CustomTrainer(Trainer):
             loss = result
             outputs = None
 
-        # Check for NaN loss and replace with small value if found
         if loss is not None and torch.isnan(loss):
-            print(f"⚠️ Warning: NaN loss detected, using fallback loss")
             loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
 
         # Track loss for stuck detection (only during training)
@@ -643,7 +652,7 @@ class ASRModel(nn.Module):
         self.encoder = ConformerEncoder(config)
         self.decoder = SmolLM2Decoder(config)
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
-        self.audio_projector = LightweightAudioProjector(config.d_model, text_dim, config)
+        self.audio_projector = DeepAudioProjector(config.d_model, text_dim, config)
         self.spec_augment = SpecAugment()
 
         # Initialize weights with smaller values for stability
@@ -749,13 +758,6 @@ class ASRModel(nn.Module):
 
         audio_prefix = self.audio_projector(audio_features)
 
-        # Debug: Check for NaN/Inf
-        if os.environ.get("DEBUG_GRADIENTS") == "1" and self.training:
-            if not torch.all(torch.isfinite(audio_prefix)):
-                print(f"❌ Non-finite values in audio_prefix: NaN={torch.any(torch.isnan(audio_prefix))}, Inf={torch.any(torch.isinf(audio_prefix))}")
-                print(f"   audio_features stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, mean={audio_features.mean():.4f}")
-                print(f"   audio_prefix stats: min={audio_prefix.min():.4f}, max={audio_prefix.max():.4f}, mean={audio_prefix.mean():.4f}")
-
         embeddings = self.decoder.model.get_input_embeddings()
         if labels is not None and callable(embeddings):
             text_embeds = embeddings(labels)
@@ -825,13 +827,6 @@ class ASRModel(nn.Module):
 
         # Project audio features to text embedding dimension
         audio_prefix = self.audio_projector(audio_features)
-
-        # Debug: Check for NaN/Inf
-        if os.environ.get("DEBUG_GRADIENTS") == "1" and self.training:
-            if not torch.all(torch.isfinite(audio_prefix)):
-                print(f"❌ Non-finite values in audio_prefix: NaN={torch.any(torch.isnan(audio_prefix))}, Inf={torch.any(torch.isinf(audio_prefix))}")
-                print(f"   audio_features stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, mean={audio_features.mean():.4f}")
-                print(f"   audio_prefix stats: min={audio_prefix.min():.4f}, max={audio_prefix.max():.4f}, mean={audio_prefix.mean():.4f}")
 
         # Ensure audio_prefix matches decoder's dtype (explicitly set to bfloat16 in __init__)
         decoder_dtype = next(self.decoder.model.parameters()).dtype
@@ -964,23 +959,9 @@ class DataCollator:
             "attention_mask": labels["attention_mask"],
         }
 
-        # Assert that all values are finite (debugging check)
-        if os.environ.get("DEBUG_GRADIENTS") == "1":
-            assert torch.all(torch.isfinite(output_batch["input_values"])), \
-                "NaN/Inf detected in final batch - this should not happen with proper preprocessing"
-
         return output_batch
 
 
-def compute_metrics(
-    eval_pred: EvalPrediction,
-    tokenizer: AutoTokenizer,
-    wer_metric: evaluate.EvaluationModule,
-) -> Dict[str, float]:
-    """Placeholder for compatibility - actual WER is computed in CustomASRTrainer."""
-    # This function is not used when CustomASRTrainer computes WER via generation
-    # Return empty dict as the real metrics are computed in evaluation_loop
-    return {}
 
 
 def parse_config(
@@ -1068,43 +1049,8 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
         num_proc=safe_num_proc,
     )
 
-    # Filter long samples before training to improve efficiency
-    # Note: We'll skip filtering for now to avoid audio decoding issues
-    # The DataCollator will handle filtering during batch creation
-
-    # Comment out filtering to avoid the audio decoding error
-    # def filter_long_samples(example):
-    #     try:
-    #         audio_len_sec = len(example["audio"]["array"]) / data_args.sample_rate
-    #         # Normalize text the same way as in DataCollator
-    #         normalized_text = re.sub(r"[^\w\s'\-]", "", example["text"].lower().strip())
-    #         text_len_words = len(normalized_text.split())
-    #         return (
-    #             audio_len_sec <= data_args.max_audio_seconds
-    #             and text_len_words <= data_args.max_text_words
-    #         )
-    #     except Exception:
-    #         return False
-
-    # # Apply filtering
     original_train_size = len(train_dataset)
     original_val_size = len(val_dataset)
-
-    # Skip filtering for now - let DataCollator handle it
-    # train_dataset = train_dataset.filter(
-    #     filter_long_samples,
-    #     num_proc=data_args.num_proc if not accelerator.is_main_process else None,
-    #     desc="Filtering long train samples",
-    # )
-    # val_dataset = val_dataset.filter(
-    #     filter_long_samples,
-    #     num_proc=data_args.num_proc if not accelerator.is_main_process else None,
-    #     desc="Filtering long val samples",
-    # )
-
-    # if accelerator.is_main_process:
-    #     print(f"   Filtered train: {original_train_size} -> {len(train_dataset)} samples")
-    #     print(f"   Filtered val: {original_val_size} -> {len(val_dataset)} samples")
 
     # Limit samples if specified (for overfitting experiments)
     if data_args.max_train_samples is not None:
@@ -1123,35 +1069,6 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     return train_dataset, val_dataset
 
 
-def add_nan_check_hook(model: torch.nn.Module, verbose: bool = False):
-    """Add forward hooks to detect NaN/Inf in model outputs."""
-    def nan_check_hook(module, inputs, outputs):
-        module_name = module.__class__.__name__
-
-        # Handle different output types
-        if isinstance(outputs, torch.Tensor):
-            if not torch.all(torch.isfinite(outputs)):
-                print(f"❌ NaN or Inf found in {module_name}")
-                print(f"   Output shape: {outputs.shape}")
-                print(f"   Contains NaN: {torch.any(torch.isnan(outputs))}")
-                print(f"   Contains Inf: {torch.any(torch.isinf(outputs))}")
-                if outputs.numel() < 100:  # Only print small tensors
-                    print(f"   Values: {outputs}")
-                raise RuntimeError(f"NaN or Inf found in the output of {module_name}")
-            elif verbose:
-                print(f"✓ {module_name}: output is finite (shape: {outputs.shape})")
-        elif isinstance(outputs, tuple):
-            for i, out in enumerate(outputs):
-                if isinstance(out, torch.Tensor) and not torch.all(torch.isfinite(out)):
-                    print(f"❌ NaN or Inf found in {module_name} output[{i}]")
-                    raise RuntimeError(f"NaN or Inf found in the output[{i}] of {module_name}")
-
-    # Add hooks to all modules except decoder (to focus on audio side first)
-    for name, submodule in model.named_modules():
-        if "decoder" not in name and len(list(submodule.children())) == 0:  # Only leaf modules
-            submodule.register_forward_hook(nan_check_hook)
-
-    print("🔍 Debug hooks attached to model (focusing on non-decoder modules)")
 
 def setup_trainer(
     model: ASRModel,
@@ -1486,11 +1403,6 @@ def main() -> None:
         model_args=model_args,
         data_args=data_args,
     )
-
-    # Add debug hooks if we're debugging gradient issues
-    if os.environ.get("DEBUG_GRADIENTS") == "1":
-        print("🔍 DEBUG_GRADIENTS=1 detected, attaching NaN/Inf detection hooks...")
-        add_nan_check_hook(model, verbose=False)
 
     if eval_only:
         # Find and load the latest checkpoint
