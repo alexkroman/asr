@@ -51,9 +51,7 @@ os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
 # Accelerator will be initialized in main function
 
-# Handle Hugging Face authentication
-hf_write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
-hf_read_token = os.environ.get("HF_READ_TOKEN")
+# HuggingFace authentication removed - not needed for local training
 
 # Authentication will be handled in main function
 
@@ -592,7 +590,8 @@ class CustomTrainer(Trainer):
                 if abs(recent_avg - older_avg) < 0.1:  # Less than 0.1 improvement
                     self.loss_stuck_counter += 1
                     if self.loss_stuck_counter % 50 == 0:  # Alert every 50 stuck steps
-                        print(f"⚠️ Loss appears stuck around {recent_avg:.2f} for {self.loss_stuck_counter} steps")
+                        from tqdm import tqdm
+                        tqdm.write(f"⚠️ Loss appears stuck around {recent_avg:.2f} for {self.loss_stuck_counter} steps")
                 else:
                     self.loss_stuck_counter = 0  # Reset if improving
 
@@ -624,10 +623,12 @@ class CustomTrainer(Trainer):
                         max_grad_param = name
 
             if num_inf > 0 or num_nan > 0:
-                print(f"⚠️ Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param}, "
-                      f"Inf params: {num_inf}, NaN params: {num_nan}")
+                from tqdm import tqdm
+                tqdm.write(f"⚠️ Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param}, "
+                          f"Inf params: {num_inf}, NaN params: {num_nan}")
             elif max_grad > 10000:
-                print(f"📊 Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param} (high but manageable)")
+                from tqdm import tqdm
+                tqdm.write(f"📊 Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param} (high but manageable)")
             elif self.state.global_step % 100 == 0:  # Every 100 steps show status
                 # Collect more detailed stats
                 grad_stats = []
@@ -643,8 +644,9 @@ class CustomTrainer(Trainer):
                     # Check for vanishing gradients
                     vanishing_count = sum(1 for g in grad_stats if g < 1e-6)
 
-                    print(f"✅ Step {self.state.global_step}: max_grad={max_grad:.2e}, avg_grad={avg_grad:.2e}, "
-                          f"min_grad={min_grad:.2e}, vanishing={vanishing_count}/{len(grad_stats)}")
+                    from tqdm import tqdm
+                    tqdm.write(f"✅ Step {self.state.global_step}: max_grad={max_grad:.2e}, avg_grad={avg_grad:.2e}, "
+                              f"min_grad={min_grad:.2e}, vanishing={vanishing_count}/{len(grad_stats)}")
 
         return loss
 
@@ -995,19 +997,11 @@ def parse_config(
     training_args.remove_unused_columns = False
     training_args.label_names = ["labels"]
 
-    # Set report_to based on environment
-    if os.environ.get("WANDB_API_KEY"):
-        if "wandb" not in training_args.report_to:
-            training_args.report_to.append("wandb")
+    # Disable all reporting
+    training_args.report_to = []
 
-    # Hub settings validation
-    if training_args.push_to_hub and not hf_write_token:
-        if accelerator.is_main_process:
-            print(
-                "⚠️  Warning: push_to_hub is True but no HF_WRITE_TOKEN found. "
-                "Disabling hub upload."
-            )
-        training_args.push_to_hub = False
+    # Disable hub pushing
+    training_args.push_to_hub = False
 
     return model_args, data_args, training_args
 
@@ -1036,8 +1030,12 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
 
-    # Reduce num_proc to avoid resource limits on Mac
-    safe_num_proc = min(data_args.num_proc, 1) if data_args.num_proc else None
+    # Adjust num_proc based on platform
+    import platform
+    if platform.system() == "Darwin":  # Mac
+        safe_num_proc = min(data_args.num_proc, 1) if data_args.num_proc else None
+    else:  # Linux/CUDA
+        safe_num_proc = data_args.num_proc if data_args.num_proc else None
 
     train_datasets = []
     val_datasets = []
@@ -1351,11 +1349,7 @@ def run_training(
     else:
         trainer.train()
 
-    # Push to hub if requested
-    if training_args.push_to_hub and hf_write_token:
-        print(f"📤 Pushing model to hub: {training_args.hub_model_id}")
-        trainer.push_to_hub()
-        print(f"✅ Model pushed to https://huggingface.co/{training_args.hub_model_id}")
+    # Hub pushing disabled
 
 
 def main() -> None:
@@ -1372,29 +1366,9 @@ def main() -> None:
     # Initialize Accelerator
     accelerator = Accelerator()
 
-    # Handle Hugging Face authentication
-    if hf_read_token:
-        from huggingface_hub import login
+    # HuggingFace authentication removed - not needed for local training
 
-        login(token=hf_read_token)
-        if accelerator.is_main_process:
-            print("✅ Logged in to Hugging Face Hub with read token")
-    elif hf_write_token:
-        from huggingface_hub import login
-
-        login(token=hf_write_token)
-        if accelerator.is_main_process:
-            print("✅ Logged in to Hugging Face Hub with write token")
-    else:
-        if accelerator.is_main_process:
-            print("⚠️  No HF_WRITE_TOKEN or HF_READ_TOKEN found. Model upload will be skipped.")
-
-    # Optional: Setup WandB if available
-    if os.environ.get("WANDB_API_KEY") and accelerator.is_main_process:
-        import wandb
-
-        wandb.login(key=os.environ.get("WANDB_API_KEY"))
-        print("✅ Logged in to Weights & Biases")
+    # WandB removed - not needed for local training
 
     # Require a config file to be provided
     if len(sys.argv) < 2 or sys.argv[1] != "--config":

@@ -136,15 +136,10 @@ dependencies = [
 train = "accelerate launch src/train.py --config {args:configs/experiments/small_test.json}"
 train-prod = "accelerate launch src/train.py --config configs/experiments/production.json"
 train-test = "accelerate launch src/train.py --config configs/experiments/test_config.json"
-train-multi = "accelerate launch --multi_gpu src/train.py --config {args:experiment_config.json}"
 
 # Mac-specific scripts
 train-mac = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/test_config.json"
 train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
-
-# Overfitting experiment - train on 8 samples for 200 steps to verify model can memorize
-overfit = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/overfit_8samples.json"
-overfit-debug = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 DEBUG_GRADIENTS=1 accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/overfit_8samples.json"
 
 # Evaluation
 eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
@@ -180,24 +175,31 @@ setup-mac = [
 
 # Pod deployment
 pod-deploy = [
-    "echo 'Deploying to RunPod server...'",
-    "rsync -avz -e 'ssh -p 16392 -i ~/.ssh/id_ed25519' --exclude='__pycache__' --exclude='*.pyc' src root@103.196.86.163:/workspace/",
-    "rsync -avz -e 'ssh -p 16392 -i ~/.ssh/id_ed25519' --exclude='__pycache__' --exclude='*.pyc' configs root@103.196.86.163:/workspace/",
-    "scp -P 16392 -i ~/.ssh/id_ed25519 pyproject.toml root@103.196.86.163:/workspace/",
-    "echo 'Deployment complete!'"
+    "ssh -p 22116 -i ~/.ssh/id_ed25519 root@194.68.245.62 'mkdir -p /workspace/src /workspace/configs/accelerate /workspace/configs/experiments'",
+    "scp -P 22116 -i ~/.ssh/id_ed25519 pyproject.toml README.md root@194.68.245.62:/workspace/",
+    "scp -P 22116 -i ~/.ssh/id_ed25519 src/train.py src/__init__.py root@194.68.245.62:/workspace/src/",
+    "scp -P 22116 -i ~/.ssh/id_ed25519 configs/accelerate/a40_optimized.yaml root@194.68.245.62:/workspace/configs/accelerate/",
+    "scp -P 22116 -i ~/.ssh/id_ed25519 configs/experiments/production.json root@194.68.245.62:/workspace/configs/experiments/"
 ]
 install-deps = [
     "apt update",
-    "apt install -y ffmpeg libsndfile1 libsndfile1-dev"
+    "apt install -y ffmpeg libsndfile1 libsndfile1-dev",
 ]
 
 [tool.hatch.envs.cuda]
 template = "default"
 features = ["cuda", "optimized"]
 
+[tool.hatch.envs.cuda.env-vars]
+HF_HOME = "/workspace/.cache/huggingface"
+HF_DATASETS_CACHE = "/workspace/datasets"
+TORCH_HOME = "/workspace/.cache/torch"
+HF_HUB_ENABLE_HF_TRANSFER = "1"
+HF_DATASETS_DOWNLOAD_WORKERS = "32"
+HF_DATASETS_IN_MEMORY_MAX_SIZE = "0"
+
 [tool.hatch.envs.cuda.scripts]
-train-a40 = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config {args:experiment_config.json}"
-train-a100 = "accelerate launch --config_file configs/accelerate/a100_optimized.yaml src/train.py --config {args:experiment_config.json}"
+train-production = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json"
 
 [tool.hatch.envs.mac]
 template = "default"

@@ -14,12 +14,3 @@ tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
-
-# A40-specific optimizations via environment variables
-dynamo:
-  backend: inductor
-  mode: reduce-overhead
-
-deepspeed_config: {}
-fsdp_config: {}
-megatron_lm_config: {}
