@@ -143,8 +143,8 @@ train-mac = "accelerate launch --config_file configs/accelerate/accelerate_confi
 train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
 
 # Overfitting experiment - train on 8 samples for 200 steps to verify model can memorize
-overfit = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 python src/train.py --config configs/experiments/overfit_8samples.json"
-overfit-debug = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 DEBUG_GRADIENTS=1 python src/train.py --config configs/experiments/overfit_8samples.json"
+overfit = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/overfit_8samples.json"
+overfit-debug = "PYTORCH_ENABLE_MPS_FALLBACK=1 PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 DEBUG_GRADIENTS=1 accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/overfit_8samples.json"
 
 # Evaluation
 eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"

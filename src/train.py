@@ -111,11 +111,15 @@ class DataArguments:
     dataset_name: str = field(
         default="librispeech_asr", metadata={"help": "The name of the dataset to use."}
     )
-    dataset_config_name: str = field(
-        default="clean", metadata={"help": "The configuration name of the dataset."}
+    dataset_configs: List[str] = field(
+        default_factory=lambda: ["clean"], metadata={"help": "List of dataset configurations to concatenate."}
     )
-    train_split: str = field(default="train.100", metadata={"help": "The training split to use."})
-    eval_split: str = field(default="validation", metadata={"help": "The evaluation split to use."})
+    train_splits: List[str] = field(
+        default_factory=lambda: ["train.100"], metadata={"help": "List of training splits corresponding to dataset_configs."}
+    )
+    eval_splits: List[str] = field(
+        default_factory=lambda: ["validation"], metadata={"help": "List of evaluation splits corresponding to dataset_configs."}
+    )
     max_audio_seconds: float = field(
         default=20.0, metadata={"help": "Filter out audio samples longer than this."}
     )
@@ -1027,27 +1031,50 @@ def initialize_model(
 
 def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
+    from datasets import concatenate_datasets
+
     if accelerator.is_main_process:
         print("📦 Loading datasets...")
 
-    # Load datasets
     # Reduce num_proc to avoid resource limits on Mac
     safe_num_proc = min(data_args.num_proc, 1) if data_args.num_proc else None
 
-    train_dataset = load_dataset(
-        data_args.dataset_name,
-        data_args.dataset_config_name,
-        split=data_args.train_split,
-        cache_dir=data_args.dataset_cache_dir,
-        num_proc=safe_num_proc,
-    )
-    val_dataset = load_dataset(
-        data_args.dataset_name,
-        data_args.dataset_config_name,
-        split=data_args.eval_split,
-        cache_dir=data_args.dataset_cache_dir,
-        num_proc=safe_num_proc,
-    )
+    train_datasets = []
+    val_datasets = []
+
+    for config, train_split, eval_split in zip(
+        data_args.dataset_configs, data_args.train_splits, data_args.eval_splits
+    ):
+        if accelerator.is_main_process:
+            print(f"   Loading {config} - train: {train_split}, eval: {eval_split}")
+
+        train_ds = load_dataset(
+            data_args.dataset_name,
+            config,
+            split=train_split,
+            cache_dir=data_args.dataset_cache_dir,
+            num_proc=safe_num_proc,
+        )
+        train_datasets.append(train_ds)
+
+        val_ds = load_dataset(
+            data_args.dataset_name,
+            config,
+            split=eval_split,
+            cache_dir=data_args.dataset_cache_dir,
+            num_proc=safe_num_proc,
+        )
+        val_datasets.append(val_ds)
+
+    # Concatenate all datasets
+    train_dataset = concatenate_datasets(train_datasets)
+    val_dataset = concatenate_datasets(val_datasets)
+
+    if accelerator.is_main_process:
+        for i, (config, ds) in enumerate(zip(data_args.dataset_configs, train_datasets)):
+            print(f"   Train {config}: {len(ds)} samples")
+        for i, (config, ds) in enumerate(zip(data_args.dataset_configs, val_datasets)):
+            print(f"   Val {config}: {len(ds)} samples")
 
     original_train_size = len(train_dataset)
     original_val_size = len(val_dataset)
