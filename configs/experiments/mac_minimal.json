@@ -19,9 +19,9 @@
   "projector_dropout": 0.1,
 
   "dataset_name": "librispeech_asr",
-  "dataset_config_name": "clean",
-  "train_split": "train.100",
-  "eval_split": "validation",
+  "dataset_configs": ["clean", "clean", "other"],
+  "train_splits": ["train.100", "train.360", "train.500"],
+  "eval_splits": ["validation", "validation", "validation"],
   "max_audio_seconds": 10.0,
   "max_text_words": 50,
   "sample_rate": 16000,
