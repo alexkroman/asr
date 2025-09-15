@@ -129,6 +129,12 @@ class DataArguments:
         default="/workspace/datasets", metadata={"help": "Directory to cache datasets."}
     )
     num_proc: int = field(default=8, metadata={"help": "Number of processes for dataset loading."})
+    max_train_samples: Optional[int] = field(
+        default=None, metadata={"help": "Maximum number of training samples to use."}
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None, metadata={"help": "Maximum number of evaluation samples to use."}
+    )
 
 
 class SpecAugment(nn.Module):
@@ -310,7 +316,7 @@ class ConformerEncoder(nn.Module):
     def __init__(self, config: ModelArguments):
         super().__init__()
         self.config = config
-        self.gradient_checkpointing = False  # Track gradient checkpointing state
+        self._gradient_checkpointing = False  # Use private attribute to follow HF convention
 
         # Convolutional subsampling with stride 2 for each layer
         # Total subsampling factor = 2^num_subsample_layers
@@ -367,8 +373,20 @@ class ConformerEncoder(nn.Module):
         x = self.dropout(x)
 
         # Calculate output lengths after subsampling
-        output_lengths = input_lengths // self.subsample_factor
+        # Use integer arithmetic to avoid floating point errors
+        # For Conv2d with kernel=3, stride=2, padding=1:
+        # output = floor((input + 2*padding - kernel) / stride) + 1
+        output_lengths = input_lengths.clone()
+
+        # Apply convolution length calculation for each subsampling layer
+        # Using explicit parameters to match the actual Conv2d layers
+        for _ in range(self.subsample_layers):
+            # Matches nn.Conv2d(_, _, kernel_size=3, stride=2, padding=1)
+            output_lengths = torch.div(output_lengths + 2 * 1 - 3, 2, rounding_mode='floor') + 1
+
+        # Ensure output lengths don't exceed actual tensor size
         max_len = x.size(1)
+        output_lengths = torch.minimum(output_lengths, torch.tensor(max_len, device=output_lengths.device))
 
         # Create padding mask
         key_padding_mask = (
@@ -377,22 +395,39 @@ class ConformerEncoder(nn.Module):
 
         # Apply Conformer blocks with optional gradient checkpointing
         for conformer_block in self.conformer_blocks:
-            if self.gradient_checkpointing and self.training:
+            if self._gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training
-                from torch.utils.checkpoint import checkpoint
-
-                x = checkpoint(conformer_block, x, key_padding_mask, use_reentrant=False)
+                x = self._checkpoint_forward(conformer_block, x, key_padding_mask)
             else:
                 x = conformer_block(x, key_padding_mask)
 
         return x
+
+    def _checkpoint_forward(self, module, *args):
+        """Helper method for gradient checkpointing with proper handling."""
+        from torch.utils.checkpoint import checkpoint
+        # Use checkpoint with use_reentrant=False for better memory efficiency
+        # and compatibility with autocast
+        return checkpoint(module, *args, use_reentrant=False)
+
+    @property
+    def gradient_checkpointing(self):
+        """Property for compatibility with Trainer."""
+        return self._gradient_checkpointing
+
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        """Property setter for compatibility with Trainer."""
+        self._gradient_checkpointing = value
 
 
 class LightweightAudioProjector(nn.Module):
     def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
         self.audio_proj = nn.Linear(audio_dim, text_dim)
-        self.queries = nn.Parameter(torch.randn(config.num_queries, text_dim))
+        # Initialize queries with smaller values for numerical stability
+        self.queries = nn.Parameter(torch.zeros(config.num_queries, text_dim))
+        nn.init.normal_(self.queries, mean=0.0, std=0.01)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=text_dim,
             num_heads=config.projector_num_heads,
@@ -410,10 +445,12 @@ class LightweightAudioProjector(nn.Module):
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         B = audio_features.shape[0]
+
         audio_proj = self.audio_proj(audio_features)
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)
         attn_out, _ = self.cross_attn(queries, audio_proj, audio_proj)
         result: torch.Tensor = self.mlp(attn_out + queries)
+
         return result
 
 
@@ -424,15 +461,30 @@ class SmolLM2Decoder(nn.Module):
             config.decoder_model_name, dtype=torch.bfloat16, token=False
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
+
+        # Handle padding token configuration
         if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
-            self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=False)
-            with torch.no_grad():
-                embeddings = self.model.get_input_embeddings()
-                if embeddings is not None and hasattr(embeddings, "weight"):
-                    embedding_weight: torch.nn.Parameter = embeddings.weight  # type: ignore
-                    embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
-            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            # Check if model already has a pad token configured
+            if hasattr(self.model.config, 'pad_token_id') and self.model.config.pad_token_id is not None:
+                # Use the model's existing pad token
+                vocab = self.tokenizer.get_vocab()
+                # Try to find the token corresponding to the model's pad_token_id
+                for token, token_id in vocab.items():
+                    if token_id == self.model.config.pad_token_id:
+                        self.tokenizer.pad_token = token
+                        break
+                else:
+                    # If no corresponding token found, add a new one
+                    self._add_padding_token()
+            else:
+                # Neither tokenizer nor model has padding configured
+                self._add_padding_token()
+        else:
+            # Tokenizer has pad token, ensure model config is synchronized
+            if hasattr(self.model.config, 'pad_token_id'):
+                self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+        # Continue with LoRA setup if needed
         if config.use_lora:
             lora_config = LoraConfig(
                 r=config.lora_r,
@@ -448,9 +500,33 @@ class SmolLM2Decoder(nn.Module):
             if hasattr(self.model, "print_trainable_parameters"):
                 self.model.print_trainable_parameters()
 
+    def _add_padding_token(self):
+        """Add a padding token to the tokenizer and resize model embeddings."""
+        # Add the padding token
+        self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
+
+        # Resize model embeddings to accommodate the new token
+        self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=False)
+
+        # Initialize the new embedding with the mean of existing embeddings
+        with torch.no_grad():
+            embeddings = self.model.get_input_embeddings()
+            if embeddings is not None and hasattr(embeddings, "weight"):
+                embedding_weight: torch.nn.Parameter = embeddings.weight  # type: ignore
+                # Initialize new token embedding as mean of existing embeddings
+                embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
+
+        # Update model config
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+    def forward(self, **kwargs):
+        """Simple forward pass through the decoder model."""
+        return self.model(**kwargs)
+
 
 class CustomTrainer(Trainer):
     """Custom trainer that handles tied embeddings properly during saving."""
+
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Override save to handle tied embeddings in the decoder."""
@@ -500,23 +576,73 @@ class ASRModel(nn.Module):
         self.audio_projector = LightweightAudioProjector(config.d_model, text_dim, config)
         self.spec_augment = SpecAugment()
 
+        # Initialize weights with smaller values for stability
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights using standard gains to prevent vanishing gradients."""
+        for name, module in self.named_modules():
+            # Skip decoder weights - they're already pretrained
+            if 'decoder' in name:
+                continue
+
+            if isinstance(module, nn.Linear):
+                # Use standard Xavier initialization for linear layers
+                # Gain of 1.0 is standard for linear layers with tanh/sigmoid
+                # For ReLU-like activations (SiLU), slightly higher gain is better
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
+                # Use Kaiming initialization for convolutional layers
+                # Better for ReLU-like activations (SiLU is similar to ReLU)
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.MultiheadAttention):
+                # Standard initialization for attention weights
+                # Scaled by 1/sqrt(d_k) is already handled internally
+                for param in module.parameters():
+                    if param.dim() > 1:
+                        nn.init.xavier_uniform_(param, gain=1.0)
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Enable gradient checkpointing for both encoder and decoder models."""
-        # Enable for encoder
+        """
+        Enable gradient checkpointing for both encoder and decoder models.
+        This method is called by the Trainer when gradient_checkpointing is enabled.
+        """
+        # Enable for encoder using property
         self.encoder.gradient_checkpointing = True
 
-        # Enable for decoder
+        # Enable for decoder using its native method
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
             self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        elif hasattr(self.decoder.model, "enable_gradient_checkpointing"):
+            self.decoder.model.enable_gradient_checkpointing()
 
     def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing for both encoder and decoder models."""
-        # Disable for encoder
+        """
+        Disable gradient checkpointing for both encoder and decoder models.
+        This method is called by the Trainer when gradient_checkpointing is disabled.
+        """
+        # Disable for encoder using property
         self.encoder.gradient_checkpointing = False
 
-        # Disable for decoder
+        # Disable for decoder using its native method
         if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
             self.decoder.model.gradient_checkpointing_disable()
+        elif hasattr(self.decoder.model, "disable_gradient_checkpointing"):
+            self.decoder.model.disable_gradient_checkpointing()
+
+    @property
+    def is_gradient_checkpointing(self):
+        """Check if gradient checkpointing is enabled."""
+        return self.encoder.gradient_checkpointing
 
     def forward(
         self,
@@ -550,11 +676,27 @@ class ASRModel(nn.Module):
 
         audio_prefix = self.audio_projector(audio_features)
 
+        # Debug: Check for NaN/Inf
+        if os.environ.get("DEBUG_GRADIENTS") == "1" and self.training:
+            if not torch.all(torch.isfinite(audio_prefix)):
+                print(f"❌ Non-finite values in audio_prefix: NaN={torch.any(torch.isnan(audio_prefix))}, Inf={torch.any(torch.isinf(audio_prefix))}")
+                print(f"   audio_features stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, mean={audio_features.mean():.4f}")
+                print(f"   audio_prefix stats: min={audio_prefix.min():.4f}, max={audio_prefix.max():.4f}, mean={audio_prefix.mean():.4f}")
+
         embeddings = self.decoder.model.get_input_embeddings()
         if labels is not None and callable(embeddings):
             text_embeds = embeddings(labels)
+
+            # Convert audio_prefix to same dtype as text embeddings
+            if audio_prefix.dtype != text_embeds.dtype:
+                audio_prefix = audio_prefix.to(text_embeds.dtype)
+
             combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
         else:
+            # Convert to decoder dtype when no labels
+            decoder_dtype = next(self.decoder.model.parameters()).dtype
+            if audio_prefix.dtype != decoder_dtype:
+                audio_prefix = audio_prefix.to(decoder_dtype)
             combined_embeds = audio_prefix
 
         audio_mask = torch.ones(
@@ -582,17 +724,20 @@ class ASRModel(nn.Module):
             labels=combined_labels,
         )
 
-        # Only return loss and logits to avoid DynamicCache padding issues
-        if hasattr(outputs, "loss") and hasattr(outputs, "logits"):
+        # During training, only return loss and logits to avoid DynamicCache padding issues
+        # During inference/generation, return full outputs including KV cache
+        if self.training and hasattr(outputs, "loss") and hasattr(outputs, "logits"):
             from transformers.modeling_outputs import CausalLMOutputWithPast
 
             return CausalLMOutputWithPast(
                 loss=outputs.loss,
                 logits=outputs.logits,
-                past_key_values=None,  # Don't return cache
+                past_key_values=None,  # Don't return cache during training
                 hidden_states=None,
                 attentions=None,
             )
+
+        # Return full outputs (including KV cache) for eval/generation
         return outputs
 
     @torch.inference_mode()
@@ -607,6 +752,13 @@ class ASRModel(nn.Module):
 
         # Project audio features to text embedding dimension
         audio_prefix = self.audio_projector(audio_features)
+
+        # Debug: Check for NaN/Inf
+        if os.environ.get("DEBUG_GRADIENTS") == "1" and self.training:
+            if not torch.all(torch.isfinite(audio_prefix)):
+                print(f"❌ Non-finite values in audio_prefix: NaN={torch.any(torch.isnan(audio_prefix))}, Inf={torch.any(torch.isinf(audio_prefix))}")
+                print(f"   audio_features stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, mean={audio_features.mean():.4f}")
+                print(f"   audio_prefix stats: min={audio_prefix.min():.4f}, max={audio_prefix.max():.4f}, mean={audio_prefix.mean():.4f}")
 
         # Ensure audio_prefix matches decoder's dtype (explicitly set to bfloat16 in __init__)
         decoder_dtype = next(self.decoder.model.parameters()).dtype
@@ -655,7 +807,6 @@ class DataCollator:
 
         if not valid_features:
             # Return dummy batch if all samples filtered
-            # Use a more realistic dummy sequence length
             pad_token_id = (
                 self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             )
@@ -664,9 +815,7 @@ class DataCollator:
                 "input_values": torch.zeros((1, self.n_mels, 100)),
                 "input_lengths": torch.tensor([100]),
                 "labels": torch.full((1, dummy_seq_len), pad_token_id, dtype=torch.long),
-                "attention_mask": torch.ones(
-                    (1, dummy_seq_len), dtype=torch.long
-                ),  # Fixed: was zeros
+                "attention_mask": torch.ones((1, dummy_seq_len), dtype=torch.long),
             }
 
         # Process audio to spectrograms and normalize texts
@@ -674,9 +823,52 @@ class DataCollator:
         texts = []
         for f in valid_features:
             audio_array = torch.from_numpy(np.array(f["audio"]["array"], dtype=np.float32))
+
+            # Check for NaN/Inf in raw audio
+            if not torch.all(torch.isfinite(audio_array)):
+                # Handle corrupted audio by replacing with silence
+                audio_array = torch.zeros_like(audio_array)
+                print("⚠️ Warning: Found NaN/Inf in raw audio, replacing with silence")
+
+            # Clip audio to prevent extreme values
+            audio_array = torch.clamp(audio_array, min=-1.0, max=1.0)
+
+            # Apply mel transform
             spec = self.mel_transform(audio_array)
+
+            # Add small epsilon to prevent log(0)
+            spec = spec + 1e-10
+
+            # Convert to dB scale
             spec_db = self.amp_to_db(spec)
-            spec_norm = (spec_db - spec_db.mean()) / (spec_db.std() + 1e-8)
+
+            # Check for NaN/Inf after dB conversion
+            if not torch.all(torch.isfinite(spec_db)):
+                # Fall back to zero spectrogram
+                spec_db = torch.zeros_like(spec_db)
+                print("⚠️ Warning: Found NaN/Inf after dB conversion, using zero spectrogram")
+
+            # Robust normalization
+            mean_val = spec_db.mean()
+            std_val = spec_db.std()
+
+            # Handle edge cases for normalization
+            if not torch.isfinite(mean_val):
+                mean_val = torch.tensor(0.0)
+            if not torch.isfinite(std_val) or std_val < 1e-6:
+                std_val = torch.tensor(1.0)
+
+            # Apply normalization with safe std
+            spec_norm = (spec_db - mean_val) / std_val
+
+            # Final clamping to ensure bounded values
+            spec_norm = torch.clamp(spec_norm, min=-5.0, max=5.0)
+
+            # Final check
+            if not torch.all(torch.isfinite(spec_norm)):
+                spec_norm = torch.zeros_like(spec_norm)
+                print("⚠️ Warning: Found NaN/Inf after normalization, using zero spectrogram")
+
             specs.append(spec_norm)
             texts.append(self._normalize_text(f["text"]))
 
@@ -692,12 +884,19 @@ class DataCollator:
         # Tokenize and pad text labels
         labels = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt")
 
-        return {
+        output_batch = {
             "input_values": padded_specs,
             "input_lengths": input_lengths,
             "labels": labels["input_ids"],
             "attention_mask": labels["attention_mask"],
         }
+
+        # Assert that all values are finite (debugging check)
+        if os.environ.get("DEBUG_GRADIENTS") == "1":
+            assert torch.all(torch.isfinite(output_batch["input_values"])), \
+                "NaN/Inf detected in final batch - this should not happen with proper preprocessing"
+
+        return output_batch
 
 
 def compute_metrics(
@@ -778,26 +977,108 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
         print("📦 Loading datasets...")
 
     # Load datasets
+    # Reduce num_proc to avoid resource limits on Mac
+    safe_num_proc = min(data_args.num_proc, 1) if data_args.num_proc else None
+
     train_dataset = load_dataset(
         data_args.dataset_name,
         data_args.dataset_config_name,
         split=data_args.train_split,
         cache_dir=data_args.dataset_cache_dir,
-        num_proc=data_args.num_proc if not accelerator.is_main_process else None,
+        num_proc=safe_num_proc,
     )
     val_dataset = load_dataset(
         data_args.dataset_name,
         data_args.dataset_config_name,
         split=data_args.eval_split,
         cache_dir=data_args.dataset_cache_dir,
-        num_proc=data_args.num_proc if not accelerator.is_main_process else None,
+        num_proc=safe_num_proc,
     )
+
+    # Filter long samples before training to improve efficiency
+    # Note: We'll skip filtering for now to avoid audio decoding issues
+    # The DataCollator will handle filtering during batch creation
+
+    # Comment out filtering to avoid the audio decoding error
+    # def filter_long_samples(example):
+    #     try:
+    #         audio_len_sec = len(example["audio"]["array"]) / data_args.sample_rate
+    #         # Normalize text the same way as in DataCollator
+    #         normalized_text = re.sub(r"[^\w\s'\-]", "", example["text"].lower().strip())
+    #         text_len_words = len(normalized_text.split())
+    #         return (
+    #             audio_len_sec <= data_args.max_audio_seconds
+    #             and text_len_words <= data_args.max_text_words
+    #         )
+    #     except Exception:
+    #         return False
+
+    # # Apply filtering
+    original_train_size = len(train_dataset)
+    original_val_size = len(val_dataset)
+
+    # Skip filtering for now - let DataCollator handle it
+    # train_dataset = train_dataset.filter(
+    #     filter_long_samples,
+    #     num_proc=data_args.num_proc if not accelerator.is_main_process else None,
+    #     desc="Filtering long train samples",
+    # )
+    # val_dataset = val_dataset.filter(
+    #     filter_long_samples,
+    #     num_proc=data_args.num_proc if not accelerator.is_main_process else None,
+    #     desc="Filtering long val samples",
+    # )
+
+    # if accelerator.is_main_process:
+    #     print(f"   Filtered train: {original_train_size} -> {len(train_dataset)} samples")
+    #     print(f"   Filtered val: {original_val_size} -> {len(val_dataset)} samples")
+
+    # Limit samples if specified (for overfitting experiments)
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(data_args.max_train_samples, len(train_dataset))))
+        if accelerator.is_main_process:
+            print(f"   Limited training samples to {len(train_dataset)}")
+
+    if data_args.max_eval_samples is not None:
+        val_dataset = val_dataset.select(range(min(data_args.max_eval_samples, len(val_dataset))))
+        if accelerator.is_main_process:
+            print(f"   Limited evaluation samples to {len(val_dataset)}")
 
     if accelerator.is_main_process:
         print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     return train_dataset, val_dataset
 
+
+def add_nan_check_hook(model: torch.nn.Module, verbose: bool = False):
+    """Add forward hooks to detect NaN/Inf in model outputs."""
+    def nan_check_hook(module, inputs, outputs):
+        module_name = module.__class__.__name__
+
+        # Handle different output types
+        if isinstance(outputs, torch.Tensor):
+            if not torch.all(torch.isfinite(outputs)):
+                print(f"❌ NaN or Inf found in {module_name}")
+                print(f"   Output shape: {outputs.shape}")
+                print(f"   Contains NaN: {torch.any(torch.isnan(outputs))}")
+                print(f"   Contains Inf: {torch.any(torch.isinf(outputs))}")
+                if outputs.numel() < 100:  # Only print small tensors
+                    print(f"   Values: {outputs}")
+                raise RuntimeError(f"NaN or Inf found in the output of {module_name}")
+            elif verbose:
+                print(f"✓ {module_name}: output is finite (shape: {outputs.shape})")
+        elif isinstance(outputs, tuple):
+            for i, out in enumerate(outputs):
+                if isinstance(out, torch.Tensor) and not torch.all(torch.isfinite(out)):
+                    print(f"❌ NaN or Inf found in {module_name} output[{i}]")
+                    raise RuntimeError(f"NaN or Inf found in the output[{i}] of {module_name}")
+
+    # Add hooks to all modules except decoder (to focus on audio side first)
+    for name, submodule in model.named_modules():
+        if "decoder" not in name and len(list(submodule.children())) == 0:  # Only leaf modules
+            submodule.register_forward_hook(nan_check_hook)
+
+    print("🔍 Debug hooks attached to model (focusing on non-decoder modules)")
 
 def setup_trainer(
     model: ASRModel,
@@ -889,89 +1170,111 @@ def show_sample_predictions(
 
 
 def load_checkpoint(checkpoint_dir: str, model: ASRModel, accelerator: Accelerator) -> bool:
-    """Load a checkpoint into the model. Returns True if successful."""
+    """
+    Load a checkpoint into the model. Returns True if successful.
+
+    Supports two checkpoint formats:
+    1. LoRA format: LoRA adapters in decoder/ subdirectory
+    2. Full model format: Complete model in decoder/ subdirectory
+    """
+    if not os.path.exists(checkpoint_dir):
+        print(f"⚠️  Checkpoint directory does not exist: {checkpoint_dir}")
+        return False
+
     try:
-        # Check if it's a LoRA model or full model
+        # Define paths for different components
         decoder_path = os.path.join(checkpoint_dir, "decoder")
+        encoder_path = os.path.join(checkpoint_dir, "encoder.bin")
+        projector_path = os.path.join(checkpoint_dir, "projector.bin")
 
-        if os.path.exists(os.path.join(decoder_path, "adapter_config.json")):
-            # Load LoRA adapters from decoder directory
+        # Detect checkpoint format
+        checkpoint_format = _detect_checkpoint_format(checkpoint_dir)
+
+        if checkpoint_format == "lora":
+            # LoRA adapters in decoder/ subdirectory
             print("   Loading LoRA adapters...")
-            from peft import PeftModel
+            _load_lora_decoder(model, decoder_path, accelerator)
+            _load_audio_components(model, encoder_path, projector_path, accelerator)
 
-            # Get the base model (without LoRA)
-            if hasattr(model.decoder.model, 'base_model'):
-                base_model = model.decoder.model.base_model.model
-            else:
-                base_model = model.decoder.model
-
-            # Load the LoRA adapters
-            model.decoder.model = PeftModel.from_pretrained(
-                base_model,
-                decoder_path,
-                device_map=accelerator.device,
-            )
-
-            # Load encoder and projector
-            if os.path.exists(os.path.join(checkpoint_dir, "encoder.bin")):
-                model.encoder.load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "encoder.bin"), map_location=accelerator.device
-                    )
-                )
-            if os.path.exists(os.path.join(checkpoint_dir, "projector.bin")):
-                model.audio_projector.load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "projector.bin"),
-                        map_location=accelerator.device,
-                    )
-                )
-        elif os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json")):
-            # Old format - LoRA at root level
-            print("   Loading LoRA adapters (old format)...")
-            from peft import PeftModel
-
-            model.decoder.model = PeftModel.from_pretrained(
-                model.decoder.model.base_model.model,
-                checkpoint_dir,
-                device_map=accelerator.device,
-            )
-            # Load encoder and projector if they exist
-            if os.path.exists(os.path.join(checkpoint_dir, "audio_components.bin")):
-                audio_components = torch.load(
-                    os.path.join(checkpoint_dir, "audio_components.bin"),
-                    map_location=accelerator.device,
-                )
-                model.encoder.load_state_dict(audio_components["encoder"])
-                model.audio_projector.load_state_dict(audio_components["audio_projector"])
-        elif os.path.exists(decoder_path):
-            # Load full model from decoder directory
+        elif checkpoint_format == "full_model":
+            # Full model format: Complete model in decoder/ subdirectory
             print("   Loading full model from checkpoint...")
             model.decoder.model = AutoModelForCausalLM.from_pretrained(
-                decoder_path, device_map=accelerator.device, dtype=torch.bfloat16
+                decoder_path,
+                device_map=accelerator.device,
+                torch_dtype=torch.bfloat16
             )
-            if os.path.exists(os.path.join(checkpoint_dir, "encoder.bin")):
-                model.encoder.load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "encoder.bin"), map_location=accelerator.device
-                    )
-                )
-            if os.path.exists(os.path.join(checkpoint_dir, "projector.bin")):
-                model.audio_projector.load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "projector.bin"),
-                        map_location=accelerator.device,
-                    )
-                )
+            _load_audio_components(model, encoder_path, projector_path, accelerator)
+
         else:
-            print(f"⚠️  Unknown checkpoint format in {checkpoint_dir}")
+            print(f"⚠️  Unknown or invalid checkpoint format in {checkpoint_dir}")
             return False
 
         print("✅ Model loaded successfully")
         return True
+
     except Exception as e:
         print(f"⚠️  Failed to load checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
         return False
+
+
+def _detect_checkpoint_format(checkpoint_dir: str) -> str:
+    """Detect the format of a checkpoint directory."""
+    decoder_path = os.path.join(checkpoint_dir, "decoder")
+
+    # Check for LoRA format
+    if os.path.exists(os.path.join(decoder_path, "adapter_config.json")):
+        return "lora"
+
+    # Check for full model format
+    if os.path.exists(os.path.join(decoder_path, "config.json")):
+        return "full_model"
+
+    return "unknown"
+
+
+def _get_base_model(decoder_model):
+    """Extract the base model from a potentially LoRA-wrapped model."""
+    if hasattr(decoder_model, 'base_model'):
+        # Model is already wrapped with LoRA
+        if hasattr(decoder_model.base_model, 'model'):
+            return decoder_model.base_model.model
+        return decoder_model.base_model
+    return decoder_model
+
+
+def _load_lora_decoder(model: ASRModel, decoder_path: str, accelerator: Accelerator):
+    """Load LoRA adapters for the decoder."""
+    from peft import PeftModel
+
+    base_model = _get_base_model(model.decoder.model)
+    model.decoder.model = PeftModel.from_pretrained(
+        base_model,
+        decoder_path,
+        device_map=accelerator.device,
+    )
+
+
+def _load_audio_components(
+    model: ASRModel,
+    encoder_path: str,
+    projector_path: str,
+    accelerator: Accelerator
+):
+    """Load encoder and projector components if they exist."""
+    if os.path.exists(encoder_path):
+        print("   Loading encoder...")
+        model.encoder.load_state_dict(
+            torch.load(encoder_path, map_location=accelerator.device)
+        )
+
+    if os.path.exists(projector_path):
+        print("   Loading audio projector...")
+        model.audio_projector.load_state_dict(
+            torch.load(projector_path, map_location=accelerator.device)
+        )
 
 
 def find_latest_checkpoint(output_dir: str, model_args: ModelArguments) -> Optional[str]:
@@ -1110,6 +1413,11 @@ def main() -> None:
         model_args=model_args,
         data_args=data_args,
     )
+
+    # Add debug hooks if we're debugging gradient issues
+    if os.environ.get("DEBUG_GRADIENTS") == "1":
+        print("🔍 DEBUG_GRADIENTS=1 detected, attaching NaN/Inf detection hooks...")
+        add_nan_check_hook(model, verbose=False)
 
     if eval_only:
         # Find and load the latest checkpoint

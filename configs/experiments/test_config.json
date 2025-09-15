@@ -20,7 +20,7 @@
   "dataset_name": "librispeech_asr",
   "dataset_config_name": "clean",
   "train_split": "train.100[:5]",
-  "eval_split": "validation[:100]",
+  "eval_split": "validation[:2]",
   "max_audio_seconds": 5.0,
   "max_text_words": 20,
   "sample_rate": 16000,

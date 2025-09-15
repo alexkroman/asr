@@ -3,6 +3,8 @@ datasets_cache
 myenv
 test_output
 mac_minimal_output
+overfit_output
+overfit_aggressive_output
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
