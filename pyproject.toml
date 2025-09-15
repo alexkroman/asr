@@ -179,8 +179,17 @@ setup-mac = [
 ]
 
 # Pod deployment
-pod-copy = "bash scripts/pod_copy.sh"
-install-deps = "bash scripts/install_dependencies.sh"
+pod-deploy = [
+    "echo 'Deploying to RunPod server...'",
+    "rsync -avz -e 'ssh -p 16392 -i ~/.ssh/id_ed25519' --exclude='__pycache__' --exclude='*.pyc' src root@103.196.86.163:/workspace/",
+    "rsync -avz -e 'ssh -p 16392 -i ~/.ssh/id_ed25519' --exclude='__pycache__' --exclude='*.pyc' configs root@103.196.86.163:/workspace/",
+    "scp -P 16392 -i ~/.ssh/id_ed25519 pyproject.toml root@103.196.86.163:/workspace/",
+    "echo 'Deployment complete!'"
+]
+install-deps = [
+    "apt update",
+    "apt install -y ffmpeg libsndfile1 libsndfile1-dev"
+]
 
 [tool.hatch.envs.cuda]
 template = "default"
