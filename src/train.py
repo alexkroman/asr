@@ -169,7 +169,7 @@ class ConvolutionModule(nn.Module):
         assert kernel_size % 2 == 1, "kernel_size must be odd for 'same' padding"
 
         self.layer_norm = nn.LayerNorm(d_model)
-        self.pointwise_conv1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
+        self.pointwise_conv1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1, bias=False)
         self.glu = nn.GLU(dim=1)
         self.depthwise_conv = nn.Conv1d(
             d_model,
@@ -177,10 +177,10 @@ class ConvolutionModule(nn.Module):
             kernel_size=kernel_size,
             padding=(kernel_size - 1) // 2,
             groups=d_model,
+            bias=False,
         )
-        self.batch_norm = nn.BatchNorm1d(d_model)
         self.activation = nn.SiLU()
-        self.pointwise_conv2 = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.pointwise_conv2 = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,7 +202,6 @@ class ConvolutionModule(nn.Module):
 
         # Depthwise conv
         x = self.depthwise_conv(x)
-        x = self.batch_norm(x)
         x = self.activation(x)
 
         # Second pointwise conv
@@ -223,10 +222,10 @@ class FeedForwardModule(nn.Module):
         d_ff = d_ff or 4 * d_model
 
         self.layer_norm = nn.LayerNorm(d_model)
-        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
         self.activation = nn.SiLU()
         self.dropout1 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -264,7 +263,9 @@ class ConformerBlock(nn.Module):
 
         # Multi-head self-attention module
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_head, dropout=dropout, batch_first=True, bias=False
+        )
         self.attn_dropout = nn.Dropout(dropout)
 
         # Convolution module
@@ -323,22 +324,25 @@ class ConformerEncoder(nn.Module):
         self.subsample_layers = 2  # Number of conv layers with stride 2
         self.subsample_factor = 2**self.subsample_layers  # Total subsampling: 4x
 
-        # Convolutional subsampling
+        # Convolutional subsampling - simplified without normalization layers
+        # The normalization will happen after reshaping
         self.subsample = nn.Sequential(
-            nn.Conv2d(1, config.d_model, 3, 2, 1),
+            nn.Conv2d(1, config.d_model, 3, 2, 1, bias=False),
             nn.SiLU(),
-            nn.Conv2d(config.d_model, config.d_model, 3, 2, 1),
+            nn.Conv2d(config.d_model, config.d_model, 3, 2, 1, bias=False),
             nn.SiLU(),
         )
 
-        # Linear projection after subsampling
+        # Linear projection after subsampling with normalization
         # Calculate feature dimension after frequency subsampling
         freq_subsample_factor = (
             self.subsample_factor
         )  # Frequency dimension also reduced by same factor
-        self.input_proj = nn.Linear(
-            config.d_model * (config.n_mels // freq_subsample_factor), config.d_model
-        )
+        input_dim = config.d_model * (config.n_mels // freq_subsample_factor)
+
+        # Add layer norm before projection to stabilize gradients
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_proj = nn.Linear(input_dim, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.conformer_dropout)
 
         # Stack of Conformer blocks
@@ -367,8 +371,14 @@ class ConformerEncoder(nn.Module):
         x = x.contiguous()
 
         # Convolutional subsampling
-        x = self.subsample(x.unsqueeze(1))
+        x = x.unsqueeze(1)  # Add channel dimension
+        x = self.subsample(x)
+
+        # Clamp values to prevent explosion
+        x = torch.clamp(x, min=-10, max=10)
+
         x = rearrange(x, "b c f t -> b t (c f)")
+        x = self.input_norm(x)  # Normalize before projection
         x = self.input_proj(x)
         x = self.dropout(x)
 
@@ -424,7 +434,7 @@ class ConformerEncoder(nn.Module):
 class LightweightAudioProjector(nn.Module):
     def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
-        self.audio_proj = nn.Linear(audio_dim, text_dim)
+        self.audio_proj = nn.Linear(audio_dim, text_dim, bias=False)
         # Initialize queries with smaller values for numerical stability
         self.queries = nn.Parameter(torch.zeros(config.num_queries, text_dim))
         nn.init.normal_(self.queries, mean=0.0, std=0.01)
@@ -433,13 +443,14 @@ class LightweightAudioProjector(nn.Module):
             num_heads=config.projector_num_heads,
             dropout=config.projector_dropout,
             batch_first=True,
+            bias=False,
         )
         self.mlp = nn.Sequential(
             nn.LayerNorm(text_dim),
-            nn.Linear(text_dim, text_dim * 2),
+            nn.Linear(text_dim, text_dim * 2, bias=False),
             nn.GELU(),
             nn.Dropout(config.projector_dropout),
-            nn.Linear(text_dim * 2, text_dim),
+            nn.Linear(text_dim * 2, text_dim, bias=False),
             nn.LayerNorm(text_dim),
         )
 
@@ -527,44 +538,103 @@ class SmolLM2Decoder(nn.Module):
 class CustomTrainer(Trainer):
     """Custom trainer that handles tied embeddings properly during saving."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loss_history = []  # Track recent losses
+        self.loss_stuck_counter = 0  # Count steps without improvement
+        # Force pytorch format instead of safetensors to handle tied weights
+        self.args.save_safetensors = False
 
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        """Override save to handle tied embeddings in the decoder."""
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
-        if output_dir is not None:
-            os.makedirs(output_dir, exist_ok=True)
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Override compute_loss to add NaN detection."""
+        # Call parent's compute_loss
+        result = super().compute_loss(model, inputs, return_outputs=True)
 
-        # Save the model using save_model which handles tied embeddings
-        if self.model is not None:
-            self._save_model(output_dir, state_dict)
-
-        # Save tokenizer
-        if self.tokenizer is not None and output_dir is not None:
-            self.tokenizer.save_pretrained(output_dir)
-
-        # Save training args
-        if output_dir is not None:
-            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
-
-    def _save_model(self, output_dir, state_dict=None):
-        """Save model handling tied embeddings properly."""
-        # Use the model's save_pretrained if available (for HF models)
-        if hasattr(self.model, "decoder") and hasattr(self.model.decoder, "model") and hasattr(self.model.decoder.model, "save_pretrained"):
-            # Save decoder with tied embeddings handled properly
-            if output_dir is not None:
-                decoder_path = os.path.join(output_dir, "decoder")
-                self.model.decoder.model.save_pretrained(decoder_path)
-
-            # Save encoder and projector separately
-            if output_dir is not None and hasattr(self.model, "encoder"):
-                torch.save(self.model.encoder.state_dict(), os.path.join(output_dir, "encoder.bin"))
-            if output_dir is not None and hasattr(self.model, "audio_projector"):
-                torch.save(
-                    self.model.audio_projector.state_dict(), os.path.join(output_dir, "projector.bin")
-                )
+        # Handle the return value which is always a tuple when return_outputs=True
+        if isinstance(result, tuple):
+            loss, outputs = result
         else:
-            # Fallback to standard save
-            super()._save(output_dir, state_dict)
+            loss = result
+            outputs = None
+
+        # Check for NaN loss and replace with small value if found
+        if loss is not None and torch.isnan(loss):
+            print(f"⚠️ Warning: NaN loss detected, using fallback loss")
+            loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
+
+        # Track loss for stuck detection (only during training)
+        if model.training and loss is not None:
+            loss_value = loss.detach().item()
+            self.loss_history.append(loss_value)
+
+            # Keep only last 100 losses
+            if len(self.loss_history) > 100:
+                self.loss_history.pop(0)
+
+            # Check if loss is stuck (not improving)
+            if len(self.loss_history) >= 50:
+                recent_avg = sum(self.loss_history[-20:]) / 20
+                older_avg = sum(self.loss_history[-50:-30]) / 20
+
+                if abs(recent_avg - older_avg) < 0.1:  # Less than 0.1 improvement
+                    self.loss_stuck_counter += 1
+                    if self.loss_stuck_counter % 50 == 0:  # Alert every 50 stuck steps
+                        print(f"⚠️ Loss appears stuck around {recent_avg:.2f} for {self.loss_stuck_counter} steps")
+                else:
+                    self.loss_stuck_counter = 0  # Reset if improving
+
+        if return_outputs:
+            return (loss, outputs)
+        return loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to add gradient monitoring."""
+        # Call parent's training_step
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        # Check for inf/nan gradients after backward pass (check every step for debugging)
+        if self.state.global_step % 10 == 0:  # Check every 10 steps
+            max_grad = 0
+            max_grad_param = None
+            num_inf = 0
+            num_nan = 0
+
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        num_nan += 1
+                    if torch.isinf(param.grad).any():
+                        num_inf += 1
+                    grad_norm = param.grad.abs().max().item()
+                    if grad_norm > max_grad:
+                        max_grad = grad_norm
+                        max_grad_param = name
+
+            if num_inf > 0 or num_nan > 0:
+                print(f"⚠️ Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param}, "
+                      f"Inf params: {num_inf}, NaN params: {num_nan}")
+            elif max_grad > 10000:
+                print(f"📊 Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param} (high but manageable)")
+            elif self.state.global_step % 100 == 0:  # Every 100 steps show status
+                # Collect more detailed stats
+                grad_stats = []
+                for name, param in model.named_parameters():
+                    if param.grad is not None and param.requires_grad:
+                        grad_norm = param.grad.norm().item()
+                        grad_stats.append(grad_norm)
+
+                if grad_stats:
+                    avg_grad = sum(grad_stats) / len(grad_stats)
+                    min_grad = min(grad_stats)
+
+                    # Check for vanishing gradients
+                    vanishing_count = sum(1 for g in grad_stats if g < 1e-6)
+
+                    print(f"✅ Step {self.state.global_step}: max_grad={max_grad:.2e}, avg_grad={avg_grad:.2e}, "
+                          f"min_grad={min_grad:.2e}, vanishing={vanishing_count}/{len(grad_stats)}")
+
+        return loss
+
 
 
 class ASRModel(nn.Module):
@@ -580,24 +650,28 @@ class ASRModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights using standard gains to prevent vanishing gradients."""
+        """Initialize weights with more conservative values to prevent gradient explosion."""
         for name, module in self.named_modules():
             # Skip decoder weights - they're already pretrained
             if 'decoder' in name:
                 continue
 
             if isinstance(module, nn.Linear):
-                # Use standard Xavier initialization for linear layers
-                # Gain of 1.0 is standard for linear layers with tanh/sigmoid
-                # For ReLU-like activations (SiLU), slightly higher gain is better
-                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                # Very conservative initialization to prevent gradient explosion
+                nn.init.xavier_uniform_(module.weight, gain=0.02)  # Even smaller gain
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
-                # Use Kaiming initialization for convolutional layers
-                # Better for ReLU-like activations (SiLU is similar to ReLU)
+                # Very conservative initialization for conv layers
                 nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                with torch.no_grad():
+                    module.weight.data *= 0.1  # Much smaller scale
                 if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d) or isinstance(module, nn.GroupNorm):
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.LayerNorm):
                 if hasattr(module, 'weight') and module.weight is not None:
@@ -605,11 +679,10 @@ class ASRModel(nn.Module):
                 if hasattr(module, 'bias') and module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.MultiheadAttention):
-                # Standard initialization for attention weights
-                # Scaled by 1/sqrt(d_k) is already handled internally
+                # More conservative initialization for attention
                 for param in module.parameters():
                     if param.dim() > 1:
-                        nn.init.xavier_uniform_(param, gain=1.0)
+                        nn.init.xavier_uniform_(param, gain=0.1)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """
