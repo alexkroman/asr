@@ -1001,8 +1001,8 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict
     wer = wer_metric.compute(predictions=pred_texts, references=label_texts)
 
     return {
-        "eval_wer": wer,
-        "eval_samples": max_samples,
+        "wer": wer,
+        "wer_samples": max_samples,
     }
 
 
