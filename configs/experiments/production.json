@@ -8,7 +8,7 @@
 
   "decoder_model_name": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
   "use_lora": true,
-  "lora_r": 64,
+  "lora_r": 32,
   "lora_alpha": 32,
   "lora_dropout": 0.05,
   "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
@@ -19,7 +19,7 @@
   "n_freq_masks": 2,
   "n_time_masks": 2,
 
-  "num_queries": 64,
+  "num_queries": 128,
   "projector_num_heads": 8,
   "projector_num_layers": 2,
   "projector_dropout": 0.1,
@@ -60,7 +60,7 @@
   "metric_for_best_model": "eval_loss",
   "greater_is_better": false,
   "push_to_hub": false,
-  "report_to": [],
+  "report_to": ["tensorboard"],
   "dataloader_num_workers": 8,
   "gradient_checkpointing": true,
   "fp16": false,

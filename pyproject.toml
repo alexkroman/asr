@@ -174,17 +174,7 @@ setup-mac = [
 ]
 
 # Pod deployment
-pod-deploy = [
-    "ssh -p 22116 -i ~/.ssh/id_ed25519 root@194.68.245.62 'mkdir -p /workspace/src /workspace/configs/accelerate /workspace/configs/experiments'",
-    "scp -P 22116 -i ~/.ssh/id_ed25519 pyproject.toml README.md root@194.68.245.62:/workspace/",
-    "scp -P 22116 -i ~/.ssh/id_ed25519 src/train.py src/__init__.py root@194.68.245.62:/workspace/src/",
-    "scp -P 22116 -i ~/.ssh/id_ed25519 configs/accelerate/a40_optimized.yaml root@194.68.245.62:/workspace/configs/accelerate/",
-    "scp -P 22116 -i ~/.ssh/id_ed25519 configs/experiments/production.json root@194.68.245.62:/workspace/configs/experiments/"
-]
-install-deps = [
-    "apt update",
-    "apt install -y ffmpeg libsndfile1 libsndfile1-dev",
-]
+pod-deploy = "./scripts/pod_deploy.sh"
 
 [tool.hatch.envs.cuda]
 template = "default"

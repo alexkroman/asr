@@ -41,19 +41,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 warnings.filterwarnings("ignore")
 
-# Data path for outputs - use local directory on Mac
-DATA_PATH = (
-    "/workspace/ASR_Conformer_SmolLM2_Optimized" if os.path.exists("/workspace") else "./ASR_output"
-)
-os.makedirs(f"{DATA_PATH}/checkpoints", exist_ok=True)
-os.makedirs(f"{DATA_PATH}/models", exist_ok=True)
-os.makedirs(f"{DATA_PATH}/logs", exist_ok=True)
 
-# Accelerator will be initialized in main function
-
-# HuggingFace authentication removed - not needed for local training
-
-# Authentication will be handled in main function
 
 
 @dataclass
@@ -521,8 +509,6 @@ class SmolLM2Decoder(nn.Module):
                 task_type=TaskType.CAUSAL_LM,
             )
             self.model = get_peft_model(self.model, lora_config)
-            if hasattr(self.model, "print_trainable_parameters"):
-                self.model.print_trainable_parameters()
 
     def _add_padding_token(self):
         """Add a padding token to the tokenizer and resize model embeddings."""
@@ -548,107 +534,6 @@ class SmolLM2Decoder(nn.Module):
         return self.model(**kwargs)
 
 
-class CustomTrainer(Trainer):
-    """Custom trainer that handles tied embeddings properly during saving."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.loss_history = []  # Track recent losses
-        self.loss_stuck_counter = 0  # Count steps without improvement
-        # Force pytorch format instead of safetensors to handle tied weights
-        self.args.save_safetensors = False
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Override compute_loss to add NaN detection."""
-        # Call parent's compute_loss
-        result = super().compute_loss(model, inputs, return_outputs=True)
-
-        # Handle the return value which is always a tuple when return_outputs=True
-        if isinstance(result, tuple):
-            loss, outputs = result
-        else:
-            loss = result
-            outputs = None
-
-        if loss is not None and torch.isnan(loss):
-            loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
-
-        # Track loss for stuck detection (only during training)
-        if model.training and loss is not None:
-            loss_value = loss.detach().item()
-            self.loss_history.append(loss_value)
-
-            # Keep only last 100 losses
-            if len(self.loss_history) > 100:
-                self.loss_history.pop(0)
-
-            # Check if loss is stuck (not improving)
-            if len(self.loss_history) >= 50:
-                recent_avg = sum(self.loss_history[-20:]) / 20
-                older_avg = sum(self.loss_history[-50:-30]) / 20
-
-                if abs(recent_avg - older_avg) < 0.1:  # Less than 0.1 improvement
-                    self.loss_stuck_counter += 1
-                    if self.loss_stuck_counter % 50 == 0:  # Alert every 50 stuck steps
-                        from tqdm import tqdm
-                        tqdm.write(f"⚠️ Loss appears stuck around {recent_avg:.2f} for {self.loss_stuck_counter} steps")
-                else:
-                    self.loss_stuck_counter = 0  # Reset if improving
-
-        if return_outputs:
-            return (loss, outputs)
-        return loss
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to add gradient monitoring."""
-        # Call parent's training_step
-        loss = super().training_step(model, inputs, num_items_in_batch)
-
-        # Check for inf/nan gradients after backward pass (check every step for debugging)
-        if self.state.global_step % 10 == 0:  # Check every 10 steps
-            max_grad = 0
-            max_grad_param = None
-            num_inf = 0
-            num_nan = 0
-
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        num_nan += 1
-                    if torch.isinf(param.grad).any():
-                        num_inf += 1
-                    grad_norm = param.grad.abs().max().item()
-                    if grad_norm > max_grad:
-                        max_grad = grad_norm
-                        max_grad_param = name
-
-            if num_inf > 0 or num_nan > 0:
-                from tqdm import tqdm
-                tqdm.write(f"⚠️ Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param}, "
-                          f"Inf params: {num_inf}, NaN params: {num_nan}")
-            elif max_grad > 10000:
-                from tqdm import tqdm
-                tqdm.write(f"📊 Step {self.state.global_step}: Max grad {max_grad:.2e} in {max_grad_param} (high but manageable)")
-            elif self.state.global_step % 100 == 0:  # Every 100 steps show status
-                # Collect more detailed stats
-                grad_stats = []
-                for name, param in model.named_parameters():
-                    if param.grad is not None and param.requires_grad:
-                        grad_norm = param.grad.norm().item()
-                        grad_stats.append(grad_norm)
-
-                if grad_stats:
-                    avg_grad = sum(grad_stats) / len(grad_stats)
-                    min_grad = min(grad_stats)
-
-                    # Check for vanishing gradients
-                    vanishing_count = sum(1 for g in grad_stats if g < 1e-6)
-
-                    from tqdm import tqdm
-                    tqdm.write(f"✅ Step {self.state.global_step}: max_grad={max_grad:.2e}, avg_grad={avg_grad:.2e}, "
-                              f"min_grad={min_grad:.2e}, vanishing={vanishing_count}/{len(grad_stats)}")
-
-        return loss
 
 
 
@@ -902,7 +787,6 @@ class DataCollator:
             if not torch.all(torch.isfinite(audio_array)):
                 # Handle corrupted audio by replacing with silence
                 audio_array = torch.zeros_like(audio_array)
-                print("⚠️ Warning: Found NaN/Inf in raw audio, replacing with silence")
 
             # Clip audio to prevent extreme values
             audio_array = torch.clamp(audio_array, min=-1.0, max=1.0)
@@ -920,7 +804,6 @@ class DataCollator:
             if not torch.all(torch.isfinite(spec_db)):
                 # Fall back to zero spectrogram
                 spec_db = torch.zeros_like(spec_db)
-                print("⚠️ Warning: Found NaN/Inf after dB conversion, using zero spectrogram")
 
             # Robust normalization
             mean_val = spec_db.mean()
@@ -941,7 +824,6 @@ class DataCollator:
             # Final check
             if not torch.all(torch.isfinite(spec_norm)):
                 spec_norm = torch.zeros_like(spec_norm)
-                print("⚠️ Warning: Found NaN/Inf after normalization, using zero spectrogram")
 
             specs.append(spec_norm)
             texts.append(self._normalize_text(f["text"]))
@@ -974,11 +856,8 @@ def parse_config(
     config_file: str, accelerator: Accelerator
 ) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
-    import sys
-
     if not os.path.exists(config_file):
-        print(f"❌ Error: Config file '{config_file}' not found!")
-        sys.exit(1)
+        raise FileNotFoundError(f"Config file '{config_file}' not found!")
 
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
 
@@ -987,18 +866,17 @@ def parse_config(
             json_file=config_file, allow_extra_keys=True
         )
     except Exception as e:
-        print(f"❌ Error parsing config file: {e}")
-        sys.exit(1)
+        raise ValueError(f"Error parsing config file: {e}") from e
 
-    if accelerator.is_main_process:
-        print(f"✅ Loaded configuration from: {config_file}")
+    # Configuration loaded successfully
 
     # Apply essential runtime settings
     training_args.remove_unused_columns = False
     training_args.label_names = ["labels"]
 
-    # Disable all reporting
-    training_args.report_to = []
+    # Enable TensorBoard if specified, otherwise disable reporting
+    if "tensorboard" not in training_args.report_to:
+        training_args.report_to = []
 
     # Disable hub pushing
     training_args.push_to_hub = False
@@ -1010,8 +888,7 @@ def initialize_model(
     model_args: ModelArguments, accelerator: Accelerator
 ) -> Tuple[ASRModel, AutoTokenizer]:
     """Initialize the ASR model and tokenizer."""
-    if accelerator.is_main_process:
-        print("🚀 Initializing model and tokenizer...")
+    # Initialize model and tokenizer
 
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
@@ -1027,8 +904,7 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     """Load training and validation datasets."""
     from datasets import concatenate_datasets
 
-    if accelerator.is_main_process:
-        print("📦 Loading datasets...")
+    # Load datasets
 
     # Adjust num_proc based on platform
     import platform
@@ -1043,8 +919,7 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     for config, train_split, eval_split in zip(
         data_args.dataset_configs, data_args.train_splits, data_args.eval_splits
     ):
-        if accelerator.is_main_process:
-            print(f"   Loading {config} - train: {train_split}, eval: {eval_split}")
+        # Load dataset configuration
 
         train_ds = load_dataset(
             data_args.dataset_name,
@@ -1068,31 +943,67 @@ def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[D
     train_dataset = concatenate_datasets(train_datasets)
     val_dataset = concatenate_datasets(val_datasets)
 
-    if accelerator.is_main_process:
-        for i, (config, ds) in enumerate(zip(data_args.dataset_configs, train_datasets)):
-            print(f"   Train {config}: {len(ds)} samples")
-        for i, (config, ds) in enumerate(zip(data_args.dataset_configs, val_datasets)):
-            print(f"   Val {config}: {len(ds)} samples")
-
-    original_train_size = len(train_dataset)
-    original_val_size = len(val_dataset)
+    # Dataset sizes recorded
 
     # Limit samples if specified (for overfitting experiments)
     if data_args.max_train_samples is not None:
         train_dataset = train_dataset.select(range(min(data_args.max_train_samples, len(train_dataset))))
-        if accelerator.is_main_process:
-            print(f"   Limited training samples to {len(train_dataset)}")
 
     if data_args.max_eval_samples is not None:
         val_dataset = val_dataset.select(range(min(data_args.max_eval_samples, len(val_dataset))))
-        if accelerator.is_main_process:
-            print(f"   Limited evaluation samples to {len(val_dataset)}")
 
-    if accelerator.is_main_process:
-        print(f"✅ Datasets loaded. Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    # Datasets loaded successfully
 
     return train_dataset, val_dataset
 
+
+
+def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict[str, float]:
+    """Compute WER metric for evaluation.
+
+    Args:
+        eval_pred: EvalPrediction object from Trainer
+        tokenizer: Tokenizer for decoding
+    """
+    predictions = eval_pred.predictions
+    label_ids = eval_pred.label_ids
+
+    # Handle small evaluation sets
+    total_samples = len(predictions)
+    # Sample up to 10% of data or max 100 samples for WER calculation to save time
+    max_samples = min(max(10, int(total_samples * 0.1)), 100)
+
+    if total_samples > max_samples:
+        indices = random.sample(range(total_samples), max_samples)
+        predictions = predictions[indices]
+        label_ids = label_ids[indices]
+    else:
+        max_samples = total_samples
+
+    # Decode predictions and labels
+    if len(predictions.shape) == 3:
+        # If predictions are logits, get argmax
+        predictions = np.argmax(predictions, axis=-1)
+
+    # Replace -100 with pad_token_id for labels
+    label_ids = np.where(label_ids == -100, tokenizer.pad_token_id, label_ids)
+
+    # Decode texts
+    pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    label_texts = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    # Normalize texts
+    pred_texts = [text.lower().strip() for text in pred_texts]
+    label_texts = [text.lower().strip() for text in label_texts]
+
+    # Calculate WER
+    wer_metric = evaluate.load("wer")
+    wer = wer_metric.compute(predictions=pred_texts, references=label_texts)
+
+    return {
+        "eval_wer": wer,
+        "eval_samples": max_samples,
+    }
 
 
 def setup_trainer(
@@ -1103,6 +1014,7 @@ def setup_trainer(
     val_dataset: Dataset,
     model_args: ModelArguments,
     data_args: DataArguments,
+    accelerator: Accelerator,
 ) -> Trainer:
     """Setup the trainer with data collator and compute metrics."""
     # Create data collator
@@ -1114,214 +1026,25 @@ def setup_trainer(
         max_text_words=data_args.max_text_words,
     )
 
-    # Initialize CustomTrainer to handle tied embeddings properly
-    trainer = CustomTrainer(
+    # Create compute_metrics function with tokenizer bound
+    def compute_metrics_fn(eval_pred):
+        return compute_metrics(eval_pred, tokenizer)
+
+    # Initialize standard Trainer
+    # Only compute metrics if explicitly requested in config
+    use_metrics = getattr(training_args, 'compute_metrics', False)
+
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        compute_metrics=None,  # Using eval_loss for model selection
+        compute_metrics=compute_metrics_fn if use_metrics else None,
     )
 
     return trainer
-
-
-def show_sample_predictions(
-    model: ASRModel,
-    dataset: Dataset,
-    tokenizer: AutoTokenizer,
-    data_collator: DataCollator,
-    device: torch.device,
-    num_samples: int = 10,
-) -> None:
-    """Show sample predictions from the validation set using generation."""
-    model.eval()
-
-    # Get random samples from the dataset
-    wer_metric = evaluate.load("wer")
-    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
-
-    with torch.no_grad():
-        for i, idx in enumerate(indices, 1):
-            # Get sample and collate it
-            sample = dataset[idx]
-            batch = data_collator([sample])
-
-            # Move to device
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
-
-            # Use actual generation
-            generated_ids = model.generate(
-                input_values=batch["input_values"],
-                input_lengths=batch["input_lengths"],
-                max_length=256,
-                num_beams=1,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            pred_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-            # Get ground truth, handling -100 padding
-            labels = batch["labels"][0]
-            labels = torch.where(labels == -100, tokenizer.pad_token_id, labels)
-            true_text = tokenizer.decode(labels, skip_special_tokens=True)
-
-            # Clean up and truncate texts
-            pred_text = pred_text.strip()[:100] if pred_text.strip() else "[EMPTY]"
-            true_text = true_text.strip()[:100] if true_text.strip() else "[EMPTY]"
-
-            # Calculate sample WER for display
-            if true_text != "[EMPTY]":
-                sample_wer = wer_metric.compute(predictions=[pred_text], references=[true_text])
-                print(f"\nSample {i} (WER: {sample_wer:.2f}):")
-            else:
-                print(f"\nSample {i}:")
-            print(f"  Truth: {true_text}")
-            print(f"  Pred:  {pred_text}")
-
-
-def load_checkpoint(checkpoint_dir: str, model: ASRModel, accelerator: Accelerator) -> bool:
-    """
-    Load a checkpoint into the model. Returns True if successful.
-
-    Supports two checkpoint formats:
-    1. LoRA format: LoRA adapters in decoder/ subdirectory
-    2. Full model format: Complete model in decoder/ subdirectory
-    """
-    if not os.path.exists(checkpoint_dir):
-        print(f"⚠️  Checkpoint directory does not exist: {checkpoint_dir}")
-        return False
-
-    try:
-        # Define paths for different components
-        decoder_path = os.path.join(checkpoint_dir, "decoder")
-        encoder_path = os.path.join(checkpoint_dir, "encoder.bin")
-        projector_path = os.path.join(checkpoint_dir, "projector.bin")
-
-        # Detect checkpoint format
-        checkpoint_format = _detect_checkpoint_format(checkpoint_dir)
-
-        if checkpoint_format == "lora":
-            # LoRA adapters in decoder/ subdirectory
-            print("   Loading LoRA adapters...")
-            _load_lora_decoder(model, decoder_path, accelerator)
-            _load_audio_components(model, encoder_path, projector_path, accelerator)
-
-        elif checkpoint_format == "full_model":
-            # Full model format: Complete model in decoder/ subdirectory
-            print("   Loading full model from checkpoint...")
-            model.decoder.model = AutoModelForCausalLM.from_pretrained(
-                decoder_path,
-                device_map=accelerator.device,
-                torch_dtype=torch.bfloat16
-            )
-            _load_audio_components(model, encoder_path, projector_path, accelerator)
-
-        else:
-            print(f"⚠️  Unknown or invalid checkpoint format in {checkpoint_dir}")
-            return False
-
-        print("✅ Model loaded successfully")
-        return True
-
-    except Exception as e:
-        print(f"⚠️  Failed to load checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def _detect_checkpoint_format(checkpoint_dir: str) -> str:
-    """Detect the format of a checkpoint directory."""
-    decoder_path = os.path.join(checkpoint_dir, "decoder")
-
-    # Check for LoRA format
-    if os.path.exists(os.path.join(decoder_path, "adapter_config.json")):
-        return "lora"
-
-    # Check for full model format
-    if os.path.exists(os.path.join(decoder_path, "config.json")):
-        return "full_model"
-
-    return "unknown"
-
-
-def _get_base_model(decoder_model):
-    """Extract the base model from a potentially LoRA-wrapped model."""
-    if hasattr(decoder_model, 'base_model'):
-        # Model is already wrapped with LoRA
-        if hasattr(decoder_model.base_model, 'model'):
-            return decoder_model.base_model.model
-        return decoder_model.base_model
-    return decoder_model
-
-
-def _load_lora_decoder(model: ASRModel, decoder_path: str, accelerator: Accelerator):
-    """Load LoRA adapters for the decoder."""
-    from peft import PeftModel
-
-    base_model = _get_base_model(model.decoder.model)
-    model.decoder.model = PeftModel.from_pretrained(
-        base_model,
-        decoder_path,
-        device_map=accelerator.device,
-    )
-
-
-def _load_audio_components(
-    model: ASRModel,
-    encoder_path: str,
-    projector_path: str,
-    accelerator: Accelerator
-):
-    """Load encoder and projector components if they exist."""
-    if os.path.exists(encoder_path):
-        print("   Loading encoder...")
-        model.encoder.load_state_dict(
-            torch.load(encoder_path, map_location=accelerator.device)
-        )
-
-    if os.path.exists(projector_path):
-        print("   Loading audio projector...")
-        model.audio_projector.load_state_dict(
-            torch.load(projector_path, map_location=accelerator.device)
-        )
-
-
-def find_latest_checkpoint(output_dir: str, model_args: ModelArguments) -> Optional[str]:
-    """Find the latest checkpoint, either final model or training checkpoint."""
-    # First, check for final model
-    model_size = f"d{model_args.d_model}_l{model_args.num_layers}_r{model_args.lora_r}"
-    save_path = f"{DATA_PATH}/models/final_model_{model_size}"
-
-    if os.path.exists(f"{save_path}/adapter_config.json") or os.path.exists(f"{save_path}/decoder"):
-        print(f"📂 Found final model at {save_path}")
-        return save_path
-
-    # Look for latest checkpoint in output_dir
-    if os.path.exists(output_dir):
-        checkpoint_dirs = [
-            d
-            for d in os.listdir(output_dir)
-            if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))
-        ]
-
-        if checkpoint_dirs:
-            # Sort by step number and get the latest
-            checkpoint_dirs.sort(key=lambda x: int(x.split("-")[-1]))
-            checkpoint_dir = os.path.join(output_dir, checkpoint_dirs[-1])
-            print(f"📂 Found checkpoint at {checkpoint_dir}")
-            return checkpoint_dir
-        else:
-            print(f"⚠️  No checkpoints found in {output_dir}")
-    else:
-        print(f"⚠️  Output directory {output_dir} does not exist")
-
-    return None
 
 
 def run_training(
@@ -1334,17 +1057,11 @@ def run_training(
 ) -> None:
     """Run the training and save the model."""
     # Start training
-    if accelerator.is_main_process:
-        print("🚀 Starting training...")
-        print(f"   Device: {accelerator.device}")
-        print(f"   Distributed: {accelerator.state.distributed_type}")
-        print(f"   Mixed precision: {accelerator.mixed_precision}")
 
     # Resume from checkpoint if specified
     if training_args.resume_from_checkpoint and os.path.exists(
         training_args.resume_from_checkpoint
     ):
-        print(f"📂 Resuming training from checkpoint: {training_args.resume_from_checkpoint}")
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
@@ -1356,13 +1073,6 @@ def main() -> None:
     """Main training function - simplified with Accelerate."""
     import sys
 
-    # Check for eval-only mode
-    eval_only = False
-    if "--eval-only" in sys.argv:
-        eval_only = True
-        sys.argv.remove("--eval-only")
-        print("🔍 Running in evaluation-only mode")
-
     # Initialize Accelerator
     accelerator = Accelerator()
 
@@ -1372,16 +1082,17 @@ def main() -> None:
 
     # Require a config file to be provided
     if len(sys.argv) < 2 or sys.argv[1] != "--config":
-        print("❌ Error: Config file is required!")
-        print("Usage: accelerate launch train.py --config <config_file.json>")
-        print("\nExample:")
-        print("  accelerate launch train.py --config experiment_config.json")
-        sys.exit(1)
+        raise ValueError(
+            "Config file is required!\n"
+            "Usage: accelerate launch train.py --config <config_file.json>\n"
+            "Example: accelerate launch train.py --config experiment_config.json"
+        )
 
     if len(sys.argv) < 3:
-        print("❌ Error: Config file path is missing!")
-        print("Usage: accelerate launch train.py --config <config_file.json>")
-        sys.exit(1)
+        raise ValueError(
+            "Config file path is missing!\n"
+            "Usage: accelerate launch train.py --config <config_file.json>"
+        )
 
     config_file = sys.argv[2]
 
@@ -1403,44 +1114,11 @@ def main() -> None:
         val_dataset=val_dataset,
         model_args=model_args,
         data_args=data_args,
+        accelerator=accelerator,
     )
 
-    if eval_only:
-        # Find and load the latest checkpoint
-        checkpoint_dir = find_latest_checkpoint(training_args.output_dir, model_args)
-
-        if checkpoint_dir:
-            load_checkpoint(checkpoint_dir, model, accelerator)
-        else:
-            print("⚠️  No saved model or checkpoint found, using initialized model")
-
-        # Run evaluation
-        print("\n📊 Running evaluation...")
-        metrics = trainer.evaluate()
-
-        # Print metrics
-        print("\n📈 Evaluation Results:")
-        for key, value in metrics.items():
-            if isinstance(value, float):
-                print(f"   {key}: {value:.4f}")
-            else:
-                print(f"   {key}: {value}")
-
-        # Show sample predictions
-        print("\n📝 Sample Predictions (10 samples):")
-        print("-" * 80)
-        show_sample_predictions(
-            model=model,
-            dataset=val_dataset,
-            tokenizer=tokenizer,
-            data_collator=trainer.data_collator,
-            device=accelerator.device,
-            num_samples=10,
-        )
-
-    else:
-        # Run training
-        run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
+    # Run training
+    run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
 
 
 if __name__ == "__main__":
