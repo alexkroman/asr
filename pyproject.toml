@@ -178,8 +178,7 @@ setup-mac = [
 # Pod deployment
 pod-deploy = "./scripts/pod_deploy.sh"
 
-# Push to Hugging Face Hub
-push-to-hub = "python scripts/push_to_hub.py --repo_name mazesmazes/asr --private"
+# Push to Hugging Face Hub (use --push-to-hub flag in training instead)
 
 # Gradio demo
 demo = "python demo.py --model_path mazesmazes/asr"
@@ -202,9 +201,9 @@ HF_DATASETS_IN_MEMORY_MAX_SIZE = "0"
 
 [tool.hatch.envs.cuda.scripts]
 train-production = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json"
+train-and-push = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json --push-to-hub {args:mazesmazes/asr}"
 eval-production = "python src/train.py --eval --checkpoint {args:./production_output/checkpoint-1000} --config configs/experiments/production.json"
 eval = "python src/train.py --eval --checkpoint {args} --config configs/experiments/production.json"
-push-to-hub = "python scripts/push_to_hub.py --repo_name mazesmazes/asr --private"
 
 [tool.hatch.envs.mac]
 template = "default"

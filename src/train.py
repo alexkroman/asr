@@ -455,13 +455,19 @@ class DeepAudioProjector(nn.Module):
         q = self.queries.unsqueeze(0).expand(B, -1, -1)
 
         for layer in self.layers:
+            # Cross attention with residual
             attn_out, _ = layer['cross_attn'](q, audio_proj, audio_proj)
             q = layer['norm1'](q + attn_out)
 
+            # Self attention with residual
             self_attn_out, _ = layer['self_attn'](q, q, q)
             q = layer['norm2'](q + self_attn_out)
 
+            # MLP with residual
             q = q + layer['mlp'](q)
+
+        # Add final layer norm for stability
+        q = nn.functional.layer_norm(q, [q.shape[-1]])
 
         return q
 
@@ -540,6 +546,7 @@ class SmolLM2Decoder(nn.Module):
 class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
+        self.config = config  # Store config for saving
         self.encoder = ConformerEncoder(config)
         self.decoder = SmolLM2Decoder(config)
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
@@ -723,7 +730,42 @@ class ASRModel(nn.Module):
         decoder_dtype = next(self.decoder.model.parameters()).dtype
         audio_prefix = audio_prefix.to(dtype=decoder_dtype)
 
-        return self.decoder.model.generate(inputs_embeds=audio_prefix, **kwargs)
+        # Create BOS token to start generation
+        batch_size = audio_prefix.shape[0]
+        device = audio_prefix.device
+
+        # Get BOS token ID (use pad token if no BOS token)
+        bos_token_id = self.decoder.tokenizer.bos_token_id
+        if bos_token_id is None:
+            bos_token_id = self.decoder.tokenizer.pad_token_id
+
+        # Create decoder input IDs with BOS token
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            bos_token_id,
+            dtype=torch.long,
+            device=device
+        )
+
+        # Get BOS embeddings
+        embeddings = self.decoder.model.get_input_embeddings()
+        bos_embeds = embeddings(decoder_input_ids)
+
+        # Concatenate audio prefix with BOS token
+        combined_embeds = torch.cat([audio_prefix, bos_embeds], dim=1)
+
+        # Create attention mask for the combined embeddings
+        attention_mask = torch.ones(
+            combined_embeds.shape[:2],
+            dtype=torch.long,
+            device=device
+        )
+
+        return self.decoder.model.generate(
+            inputs_embeds=combined_embeds,
+            attention_mask=attention_mask,
+            **kwargs
+        )
 
 
 @dataclass
@@ -853,39 +895,26 @@ class DataCollator:
 
 
 def parse_config(
-    config_file: str, accelerator: Accelerator
+    config_file: str
 ) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Config file '{config_file}' not found!")
 
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
+    model_args, data_args, training_args = parser.parse_json_file(
+        json_file=config_file, allow_extra_keys=True
+    )
 
-    try:
-        model_args, data_args, training_args = parser.parse_json_file(
-            json_file=config_file, allow_extra_keys=True
-        )
-    except Exception as e:
-        raise ValueError(f"Error parsing config file: {e}") from e
-
-    # Configuration loaded successfully
-
-    # Apply essential runtime settings
+    # Essential settings for ASR
     training_args.remove_unused_columns = False
     training_args.label_names = ["labels"]
-
-    # Enable TensorBoard if specified, otherwise disable reporting
-    if "tensorboard" not in training_args.report_to:
-        training_args.report_to = []
-
-    # Disable hub pushing
-    training_args.push_to_hub = False
 
     return model_args, data_args, training_args
 
 
 def initialize_model(
-    model_args: ModelArguments, accelerator: Accelerator
+    model_args: ModelArguments
 ) -> Tuple[ASRModel, AutoTokenizer]:
     """Initialize the ASR model and tokenizer."""
     # Initialize model and tokenizer
@@ -893,14 +922,10 @@ def initialize_model(
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
 
-    # Note: Gradient checkpointing is handled by Trainer based on
-    # training_args.gradient_checkpointing. The model has
-    # gradient_checkpointing_enable/disable methods that Trainer will call
-
     return model, tokenizer
 
 
-def load_datasets(data_args: DataArguments, accelerator: Accelerator) -> Tuple[Dataset, Dataset]:
+def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
     from datasets import concatenate_datasets
 
@@ -1047,205 +1072,108 @@ def setup_trainer(
     return trainer
 
 
-def run_training(
-    trainer: Trainer,
-    tokenizer: AutoTokenizer,
-    training_args: CustomTrainingArguments,
-    accelerator: Accelerator,
-    data_args: DataArguments = None,
-    model_args: ModelArguments = None,
-) -> None:
-    """Run the training and save the model."""
-    # Start training
-
-    # Resume from checkpoint if specified
-    if training_args.resume_from_checkpoint and os.path.exists(
-        training_args.resume_from_checkpoint
-    ):
-        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    else:
-        trainer.train()
-
-    # Hub pushing disabled
+# run_training function removed - just use trainer.train() directly
 
 
 def evaluate_checkpoint(checkpoint_dir: str, config_file: str) -> None:
-    """Evaluate a checkpoint and compute WER on validation set."""
-    import sys
-    import json
-    from torch.utils.data import DataLoader
+    """Evaluate a checkpoint using HuggingFace Trainer."""
+    from accelerate import Accelerator
 
-    # Load config file directly without accelerator
-    with open(config_file, 'r') as f:
-        config = json.load(f)
+    # Initialize accelerator for evaluation
+    accelerator = Accelerator()
 
-    # Parse arguments manually
-    parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
-    model_args, data_args, training_args = parser.parse_dict(config, allow_extra_keys=True)
+    # Parse configuration
+    model_args, data_args, training_args = parse_config(config_file)
 
-    # Initialize model (without accelerator)
-    print(f"Initializing model...")
-    model = ASRModel(model_args)
-    tokenizer = model.decoder.tokenizer
+    # Initialize model and tokenizer
+    model, tokenizer = initialize_model(model_args)
 
-    # Load checkpoint
+    # Load checkpoint weights
     print(f"Loading checkpoint from {checkpoint_dir}")
+    checkpoint_file = None
 
-    # Check if it's a full checkpoint or just adapter weights
-    adapter_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
-    full_model_path = os.path.join(checkpoint_dir, "model.safetensors")
-    pytorch_model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    if os.path.exists(os.path.join(checkpoint_dir, "model.safetensors")):
+        checkpoint_file = os.path.join(checkpoint_dir, "model.safetensors")
+    elif os.path.exists(os.path.join(checkpoint_dir, "pytorch_model.bin")):
+        checkpoint_file = os.path.join(checkpoint_dir, "pytorch_model.bin")
 
-    if os.path.exists(adapter_path):
-        # Load LoRA adapter weights
-        from safetensors.torch import load_file
-        adapter_weights = load_file(adapter_path)
+    if checkpoint_file:
+        # Load state dict
+        if checkpoint_file.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(checkpoint_file)
+        else:
+            state_dict = torch.load(checkpoint_file, map_location="cpu")
 
-        # Load adapter weights into model
-        model_dict = model.state_dict()
-        for key, value in adapter_weights.items():
-            if key in model_dict:
-                model_dict[key] = value
-        model.load_state_dict(model_dict, strict=False)
-        print("Loaded LoRA adapter weights")
-    elif os.path.exists(full_model_path):
-        # Load full model weights from safetensors
-        from safetensors.torch import load_file
-        state_dict = load_file(full_model_path)
         model.load_state_dict(state_dict, strict=False)
-        print("Loaded full model weights from safetensors")
-    elif os.path.exists(pytorch_model_path):
-        # Load full model weights from pytorch format
-        state_dict = torch.load(pytorch_model_path, map_location="cpu")
-        model.load_state_dict(state_dict, strict=False)
-        print("Loaded full model weights from pytorch format")
-    else:
-        raise FileNotFoundError(f"No model weights found in {checkpoint_dir}")
+        print(f"Loaded model weights from {os.path.basename(checkpoint_file)}")
 
-    # Load validation dataset (without accelerator)
-    from datasets import load_dataset, concatenate_datasets
+    # Load datasets
+    _, val_dataset = load_datasets(data_args)
 
-    val_datasets = []
-    for config, _, eval_split in zip(
-        data_args.dataset_configs, data_args.train_splits, data_args.eval_splits
-    ):
-        val_ds = load_dataset(
-            data_args.dataset_name,
-            config,
-            split=eval_split,
-            cache_dir=data_args.dataset_cache_dir,
-            num_proc=1,
-        )
-        val_datasets.append(val_ds)
-
-    val_dataset = concatenate_datasets(val_datasets)
-
-    # Sample 10% of validation set
-    num_samples = len(val_dataset)
-    eval_samples = max(10, int(num_samples * 0.1))
-    eval_samples = min(eval_samples, 100)  # Cap at 100 samples
-
+    # Sample subset for quick evaluation
+    eval_samples = min(100, len(val_dataset))
+    if eval_samples < len(val_dataset):
+        indices = random.sample(range(len(val_dataset)), eval_samples)
+        val_dataset = val_dataset.select(indices)
     print(f"Evaluating on {eval_samples} samples from validation set")
 
-    # Select random subset
-    indices = random.sample(range(num_samples), eval_samples)
-    eval_dataset = val_dataset.select(indices)
+    # Setup trainer for evaluation only
+    training_args.per_device_eval_batch_size = 8  # Smaller batch for evaluation
+    training_args.dataloader_num_workers = 2
+    training_args.remove_unused_columns = False
+    training_args.label_names = ["labels"]
 
-    # Create data collator
-    data_collator = DataCollator(
+    trainer = setup_trainer(
+        model=model,
         tokenizer=tokenizer,
-        sample_rate=data_args.sample_rate,
-        n_mels=model_args.n_mels,
-        max_audio_seconds=data_args.max_audio_seconds,
-        max_text_words=data_args.max_text_words,
+        training_args=training_args,
+        train_dataset=None,  # No training dataset needed
+        val_dataset=val_dataset,
+        model_args=model_args,
+        data_args=data_args,
+        accelerator=accelerator,
     )
 
-    # Create dataloader
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=1,
-        collate_fn=data_collator,
-        shuffle=False
-    )
+    # Run evaluation using Trainer
+    print("Running evaluation...")
+    metrics = trainer.evaluate()
 
-    # Determine device and move model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    model = model.to(device)
-    model.eval()
-
-    # Collect predictions and references
-    all_predictions = []
-    all_references = []
-
-    print("Running inference...")
-
-    with torch.no_grad():
-        for i, batch in enumerate(eval_dataloader):
-            # Move batch to device
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-            # Generate predictions
-            # Create attention mask for the audio inputs (all ones, no padding in audio)
-            audio_attention_mask = torch.ones(
-                batch["input_values"].shape[0],
-                model.audio_projector.queries.shape[0],
-                dtype=torch.long,
-                device=device
-            )
-
-            generated_ids = model.generate(
-                input_values=batch["input_values"],
-                input_lengths=batch["input_lengths"],
-                attention_mask=audio_attention_mask,
-                max_new_tokens=100,
-                do_sample=False,
-                num_beams=1,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-            # Decode predictions
-            pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-
-            # Decode references
-            labels = batch["labels"]
-            labels = torch.where(labels == -100, tokenizer.pad_token_id, labels)
-            ref_text = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-            # Normalize texts
-            pred_text = [text.lower().strip() for text in pred_text]
-            ref_text = [text.lower().strip() for text in ref_text]
-
-            all_predictions.extend(pred_text)
-            all_references.extend(ref_text)
-
-            # Print progress
-            if (i + 1) % 10 == 0:
-                print(f"Processed {i + 1}/{len(eval_dataloader)} samples")
-
-    # Calculate WER
-    wer_metric = evaluate.load("wer")
-    wer = wer_metric.compute(predictions=all_predictions, references=all_references)
-
-    # Print results
+    # Print metrics
     print(f"\n{'='*60}")
     print(f"Evaluation Results for checkpoint: {checkpoint_dir}")
     print(f"{'='*60}")
-    print(f"WER: {wer:.4f} ({wer*100:.2f}%)")
+    for key, value in metrics.items():
+        print(f"{key}: {value:.4f}")
     print(f"Number of samples evaluated: {eval_samples}")
+    print(f"{'='*60}\n")
 
-    # Print all predictions
-    print(f"\n{'='*60}")
-    print(f"All {len(all_predictions)} Predictions:")
-    print(f"{'='*60}")
+    # Optionally generate predictions for a few samples to see quality
+    if eval_samples <= 10:
+        print("\nGenerating sample predictions...")
+        predictions = trainer.predict(val_dataset)
 
-    for i in range(len(all_predictions)):
-        print(f"\nSample {i + 1}:")
-        print(f"Truth: {all_references[i]}")
-        print(f"Pred:  {all_predictions[i]}")
+        # If predictions contain generated text, display them
+        if hasattr(predictions, 'predictions'):
+            pred_ids = predictions.predictions
+            label_ids = predictions.label_ids
 
-    print(f"\n{'='*60}\n")
+            # Decode and display
+            if len(pred_ids.shape) == 3:
+                pred_ids = np.argmax(pred_ids, axis=-1)
+
+            pred_texts = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+            label_ids = np.where(label_ids == -100, tokenizer.pad_token_id, label_ids)
+            label_texts = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+            print(f"\n{'='*60}")
+            print("Sample Predictions:")
+            print(f"{'='*60}")
+            for i in range(min(5, len(pred_texts))):
+                print(f"\nSample {i + 1}:")
+                print(f"Truth: {label_texts[i].lower().strip()}")
+                print(f"Pred:  {pred_texts[i].lower().strip()}")
+            print(f"{'='*60}\n")
 
 
 def main() -> None:
@@ -1276,19 +1204,25 @@ def main() -> None:
         evaluate_checkpoint(checkpoint_dir, config_file)
         return
 
+    # Check if pushing to hub
+    push_to_hub = "--push-to-hub" in sys.argv
+    hub_model_id = None
+    if push_to_hub:
+        hub_idx = sys.argv.index("--push-to-hub") + 1
+        if hub_idx < len(sys.argv) and not sys.argv[hub_idx].startswith("--"):
+            hub_model_id = sys.argv[hub_idx]
+        else:
+            raise ValueError("--push-to-hub requires a model ID (e.g., username/model-name)")
+
     # Initialize Accelerator
     accelerator = Accelerator()
-
-    # HuggingFace authentication removed - not needed for local training
-
-    # WandB removed - not needed for local training
 
     # Require a config file to be provided
     if len(sys.argv) < 2 or sys.argv[1] != "--config":
         raise ValueError(
             "Config file is required!\n"
-            "Usage: accelerate launch train.py --config <config_file.json>\n"
-            "Example: accelerate launch train.py --config experiment_config.json"
+            "Usage: accelerate launch train.py --config <config_file.json> [--push-to-hub <model_id>]\n"
+            "Example: accelerate launch train.py --config experiment_config.json --push-to-hub username/asr-model"
         )
 
     if len(sys.argv) < 3:
@@ -1300,13 +1234,18 @@ def main() -> None:
     config_file = sys.argv[2]
 
     # Parse configuration
-    model_args, data_args, training_args = parse_config(config_file, accelerator)
+    model_args, data_args, training_args = parse_config(config_file)
+
+    # Override push_to_hub settings if specified via command line
+    if push_to_hub:
+        training_args.push_to_hub = True
+        training_args.hub_model_id = hub_model_id
 
     # Initialize model
-    model, tokenizer = initialize_model(model_args, accelerator)
+    model, tokenizer = initialize_model(model_args)
 
     # Load datasets
-    train_dataset, val_dataset = load_datasets(data_args, accelerator)
+    train_dataset, val_dataset = load_datasets(data_args)
 
     # Setup trainer
     trainer = setup_trainer(
@@ -1321,7 +1260,15 @@ def main() -> None:
     )
 
     # Run training
-    run_training(trainer, tokenizer, training_args, accelerator, data_args, model_args)
+    if training_args.resume_from_checkpoint and os.path.exists(training_args.resume_from_checkpoint):
+        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    else:
+        trainer.train()
+
+    # Save final model
+    trainer.save_model()
+
+    # If push_to_hub was specified, the trainer will automatically push the final model
 
 
 if __name__ == "__main__":
