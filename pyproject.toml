@@ -70,6 +70,7 @@ dependencies = [
     "requests>=2.31.0",
     "psutil>=5.9.0",
     "packaging>=23.0",
+    "python-dotenv>=1.0.0",
 
     # Interface (optional)
     "gradio>=4.0.0",
@@ -142,7 +143,8 @@ train-mac = "accelerate launch --config_file configs/accelerate/accelerate_confi
 train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
 
 # Evaluation
-eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
+eval = "python src/train.py --eval --checkpoint {args:./mac_minimal_output/checkpoint-8000} --config configs/experiments/mac_minimal.json"
+eval-mac = "python src/train.py --eval --checkpoint {args:./mac_minimal_output/checkpoint-8000} --config configs/experiments/mac_minimal.json"
 
 # Development tools
 lint = [
@@ -176,6 +178,16 @@ setup-mac = [
 # Pod deployment
 pod-deploy = "./scripts/pod_deploy.sh"
 
+# Push to Hugging Face Hub
+push-to-hub = "python scripts/push_to_hub.py --repo_name mazesmazes/asr --private"
+
+# Gradio demo
+demo = "python demo.py --model_path mazesmazes/asr"
+demo-local = "python demo.py --model_path /workspace/production_model/checkpoint-500 --use_local"
+demo-share = "python demo.py --model_path mazesmazes/asr --share"
+demo-pipeline = "python demo_pipeline.py"
+demo-pipeline-share = "python demo_pipeline.py --share"
+
 [tool.hatch.envs.cuda]
 template = "default"
 features = ["cuda", "optimized"]
@@ -190,6 +202,9 @@ HF_DATASETS_IN_MEMORY_MAX_SIZE = "0"
 
 [tool.hatch.envs.cuda.scripts]
 train-production = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json"
+eval-production = "python src/train.py --eval --checkpoint {args:./production_output/checkpoint-1000} --config configs/experiments/production.json"
+eval = "python src/train.py --eval --checkpoint {args} --config configs/experiments/production.json"
+push-to-hub = "python scripts/push_to_hub.py --repo_name mazesmazes/asr --private"
 
 [tool.hatch.envs.mac]
 template = "default"

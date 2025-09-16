@@ -1069,9 +1069,212 @@ def run_training(
     # Hub pushing disabled
 
 
+def evaluate_checkpoint(checkpoint_dir: str, config_file: str) -> None:
+    """Evaluate a checkpoint and compute WER on validation set."""
+    import sys
+    import json
+    from torch.utils.data import DataLoader
+
+    # Load config file directly without accelerator
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+
+    # Parse arguments manually
+    parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
+    model_args, data_args, training_args = parser.parse_dict(config, allow_extra_keys=True)
+
+    # Initialize model (without accelerator)
+    print(f"Initializing model...")
+    model = ASRModel(model_args)
+    tokenizer = model.decoder.tokenizer
+
+    # Load checkpoint
+    print(f"Loading checkpoint from {checkpoint_dir}")
+
+    # Check if it's a full checkpoint or just adapter weights
+    adapter_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
+    full_model_path = os.path.join(checkpoint_dir, "model.safetensors")
+    pytorch_model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+
+    if os.path.exists(adapter_path):
+        # Load LoRA adapter weights
+        from safetensors.torch import load_file
+        adapter_weights = load_file(adapter_path)
+
+        # Load adapter weights into model
+        model_dict = model.state_dict()
+        for key, value in adapter_weights.items():
+            if key in model_dict:
+                model_dict[key] = value
+        model.load_state_dict(model_dict, strict=False)
+        print("Loaded LoRA adapter weights")
+    elif os.path.exists(full_model_path):
+        # Load full model weights from safetensors
+        from safetensors.torch import load_file
+        state_dict = load_file(full_model_path)
+        model.load_state_dict(state_dict, strict=False)
+        print("Loaded full model weights from safetensors")
+    elif os.path.exists(pytorch_model_path):
+        # Load full model weights from pytorch format
+        state_dict = torch.load(pytorch_model_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)
+        print("Loaded full model weights from pytorch format")
+    else:
+        raise FileNotFoundError(f"No model weights found in {checkpoint_dir}")
+
+    # Load validation dataset (without accelerator)
+    from datasets import load_dataset, concatenate_datasets
+
+    val_datasets = []
+    for config, _, eval_split in zip(
+        data_args.dataset_configs, data_args.train_splits, data_args.eval_splits
+    ):
+        val_ds = load_dataset(
+            data_args.dataset_name,
+            config,
+            split=eval_split,
+            cache_dir=data_args.dataset_cache_dir,
+            num_proc=1,
+        )
+        val_datasets.append(val_ds)
+
+    val_dataset = concatenate_datasets(val_datasets)
+
+    # Sample 10% of validation set
+    num_samples = len(val_dataset)
+    eval_samples = max(10, int(num_samples * 0.1))
+    eval_samples = min(eval_samples, 100)  # Cap at 100 samples
+
+    print(f"Evaluating on {eval_samples} samples from validation set")
+
+    # Select random subset
+    indices = random.sample(range(num_samples), eval_samples)
+    eval_dataset = val_dataset.select(indices)
+
+    # Create data collator
+    data_collator = DataCollator(
+        tokenizer=tokenizer,
+        sample_rate=data_args.sample_rate,
+        n_mels=model_args.n_mels,
+        max_audio_seconds=data_args.max_audio_seconds,
+        max_text_words=data_args.max_text_words,
+    )
+
+    # Create dataloader
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=1,
+        collate_fn=data_collator,
+        shuffle=False
+    )
+
+    # Determine device and move model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model = model.to(device)
+    model.eval()
+
+    # Collect predictions and references
+    all_predictions = []
+    all_references = []
+
+    print("Running inference...")
+
+    with torch.no_grad():
+        for i, batch in enumerate(eval_dataloader):
+            # Move batch to device
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+            # Generate predictions
+            # Create attention mask for the audio inputs (all ones, no padding in audio)
+            audio_attention_mask = torch.ones(
+                batch["input_values"].shape[0],
+                model.audio_projector.queries.shape[0],
+                dtype=torch.long,
+                device=device
+            )
+
+            generated_ids = model.generate(
+                input_values=batch["input_values"],
+                input_lengths=batch["input_lengths"],
+                attention_mask=audio_attention_mask,
+                max_new_tokens=100,
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            # Decode predictions
+            pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+            # Decode references
+            labels = batch["labels"]
+            labels = torch.where(labels == -100, tokenizer.pad_token_id, labels)
+            ref_text = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            # Normalize texts
+            pred_text = [text.lower().strip() for text in pred_text]
+            ref_text = [text.lower().strip() for text in ref_text]
+
+            all_predictions.extend(pred_text)
+            all_references.extend(ref_text)
+
+            # Print progress
+            if (i + 1) % 10 == 0:
+                print(f"Processed {i + 1}/{len(eval_dataloader)} samples")
+
+    # Calculate WER
+    wer_metric = evaluate.load("wer")
+    wer = wer_metric.compute(predictions=all_predictions, references=all_references)
+
+    # Print results
+    print(f"\n{'='*60}")
+    print(f"Evaluation Results for checkpoint: {checkpoint_dir}")
+    print(f"{'='*60}")
+    print(f"WER: {wer:.4f} ({wer*100:.2f}%)")
+    print(f"Number of samples evaluated: {eval_samples}")
+
+    # Print all predictions
+    print(f"\n{'='*60}")
+    print(f"All {len(all_predictions)} Predictions:")
+    print(f"{'='*60}")
+
+    for i in range(len(all_predictions)):
+        print(f"\nSample {i + 1}:")
+        print(f"Truth: {all_references[i]}")
+        print(f"Pred:  {all_predictions[i]}")
+
+    print(f"\n{'='*60}\n")
+
+
 def main() -> None:
     """Main training function - simplified with Accelerate."""
     import sys
+
+    # Check if running in eval mode
+    if len(sys.argv) >= 2 and sys.argv[1] == "--eval":
+        if len(sys.argv) < 5:
+            raise ValueError(
+                "Evaluation mode requires checkpoint directory and config file!\n"
+                "Usage: python train.py --eval --checkpoint <checkpoint_dir> --config <config_file.json>\n"
+                "Example: python train.py --eval --checkpoint ./outputs/checkpoint-1000 --config configs/experiment.json"
+            )
+
+        checkpoint_idx = sys.argv.index("--checkpoint") + 1
+        config_idx = sys.argv.index("--config") + 1
+
+        checkpoint_dir = sys.argv[checkpoint_idx]
+        config_file = sys.argv[config_idx]
+
+        if not os.path.exists(checkpoint_dir):
+            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(f"Config file not found: {config_file}")
+
+        evaluate_checkpoint(checkpoint_dir, config_file)
+        return
 
     # Initialize Accelerator
     accelerator = Accelerator()
