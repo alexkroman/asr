@@ -1,0 +1,69 @@
+# Production training configuration
+output_dir: ./outputs/production_model
+overwrite_output_dir: false
+
+# Training configuration
+max_steps: 50000
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4
+eval_accumulation_steps: 1
+
+# Learning rate
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Optimizer
+optim: adamw_torch
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1e-8
+
+# Logging
+logging_dir: ./logs
+logging_steps: 25
+logging_first_step: true
+logging_nan_inf_filter: false
+report_to:
+  - tensorboard
+
+# Evaluation
+eval_strategy: steps
+eval_steps: 1000
+
+# Saving
+save_strategy: steps
+save_steps: 1000
+save_total_limit: 5
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+
+# Hub
+push_to_hub: false
+
+# Performance
+dataloader_num_workers: 8
+gradient_checkpointing: true
+fp16: false
+bf16: true
+dataloader_pin_memory: true
+max_grad_norm: 1.0
+
+# Misc
+seed: 42
+save_safetensors: true
+do_generation_test: false
+generation_max_length: 100
+disable_tqdm: false
+log_level: info
+use_cache: false
+compute_metrics: true
+predict_with_generate: true
+
+# Required by HF Trainer
+remove_unused_columns: false
+label_names:
+  - labels

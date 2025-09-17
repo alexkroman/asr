@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile.simple
+    image: asr-training:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/workspace/.cache/huggingface
+      - HF_DATASETS_CACHE=/workspace/datasets
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    volumes:
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - ~/.cache/huggingface:/workspace/.cache/huggingface
+      - ./datasets_cache:/workspace/datasets_cache
+    shm_size: '16gb'
+    command: ["+experiments=production"]
+
+  train-dev:
+    extends: train
+    command: ["+experiments=test", "training.max_steps=100"]
+    profiles: ["dev"]
+
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    ports:
+      - "6006:6006"
+    volumes:
+      - ./outputs:/logs
+    command: ["tensorboard", "--logdir=/logs", "--host=0.0.0.0"]
+    profiles: ["monitoring"]

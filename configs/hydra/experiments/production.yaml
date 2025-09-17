@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - override /model: large
+  - override /data: full
+  - override /training: production
+
+# Production-specific overrides
+training:
+  output_dir: ./outputs/production_model
+  push_to_hub: true

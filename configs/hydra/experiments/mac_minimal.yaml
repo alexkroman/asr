@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - override /model: large
+  - override /data: full
+  - override /training: mac
+
+# Mac-specific overrides
+training:
+  output_dir: ./outputs/mac_minimal_model
+  max_steps: 25000
+  eval_steps: 1000
+  save_steps: 1000

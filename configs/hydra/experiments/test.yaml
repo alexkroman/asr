@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - override /model: small
+  - override /data: small
+  - override /training: default
+
+# Override specific settings for testing
+training:
+  output_dir: ./outputs/test_model
+  max_steps: 100
+  eval_steps: 20
+  save_steps: 20
+  logging_steps: 5

@@ -1,0 +1,72 @@
+name: Deploy Training
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - production
+      gpu_type:
+        description: 'GPU Type'
+        required: true
+        default: 'a40'
+        type: choice
+        options:
+          - a40
+          - a100
+          - h100
+          - rtx3090
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Build Docker image
+        run: |
+          docker build -f Dockerfile.simple \
+            -t ghcr.io/${{ github.repository }}/asr-training:${{ github.sha }} .
+
+      - name: Push to Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/${{ github.repository }}/asr-training:${{ github.sha }}
+
+      - name: Deploy to RunPod
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          pip install requests
+          python scripts/runpod_deploy.py \
+            --environment ${{ github.event.inputs.environment }}
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "Training deployment ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Training Deployment*\n*Status:* ${{ job.status }}\n*Environment:* ${{ github.event.inputs.environment }}\n*GPU:* ${{ github.event.inputs.gpu_type }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,21 @@
+# Simpler version without Hatch
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /workspace
+
+# Install Python dependencies
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e .
+
+# Copy source code
+COPY src/ ./src/
+COPY configs/ ./configs/
+
+# Set environment variables for GPU optimization
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+ENV CUDA_LAUNCH_BLOCKING=0
+ENV OMP_NUM_THREADS=8
+
+# Direct Python execution
+ENTRYPOINT ["python", "src/train.py"]
+CMD ["+experiments=production"]
