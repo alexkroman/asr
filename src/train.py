@@ -299,7 +299,14 @@ class ASRModel(PreTrainedModel):
             with torch.no_grad():
                 embeddings = self.decoder.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, "weight"):
-                    embeddings.weight[-num_added:].normal_(mean=0.0, std=0.02)
+                    mean_embedding = embeddings.weight[:-num_added].mean(dim=0)
+                    std_embedding = embeddings.weight[:-num_added].std()
+                    
+                    for i in range(num_added):
+                        # Initialize near zero with very small variance
+                        embeddings.weight[-num_added + i] = torch.randn_like(
+                            embeddings.weight[0]
+                        ) * (std_embedding * 0.02)  # Much smaller scale
 
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
