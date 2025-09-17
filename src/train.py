@@ -39,6 +39,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 warnings.filterwarnings("ignore")
 
+
 class WhisperEncoder(nn.Module):
     """Frozen Whisper encoder wrapper."""
 
@@ -126,9 +127,7 @@ class LLMDecoder(nn.Module):
             dtype=torch.bfloat16,
             token=False,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model.decoder_model_name, token=False
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model.decoder_model_name, token=False)
 
         # Standard approach: use EOS token as padding token if not set
         if self.tokenizer.pad_token is None:
@@ -483,9 +482,7 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         val_dataset = dataset_dicts[0]["validation"]
 
     # Ensure audio is decoded and resampled correctly
-    train_dataset = train_dataset.cast_column(
-        "audio", Audio(sampling_rate=config.data.sample_rate)
-    )
+    train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
     val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
 
     if config.data.max_train_samples:
@@ -493,9 +490,7 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
             range(min(config.data.max_train_samples, len(train_dataset)))
         )
     if config.data.max_eval_samples:
-        val_dataset = val_dataset.select(
-            range(min(config.data.max_eval_samples, len(val_dataset)))
-        )
+        val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
 
     return train_dataset, val_dataset
 
@@ -546,9 +541,9 @@ def main(cfg: DictConfig) -> None:
             config=cfg,
         ),
         tokenizer=tokenizer,
-        compute_metrics=lambda eval_pred: compute_metrics(eval_pred, tokenizer)
-        if cfg.training.compute_metrics
-        else None,
+        compute_metrics=lambda eval_pred: (
+            compute_metrics(eval_pred, tokenizer) if cfg.training.compute_metrics else None
+        ),
     )
 
     # Train

@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    tmux \
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir hatch
+
+WORKDIR /workspace
+
+COPY pyproject.toml .
+COPY src/ ./src/
+COPY configs/ ./configs/
+
+RUN hatch env create
+
+ENV HATCH_ENV=default
+
+ENTRYPOINT ["hatch", "run", "train-mac"]

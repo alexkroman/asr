@@ -152,6 +152,8 @@ cython_debug/
 
 # macOS
 .DS_Store
+.ruff_cache
+.claude
 
 # Model and data files
 *.pth

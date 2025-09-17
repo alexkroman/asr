@@ -36,7 +36,6 @@ dependencies = [
     # Audio processing
     "soundfile>=0.12.0",
     "librosa>=0.10.0",
-    "torchcodec>=0.0.1",
 
     # Training utilities
     "tensorboard>=2.14.0",
@@ -73,9 +72,8 @@ dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "black>=23.0.0",
-    "flake8>=6.0.0",
+    "ruff>=0.1.0",
     "mypy>=1.5.0",
-    "isort>=5.12.0",
     "pre-commit>=3.3.0",
     # Type stubs
     "types-PyYAML>=6.0.0",
@@ -119,9 +117,8 @@ dependencies = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "black>=23.0.0",
-    "flake8>=6.0.0",
+    "ruff>=0.1.0",
     "mypy>=1.5.0",
-    "isort>=5.12.0",
 ]
 
 [tool.hatch.envs.default.scripts]
@@ -131,17 +128,17 @@ train-mac = "python src/train.py +experiments=mac_minimal"
 
 # Development tools
 lint = [
+    "ruff check src",
     "mypy src",
-    "flake8 src scripts",
 ]
 format = [
+    "ruff format src",
     "black src",
-    "isort src",
 ]
 
 # Docker commands
 docker-build = "docker build --platform=linux/amd64 -f Dockerfile -t asr-training:latest ."
-docker-build-local = "docker build --platform=linux/arm64 -f Dockerfile -t asr-training:latest-arm64 ."
+docker-build-local = "docker build -f Dockerfile.local -t asr-training:local ."
 docker-push = "bash -c 'docker tag asr-training:latest ${DOCKER_REGISTRY}/asr-training:latest && docker push ${DOCKER_REGISTRY}/asr-training:latest'"
 deploy-docker-local = "docker compose --profile dev up train-dev"
 
@@ -225,6 +222,19 @@ exclude_lines = [
 [tool.ruff]
 line-length = 100
 target-version = "py38"
+extend-exclude = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".mypy_cache",
+    ".pytest_cache",
+]
+
+[tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -241,7 +251,8 @@ select = [
     "SIM", # flake8-simplify
     "PTH", # flake8-use-pathlib
 ]
-ignore = [
+extend-ignore = [
+    "E203",  # whitespace before ':'
     "E501",  # line too long (handled by black)
     "B008",  # do not perform function calls in argument defaults
     "B905",  # zip() without an explicit strict= parameter
