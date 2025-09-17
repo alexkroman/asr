@@ -6,12 +6,11 @@ All GPU detection, optimization flags, and distributed training is handled by Ac
 """
 
 import os
-import random
 import re
 import sys
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import evaluate
 import numpy as np
@@ -25,8 +24,8 @@ from transformers import (
     AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
-    PreTrainedModel,
     PretrainedConfig,
+    PreTrainedModel,
     Trainer,
     TrainingArguments,
     WhisperModel,
@@ -300,7 +299,7 @@ class ASRModel(PreTrainedModel):
             with torch.no_grad():
                 embeddings = self.decoder.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, "weight"):
-                    mean_embedding = embeddings.weight[:-num_added].mean(dim=0)
+                    # mean_embedding = embeddings.weight[:-num_added].mean(dim=0)  # unused
                     std_embedding = embeddings.weight[:-num_added].std()
 
                     for i in range(num_added):
@@ -489,6 +488,7 @@ class ASRModel(PreTrainedModel):
 
         # Load state dict
         import os
+
         from safetensors.torch import load_file
 
         model_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
@@ -667,8 +667,9 @@ def initialize_model(
 
 def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets using standard HuggingFace patterns."""
-    from datasets import DatasetDict, concatenate_datasets
     import platform
+
+    from datasets import concatenate_datasets
 
     safe_num_proc = 1 if platform.system() == "Darwin" else data_args.num_proc
     dataset_dicts = []
@@ -699,7 +700,8 @@ def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
     # For faster evaluation, sample subset if eval set is large
     if not data_args.max_eval_samples and len(val_dataset) > 1000:
         print(
-            f"📊 Evaluation set has {len(val_dataset)} samples. Consider setting max_eval_samples=500 for faster eval."
+            f"📊 Evaluation set has {len(val_dataset)} samples. "
+            "Consider setting max_eval_samples=500 for faster eval."
         )
 
     return train_dataset, val_dataset
