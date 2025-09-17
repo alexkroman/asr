@@ -30,6 +30,7 @@ from transformers import (
     TrainingArguments,
     WhisperModel,
 )
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 # Minimal environment setup - Accelerate handles the rest
 # Use local directories if /workspace doesn't exist (e.g., on Mac)
@@ -142,7 +143,9 @@ class WhisperEncoder(nn.Module):
         super().__init__()
         # Load Whisper-small model
         self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small", dtype=torch.bfloat16, token=False
+            "openai/whisper-small",
+            dtype=torch.bfloat16,
+            token=False
         )
 
         for param in self.whisper.parameters():
@@ -182,25 +185,30 @@ class WhisperEncoder(nn.Module):
 
 
 class AudioProjector(nn.Module):
-    """Simple 2-layer MLP projector for audio features with careful initialization."""
+    """Simple 2-layer MLP projector using Pre-Normalization with small initialization."""
 
     def __init__(self, audio_dim: int, text_dim: int, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
+        self.norm = LlamaRMSNorm(audio_dim, eps=1e-6)
+
         self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
         self.act = nn.GELU()
         self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
 
-        with torch.no_grad():
-            nn.init.xavier_uniform_(self.linear_1.weight, gain=0.02)
-            nn.init.xavier_uniform_(self.linear_2.weight, gain=0.02)
-
-            nn.init.zeros_(self.linear_1.bias)
-            nn.init.zeros_(self.linear_2.bias)
+        nn.init.normal_(self.linear_1.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.linear_1.bias)
+        nn.init.normal_(self.linear_2.weight, mean=0.0, std=0.002) 
+        nn.init.zeros_(self.linear_2.bias)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.linear_1(audio_features)
+        # 1. Normalize the INPUT audio features first
+        hidden_states = self.norm(audio_features)
+
+        # 2. Then apply the transformations
+        hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
+
         return hidden_states
 
 
@@ -208,7 +216,9 @@ class SmolLM2Decoder(nn.Module):
     def __init__(self, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
-            config.decoder_model_name, dtype=torch.bfloat16, token=False
+            config.decoder_model_name,
+            dtype=torch.bfloat16,  # Use bf16 for speed and stability
+            token=False
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
 
@@ -696,13 +706,6 @@ def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
         )
     if data_args.max_eval_samples:
         val_dataset = val_dataset.select(range(min(data_args.max_eval_samples, len(val_dataset))))
-
-    # For faster evaluation, sample subset if eval set is large
-    if not data_args.max_eval_samples and len(val_dataset) > 1000:
-        print(
-            f"📊 Evaluation set has {len(val_dataset)} samples. "
-            "Consider setting max_eval_samples=500 for faster eval."
-        )
 
     return train_dataset, val_dataset
 
