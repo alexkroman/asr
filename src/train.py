@@ -44,8 +44,6 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 warnings.filterwarnings("ignore")
 
 
-
-
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
     """Extended TrainingArguments with custom fields for ASR."""
@@ -57,7 +55,8 @@ class CustomTrainingArguments(TrainingArguments):
         default=False, metadata={"help": "Whether to use torch.compile for optimization"}
     )
     compile_mode: str = field(
-        default="default", metadata={"help": "Torch compile mode: 'default', 'reduce-overhead', 'max-autotune'"}
+        default="default",
+        metadata={"help": "Torch compile mode: 'default', 'reduce-overhead', 'max-autotune'"},
     )
 
 
@@ -85,7 +84,6 @@ class ModelArguments:
     )
 
 
-
 @dataclass
 class DataArguments:
     """
@@ -96,13 +94,16 @@ class DataArguments:
         default="librispeech_asr", metadata={"help": "The name of the dataset to use."}
     )
     dataset_configs: List[str] = field(
-        default_factory=lambda: ["clean"], metadata={"help": "List of dataset configurations to concatenate."}
+        default_factory=lambda: ["clean"],
+        metadata={"help": "List of dataset configurations to concatenate."},
     )
     train_splits: List[str] = field(
-        default_factory=lambda: ["train.100"], metadata={"help": "List of training splits corresponding to dataset_configs."}
+        default_factory=lambda: ["train.100"],
+        metadata={"help": "List of training splits corresponding to dataset_configs."},
     )
     eval_splits: List[str] = field(
-        default_factory=lambda: ["validation"], metadata={"help": "List of evaluation splits corresponding to dataset_configs."}
+        default_factory=lambda: ["validation"],
+        metadata={"help": "List of evaluation splits corresponding to dataset_configs."},
     )
     max_audio_seconds: float = field(
         default=20.0, metadata={"help": "Filter out audio samples longer than this."}
@@ -125,6 +126,7 @@ class DataArguments:
 
 class ASRConfig(PretrainedConfig):
     """Configuration for ASRModel."""
+
     model_type = "asr_whisper_smollm2"
 
     def __init__(self, model_args: Optional[ModelArguments] = None, **kwargs):
@@ -141,9 +143,7 @@ class WhisperEncoder(nn.Module):
         super().__init__()
         # Load Whisper-small model
         self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small",
-            dtype=torch.bfloat16,
-            token=False
+            "openai/whisper-small", dtype=torch.bfloat16, token=False
         )
 
         for param in self.whisper.parameters():
@@ -163,10 +163,9 @@ class WhisperEncoder(nn.Module):
         """
         batch_size, n_mels, time_frames = x.shape
 
-
         if time_frames < 3000:
             pad_amount = 3000 - time_frames
-            x = torch.nn.functional.pad(x, (0, pad_amount), mode='constant', value=0)
+            x = torch.nn.functional.pad(x, (0, pad_amount), mode="constant", value=0)
         elif time_frames > 3000:
             x = x[:, :, :3000]
 
@@ -185,6 +184,7 @@ class WhisperEncoder(nn.Module):
 
 class AudioProjector(nn.Module):
     """Simple 2-layer MLP projector for audio features with careful initialization."""
+
     def __init__(self, audio_dim: int, text_dim: int, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
         self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
@@ -224,7 +224,7 @@ class SmolLM2Decoder(nn.Module):
         self.model.config.eos_token_id = self.tokenizer.eos_token_id
 
         # Update generation config if it exists
-        if hasattr(self.model, 'generation_config'):
+        if hasattr(self.model, "generation_config"):
             self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
             if self.tokenizer.bos_token_id is not None:
                 self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
@@ -251,6 +251,7 @@ class SmolLM2Decoder(nn.Module):
 
 class ASRModel(PreTrainedModel):
     """ASR model using standard HuggingFace PreTrainedModel."""
+
     config_class = ASRConfig
     base_model_prefix = "asr"
     supports_gradient_checkpointing = True
@@ -272,12 +273,12 @@ class ASRModel(PreTrainedModel):
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing for the decoder model only."""
-        if hasattr(self.decoder.model, 'gradient_checkpointing_enable'):
+        if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
             self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing for the decoder model."""
-        if hasattr(self.decoder.model, 'gradient_checkpointing_disable'):
+        if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
             self.decoder.model.gradient_checkpointing_disable()
 
     def add_audio_special_tokens(self):
@@ -301,12 +302,14 @@ class ASRModel(PreTrainedModel):
                 if embeddings is not None and hasattr(embeddings, "weight"):
                     mean_embedding = embeddings.weight[:-num_added].mean(dim=0)
                     std_embedding = embeddings.weight[:-num_added].std()
-                    
+
                     for i in range(num_added):
                         # Initialize near zero with very small variance
                         embeddings.weight[-num_added + i] = torch.randn_like(
                             embeddings.weight[0]
-                        ) * (std_embedding * 0.02)  # Much smaller scale
+                        ) * (
+                            std_embedding * 0.02
+                        )  # Much smaller scale
 
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
@@ -342,8 +345,12 @@ class ASRModel(PreTrainedModel):
         embed_layer = self.decoder.model.get_input_embeddings()
 
         # Create special token embeddings
-        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id, device=device, dtype=torch.long)
-        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id, device=device, dtype=torch.long)
+        audio_start_tokens = torch.full(
+            (batch_size, 1), self.audio_start_id, device=device, dtype=torch.long
+        )
+        audio_end_tokens = torch.full(
+            (batch_size, 1), self.audio_end_id, device=device, dtype=torch.long
+        )
 
         audio_start_embeds = embed_layer(audio_start_tokens)
         audio_end_embeds = embed_layer(audio_end_tokens)
@@ -357,28 +364,30 @@ class ASRModel(PreTrainedModel):
 
             # Combine embeddings: [audio_start, audio_features, audio_end, text]
             inputs_embeds = torch.cat(
-                [audio_start_embeds, audio_embeds, audio_end_embeds, text_embeds],
-                dim=1
+                [audio_start_embeds, audio_embeds, audio_end_embeds, text_embeds], dim=1
             )
 
             # Create attention mask
             audio_len = audio_seq_len + 2  # +2 for special tokens
             if attention_mask is not None:
                 # Extend attention mask for audio tokens
-                audio_mask = torch.ones(batch_size, audio_len, dtype=attention_mask.dtype, device=device)
+                audio_mask = torch.ones(
+                    batch_size, audio_len, dtype=attention_mask.dtype, device=device
+                )
                 attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
             else:
-                attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+                attention_mask = torch.ones(
+                    inputs_embeds.shape[:2], dtype=torch.long, device=device
+                )
 
             # Prepare labels: mask audio tokens with -100 (ignore index)
-            audio_labels = torch.full((batch_size, audio_len), -100, dtype=labels.dtype, device=device)
+            audio_labels = torch.full(
+                (batch_size, audio_len), -100, dtype=labels.dtype, device=device
+            )
             labels = torch.cat([audio_labels, labels], dim=1)
         else:
             # Inference mode: audio only
-            inputs_embeds = torch.cat(
-                [audio_start_embeds, audio_embeds, audio_end_embeds],
-                dim=1
-            )
+            inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
             labels = None
 
@@ -398,7 +407,7 @@ class ASRModel(PreTrainedModel):
         input_values: torch.Tensor,
         input_lengths: torch.Tensor,
         max_new_tokens: int = 100,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Generate text from audio input using standard HF generation."""
         # Get audio embeddings
@@ -410,27 +419,30 @@ class ASRModel(PreTrainedModel):
         embed_layer = self.decoder.model.get_input_embeddings()
 
         # Create special token embeddings
-        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id, device=device, dtype=torch.long)
-        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id, device=device, dtype=torch.long)
+        audio_start_tokens = torch.full(
+            (batch_size, 1), self.audio_start_id, device=device, dtype=torch.long
+        )
+        audio_end_tokens = torch.full(
+            (batch_size, 1), self.audio_end_id, device=device, dtype=torch.long
+        )
 
         audio_start_embeds = embed_layer(audio_start_tokens)
         audio_end_embeds = embed_layer(audio_end_tokens)
 
         # Combine embeddings for generation
-        inputs_embeds = torch.cat(
-            [audio_start_embeds, audio_embeds, audio_end_embeds],
-            dim=1
-        )
+        inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
 
         return self.decoder.model.generate(
             inputs_embeds=inputs_embeds,
             max_new_tokens=max_new_tokens,
             pad_token_id=self.decoder.tokenizer.pad_token_id,
             eos_token_id=self.decoder.tokenizer.eos_token_id,
-            **kwargs
+            **kwargs,
         )
 
-    def transcribe(self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs) -> List[str]:
+    def transcribe(
+        self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs
+    ) -> List[str]:
         """
         Convenience method to generate and decode transcriptions.
 
@@ -447,9 +459,7 @@ class ASRModel(PreTrainedModel):
 
         # Decode to text, skipping special tokens
         transcriptions = self.decoder.tokenizer.batch_decode(
-            generated_tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
+            generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
 
         return transcriptions
@@ -457,7 +467,7 @@ class ASRModel(PreTrainedModel):
     def save_pretrained(self, save_directory: str, **kwargs):
         """Save model using HuggingFace standard format."""
         # Save config
-        if hasattr(self, 'model_args') and isinstance(self.model_args, ModelArguments):
+        if hasattr(self, "model_args") and isinstance(self.model_args, ModelArguments):
             # Convert ModelArguments to config for saving
             config = ASRConfig(model_args=self.model_args)
             config.save_pretrained(save_directory)
@@ -465,7 +475,7 @@ class ASRModel(PreTrainedModel):
             super().save_pretrained(save_directory, **kwargs)
 
         # Save tokenizer
-        if hasattr(self.decoder, 'tokenizer'):
+        if hasattr(self.decoder, "tokenizer"):
             self.decoder.tokenizer.save_pretrained(save_directory)
 
     @classmethod
@@ -489,7 +499,9 @@ class ASRModel(PreTrainedModel):
             if os.path.exists(model_file):
                 state_dict = torch.load(model_file, map_location="cpu")
             else:
-                raise FileNotFoundError(f"No model weights found in {pretrained_model_name_or_path}")
+                raise FileNotFoundError(
+                    f"No model weights found in {pretrained_model_name_or_path}"
+                )
 
         model.load_state_dict(state_dict, strict=False)
         return model
@@ -619,8 +631,6 @@ class DataCollator:
         return output_batch
 
 
-
-
 def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
     if not os.path.exists(config_file):
@@ -628,8 +638,7 @@ def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, Custo
 
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
     model_args, data_args, training_args = parser.parse_json_file(
-        json_file=config_file,
-        allow_extra_keys=True
+        json_file=config_file, allow_extra_keys=True
     )
 
     # Essential settings for ASR
@@ -640,9 +649,7 @@ def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, Custo
 
 
 def initialize_model(
-    model_args: ModelArguments,
-    compile_model: bool = False,
-    compile_mode: str = "default"
+    model_args: ModelArguments, compile_model: bool = False, compile_mode: str = "default"
 ) -> Tuple[ASRModel, AutoTokenizer]:
     """Initialize the ASR model and tokenizer with optional compilation."""
     model = ASRModel(model_args)
@@ -652,6 +659,7 @@ def initialize_model(
         model = torch.compile(model, mode=compile_mode, fullgraph=False)
     elif compile_model:
         import warnings
+
         warnings.warn("torch.compile requires PyTorch 2.0+, skipping compilation")
 
     return model, tokenizer
@@ -661,6 +669,7 @@ def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets using standard HuggingFace patterns."""
     from datasets import DatasetDict, concatenate_datasets
     import platform
+
     safe_num_proc = 1 if platform.system() == "Darwin" else data_args.num_proc
     dataset_dicts = []
     for config, train_split, eval_split in zip(
@@ -681,12 +690,19 @@ def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
         train_dataset = dataset_dicts[0]["train"]
         val_dataset = dataset_dicts[0]["validation"]
     if data_args.max_train_samples:
-        train_dataset = train_dataset.select(range(min(data_args.max_train_samples, len(train_dataset))))
+        train_dataset = train_dataset.select(
+            range(min(data_args.max_train_samples, len(train_dataset)))
+        )
     if data_args.max_eval_samples:
         val_dataset = val_dataset.select(range(min(data_args.max_eval_samples, len(val_dataset))))
 
-    return train_dataset, val_dataset
+    # For faster evaluation, sample subset if eval set is large
+    if not data_args.max_eval_samples and len(val_dataset) > 1000:
+        print(
+            f"📊 Evaluation set has {len(val_dataset)} samples. Consider setting max_eval_samples=500 for faster eval."
+        )
 
+    return train_dataset, val_dataset
 
 
 def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict[str, float]:
@@ -698,13 +714,9 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict
     decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     wer_metric = evaluate.load("wer", cache_dir="./metrics_cache")
-    wer = wer_metric.compute(
-        predictions=decoded_preds,
-        references=decoded_labels
-    )
+    wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
 
     return {"wer": wer}
-
 
 
 def evaluate_checkpoint(checkpoint_dir: str, config_file: str) -> None:
@@ -744,7 +756,7 @@ def main(config_file: str) -> None:
     model, tokenizer = initialize_model(
         model_args,
         compile_model=training_args.torch_compile,
-        compile_mode=training_args.compile_mode
+        compile_mode=training_args.compile_mode,
     )
 
     train_dataset, val_dataset = load_datasets(data_args)
@@ -761,11 +773,12 @@ def main(config_file: str) -> None:
             max_text_words=data_args.max_text_words,
         ),
         tokenizer=tokenizer,
-        compute_metrics=lambda eval_pred: compute_metrics(eval_pred, tokenizer),
+        compute_metrics=None,  # Disabled for faster evaluation
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
