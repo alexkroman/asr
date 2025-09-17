@@ -28,6 +28,7 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
+    WhisperModel,
 )
 
 # Minimal environment setup - Accelerate handles the rest
@@ -147,6 +148,71 @@ class SpecAugment(nn.Module):
         for time_mask in self.time_masks:
             x = time_mask(x)
         return x
+
+
+class WhisperEncoder(nn.Module):
+    """Frozen Whisper encoder wrapper."""
+
+    def __init__(self, config: ModelArguments):
+        super().__init__()
+        # Load Whisper-small model
+        self.whisper = WhisperModel.from_pretrained(
+            "openai/whisper-small",
+            dtype=torch.bfloat16,
+            token=False
+        )
+
+        # Freeze all parameters
+        for param in self.whisper.parameters():
+            param.requires_grad = False
+
+        # Store the output dimension (768 for whisper-small)
+        self.d_model = self.whisper.config.d_model
+
+        # Set to eval mode to disable dropout
+        self.whisper.eval()
+
+    def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input mel-spectrogram of shape (batch, n_mels, time)
+            input_lengths: Lengths of input sequences
+        Returns:
+            Encoded features of shape (batch, time, d_model)
+        """
+        batch_size, n_mels, time_frames = x.shape
+
+        # Use torch.nn.functional.pad for standard padding
+        # Whisper expects exactly 3000 frames
+        if time_frames < 3000:
+            # Pad on the right to reach 3000 frames
+            pad_amount = 3000 - time_frames
+            x = torch.nn.functional.pad(x, (0, pad_amount), mode='constant', value=0)
+        elif time_frames > 3000:
+            # Truncate to 3000 frames
+            x = x[:, :, :3000]
+
+        # Get encoder outputs
+        with torch.no_grad():
+            outputs = self.whisper.encoder(x)
+            encoder_outputs = outputs.last_hidden_state
+
+        # Truncate output to match actual input length
+        # Whisper downsamples by 2x, so input_frames -> input_frames/2
+        if time_frames < 3000:
+            output_frames = (time_frames + 1) // 2
+            encoder_outputs = encoder_outputs[:, :output_frames, :]
+
+        return encoder_outputs
+
+    @property
+    def gradient_checkpointing(self):
+        return False
+
+    @gradient_checkpointing.setter
+    def gradient_checkpointing(self, value):
+        # No-op since Whisper encoder is frozen
+        pass
 
 
 class ConvolutionModule(nn.Module):
@@ -414,62 +480,19 @@ class ConformerEncoder(nn.Module):
         self._gradient_checkpointing = value
 
 
-class DeepAudioProjector(nn.Module):
+class AudioProjector(nn.Module):
+    """Simple 2-layer MLP projector for audio features."""
     def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
-        self.num_layers = config.projector_num_layers
-
-        self.audio_proj = nn.Linear(audio_dim, text_dim, bias=False)
-        self.queries = nn.Parameter(torch.zeros(config.num_queries, text_dim))
-        nn.init.normal_(self.queries, mean=0.0, std=0.01)
-
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                'cross_attn': nn.MultiheadAttention(
-                    embed_dim=text_dim,
-                    num_heads=config.projector_num_heads,
-                    dropout=config.projector_dropout,
-                    batch_first=True,
-                ),
-                'self_attn': nn.MultiheadAttention(
-                    embed_dim=text_dim,
-                    num_heads=config.projector_num_heads,
-                    dropout=config.projector_dropout,
-                    batch_first=True,
-                ),
-                'mlp': nn.Sequential(
-                    nn.LayerNorm(text_dim),
-                    nn.Linear(text_dim, text_dim * 4),
-                    nn.GELU(),
-                    nn.Linear(text_dim * 4, text_dim),
-                ),
-                'norm1': nn.LayerNorm(text_dim),
-                'norm2': nn.LayerNorm(text_dim),
-            }) for _ in range(self.num_layers)
-        ])
+        self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
+        self.act = nn.GELU()
+        self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
-        B = audio_features.shape[0]
-        audio_proj = self.audio_proj(audio_features)
-
-        q = self.queries.unsqueeze(0).expand(B, -1, -1)
-
-        for layer in self.layers:
-            # Cross attention with residual
-            attn_out, _ = layer['cross_attn'](q, audio_proj, audio_proj)
-            q = layer['norm1'](q + attn_out)
-
-            # Self attention with residual
-            self_attn_out, _ = layer['self_attn'](q, q, q)
-            q = layer['norm2'](q + self_attn_out)
-
-            # MLP with residual
-            q = q + layer['mlp'](q)
-
-        # Add final layer norm for stability
-        q = nn.functional.layer_norm(q, [q.shape[-1]])
-
-        return q
+        hidden_states = self.linear_1(audio_features)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
 
 
 class SmolLM2Decoder(nn.Module):
@@ -502,6 +525,24 @@ class SmolLM2Decoder(nn.Module):
             if hasattr(self.model.config, 'pad_token_id'):
                 self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
+        # Handle BOS token for models where tokenizer doesn't have it
+        # (e.g., Qwen models), we can use the pad token as BOS
+        if self.tokenizer.bos_token_id is None and hasattr(self.model.config, 'bos_token_id'):
+            # Use pad token as BOS token (common practice)
+            self.tokenizer.bos_token = self.tokenizer.pad_token
+            self.tokenizer.bos_token_id = self.tokenizer.pad_token_id
+
+        # Update generation config if it exists (standard HuggingFace approach)
+        if hasattr(self.model, 'generation_config'):
+            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
+            # Set BOS/EOS tokens based on what's available in the tokenizer
+            if self.tokenizer.bos_token_id is not None:
+                self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
+                self.model.config.bos_token_id = self.tokenizer.bos_token_id
+            if self.tokenizer.eos_token_id is not None:
+                self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+                self.model.config.eos_token_id = self.tokenizer.eos_token_id
+
         # Continue with LoRA setup if needed
         if config.use_lora:
             lora_config = LoraConfig(
@@ -532,24 +573,8 @@ class SmolLM2Decoder(nn.Module):
                 # Initialize new token embedding as mean of existing embeddings
                 embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
 
-        # Update model config and generation config to sync with tokenizer
+        # Update model config to sync with tokenizer
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
-
-        # For models where tokenizer doesn't have BOS but model expects it
-        # (e.g., Qwen models), we can use the pad token as BOS
-        if self.tokenizer.bos_token_id is None and hasattr(self.model.config, 'bos_token_id'):
-            # Use pad token as BOS token (common practice)
-            self.tokenizer.bos_token = self.tokenizer.pad_token
-            self.tokenizer.bos_token_id = self.tokenizer.pad_token_id
-
-        # Update generation config if it exists (standard HuggingFace approach)
-        if hasattr(self.model, 'generation_config'):
-            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            # Set BOS/EOS tokens based on what's available in the tokenizer
-            if self.tokenizer.bos_token_id is not None:
-                self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
-            if self.tokenizer.eos_token_id is not None:
-                self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
 
     def forward(self, **kwargs):
         """Simple forward pass through the decoder model."""
@@ -563,12 +588,14 @@ class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
         self.model_args = config  # Store model args for saving
-        self.encoder = ConformerEncoder(config)
+        self.encoder = WhisperEncoder(config)
         self.decoder = SmolLM2Decoder(config)
         # Store the decoder's config as the model config for HuggingFace Trainer compatibility
         self.config = self.decoder.model.config
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
-        self.audio_projector = DeepAudioProjector(config.d_model, text_dim, config)
+        # Whisper-small outputs 768-dim features
+        audio_dim = self.encoder.d_model  # 768 for whisper-small
+        self.audio_projector = AudioProjector(audio_dim, text_dim, config)
         self.spec_augment = SpecAugment()
 
         # Initialize weights with smaller values for stability
