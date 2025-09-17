@@ -133,9 +133,7 @@ class WhisperEncoder(nn.Module):
         super().__init__()
         # Load Whisper-small model
         self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small",
-            dtype=torch.bfloat16,
-            token=False
+            "openai/whisper-small", dtype=torch.bfloat16, token=False
         )
 
         for param in self.whisper.parameters():
@@ -200,7 +198,7 @@ class AudioProjector(nn.Module):
 
         nn.init.normal_(self.linear_1.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.linear_1.bias)
-        nn.init.normal_(self.linear_2.weight, mean=0.0, std=0.002) 
+        nn.init.normal_(self.linear_2.weight, mean=0.0, std=0.002)
         nn.init.zeros_(self.linear_2.bias)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
@@ -221,7 +219,7 @@ class SmolLM2Decoder(nn.Module):
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
             config.decoder_model_name,
             dtype=torch.bfloat16,  # Use bf16 for speed and stability
-            token=False
+            token=False,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
 
@@ -345,40 +343,9 @@ class ASRModel(PreTrainedModel):
         if input_values is None or input_lengths is None:
             raise ValueError("input_values and input_lengths are required")
 
-        # Debug first forward pass
-        if not hasattr(self, '_first_forward_logged'):
-            print("\n" + "="*80)
-            print("🧠 MODEL FORWARD PASS - FIRST BATCH")
-            print("="*80)
-            print(f"Input values shape: {input_values.shape}")
-            print(f"Input lengths: {input_lengths.tolist()}")
-            if labels is not None:
-                print(f"Labels shape: {labels.shape}")
-                print(f"Labels sample (first 30 tokens): {labels[0][:30].tolist()}")
-                # Decode to check text
-                if hasattr(self.decoder, 'tokenizer'):
-                    decoded = self.decoder.tokenizer.decode(labels[0], skip_special_tokens=False)
-                    print(f"Decoded labels: '{decoded[:100]}...'")
-            if attention_mask is not None:
-                print(f"Attention mask shape: {attention_mask.shape}")
-                print(f"Attention mask has zeros (padding): {(attention_mask == 0).any().item()}")
-            print("="*80 + "\n")
-            self._first_forward_logged = True
-
         # Encode audio features
         audio_features = self.encoder(input_values, input_lengths)
         audio_embeds = self.audio_projector(audio_features)
-
-        # Debug encoder output on first pass
-        if not hasattr(self, '_encoder_output_logged'):
-            print("\n" + "="*80)
-            print("🎤 ENCODER OUTPUT")
-            print("="*80)
-            print(f"Audio features shape: {audio_features.shape}")
-            print(f"Audio embeds shape (after projection): {audio_embeds.shape}")
-            print(f"Audio embeds min/max: {audio_embeds.min().item():.4f} / {audio_embeds.max().item():.4f}")
-            print("="*80 + "\n")
-            self._encoder_output_logged = True
 
         # Prepare embeddings with special tokens
         batch_size, audio_seq_len, hidden_dim = audio_embeds.shape
@@ -433,26 +400,6 @@ class ASRModel(PreTrainedModel):
             inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
             labels = None
-
-        # Debug what's being sent to decoder on first pass
-        if not hasattr(self, '_decoder_input_logged'):
-            print("\n" + "="*80)
-            print("📤 DECODER INPUT")
-            print("="*80)
-            print(f"Inputs embeds shape: {inputs_embeds.shape}")
-            print(f"Attention mask shape: {attention_mask.shape}")
-            if labels is not None:
-                print(f"Labels shape: {labels.shape}")
-                # Show how labels align with inputs
-                print(f"\nAlignment check:")
-                print(f"  Audio tokens: {audio_len if 'audio_len' in locals() else 'N/A'}")
-                print(f"  Text tokens: {labels.shape[1] - audio_len if 'audio_len' in locals() and labels is not None else 'N/A'}")
-                print(f"  Total sequence: {inputs_embeds.shape[1]}")
-                # Check label masking
-                masked_positions = (labels == -100).sum(dim=1)
-                print(f"  Masked positions per sample: {masked_positions.tolist()}")
-            print("="*80 + "\n")
-            self._decoder_input_logged = True
 
         # Forward through decoder
         outputs = self.decoder.model(
@@ -584,27 +531,10 @@ class DataCollator:
     def __call__(self, features: List[Dict[str, Union[str, Dict]]]) -> Dict[str, torch.Tensor]:
         # Filter samples that are too long
         valid_features = []
-        for i, f in enumerate(features):
+        for f in features:
             try:
                 # Audio is decoded lazily when accessed
                 audio_array = f["audio"]["array"]
-
-                # Debug first batch (after successful audio access)
-                if i == 0 and not hasattr(self, '_first_batch_logged'):
-                    print("\n" + "="*80)
-                    print("🔍 DEBUGGING FIRST BATCH")
-                    print("="*80)
-                    print(f"Number of samples in batch: {len(features)}")
-                    print(f"Sample keys: {f.keys()}")
-                    print(f"Audio array shape: {np.array(audio_array).shape}")
-                    print(f"Audio array dtype: {np.array(audio_array).dtype}")
-                    print(f"Audio array min/max: {np.min(audio_array):.4f} / {np.max(audio_array):.4f}")
-                    print(f"Audio sample rate: {f['audio']['sampling_rate']}")
-                    if 'text' in f:
-                        print(f"Text sample: '{f['text'][:100]}...'")
-                    print("="*80 + "\n")
-                    self._first_batch_logged = True
-
                 audio_len_sec = len(audio_array) / self.sample_rate
                 text_len_words = len(f["text"].split())
                 if (
@@ -612,10 +542,7 @@ class DataCollator:
                     and text_len_words <= self.max_text_words
                 ):
                     valid_features.append(f)
-            except Exception as e:
-                print(f"⚠️ Error processing sample {i}: {e}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
                 continue
 
         if not valid_features:
@@ -647,18 +574,6 @@ class DataCollator:
             padding=True,  # Pad to longest in batch (will be 3000 for Whisper)
         )
 
-        # Debug first batch processing
-        if not hasattr(self, '_first_audio_processed'):
-            print("\n" + "="*80)
-            print("🎵 PROCESSING AUDIO WITH WHISPER FEATURE EXTRACTOR")
-            print("="*80)
-            print(f"Number of audio samples: {len(audio_arrays)}")
-            print(f"First audio shape: {np.array(audio_arrays[0]).shape}")
-            print(f"Feature extractor output shape: {audio_features.input_features.shape}")
-            print(f"Feature min/max: {audio_features.input_features.min().item():.4f} / {audio_features.input_features.max().item():.4f}")
-            print("="*80 + "\n")
-            self._first_audio_processed = True
-
         # Get the padded mel spectrograms
         padded_specs = audio_features.input_features
 
@@ -666,7 +581,7 @@ class DataCollator:
         # Since feature extractor pads to 3000, we need to track actual lengths
         input_lengths = torch.tensor(
             [min(len(arr) // 160, 3000) for arr in audio_arrays],  # 160 = hop_length
-            dtype=torch.long
+            dtype=torch.long,
         )
 
         # Tokenize and pad text labels
@@ -678,50 +593,6 @@ class DataCollator:
             "labels": labels["input_ids"],
             "attention_mask": labels["attention_mask"],
         }
-
-        # Debug final batch output - comprehensive audio-text pairing check
-        if not hasattr(self, '_first_batch_output_logged'):
-            print("\n" + "="*80)
-            print("📦 FINAL BATCH OUTPUT - AUDIO-TEXT PAIRS & TOKENS")
-            print("="*80)
-            print(f"Batch size: {len(texts)}")
-            print(f"Batch keys: {output_batch.keys()}")
-            print(f"\n🎵 AUDIO INPUT:")
-            print(f"  Input values shape: {output_batch['input_values'].shape}")
-            print(f"  Input values dtype: {output_batch['input_values'].dtype}")
-            print(f"  Input values min/max: {output_batch['input_values'].min().item():.4f} / {output_batch['input_values'].max().item():.4f}")
-            print(f"  Input lengths (frame counts): {output_batch['input_lengths'].tolist()}")
-
-            print(f"\n📝 TEXT LABELS:")
-            print(f"  Labels shape: {output_batch['labels'].shape}")
-            print(f"  Attention mask shape: {output_batch['attention_mask'].shape}")
-
-            # Show first few audio-text pairs
-            print(f"\n🔗 AUDIO-TEXT PAIRS (first 3):")
-            for i in range(min(3, len(texts))):
-                print(f"\n  Sample {i}:")
-                print(f"    Original text: '{texts[i][:100]}...'")
-                print(f"    Token IDs: {output_batch['labels'][i][:30].tolist()}...")
-                decoded_text = self.tokenizer.decode(output_batch['labels'][i], skip_special_tokens=False)
-                print(f"    Decoded tokens: '{decoded_text[:100]}...'")
-                print(f"    Audio frames: {output_batch['input_lengths'][i].item()}")
-                print(f"    Audio duration: ~{output_batch['input_lengths'][i].item() * 0.01:.2f} seconds")  # 10ms per frame
-
-            # Check for special tokens
-            print(f"\n🔤 TOKENIZER INFO:")
-            print(f"  Pad token ID: {self.tokenizer.pad_token_id}")
-            print(f"  EOS token ID: {self.tokenizer.eos_token_id}")
-            print(f"  BOS token ID: {self.tokenizer.bos_token_id}")
-
-            # Check if padding is working correctly
-            print(f"\n✅ VALIDATION CHECKS:")
-            has_padding = (output_batch['labels'] == self.tokenizer.pad_token_id).any()
-            print(f"  Labels contain padding: {has_padding}")
-            print(f"  All audio inputs same shape: {len(set(output_batch['input_values'].shape[2:3])) == 1}")
-            print(f"  All labels same length: {len(set([len(l) for l in output_batch['labels']])) == 1}")
-
-            print("="*80 + "\n")
-            self._first_batch_output_logged = True
 
         return output_batch
 
@@ -743,7 +614,9 @@ def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, Custo
     return model_args, data_args, training_args
 
 
-def initialize_model(model_args: ModelArguments) -> Tuple[ASRModel, AutoTokenizer, WhisperFeatureExtractor]:
+def initialize_model(
+    model_args: ModelArguments,
+) -> Tuple[ASRModel, AutoTokenizer, WhisperFeatureExtractor]:
     """Initialize the ASR model, tokenizer, and feature extractor."""
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
@@ -780,12 +653,8 @@ def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
         val_dataset = dataset_dicts[0]["validation"]
 
     # Ensure audio is decoded and resampled correctly
-    train_dataset = train_dataset.cast_column(
-        "audio", Audio(sampling_rate=data_args.sample_rate)
-    )
-    val_dataset = val_dataset.cast_column(
-        "audio", Audio(sampling_rate=data_args.sample_rate)
-    )
+    train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=data_args.sample_rate))
+    val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=data_args.sample_rate))
 
     if data_args.max_train_samples:
         train_dataset = train_dataset.select(
