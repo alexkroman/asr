@@ -8,24 +8,25 @@ All GPU detection, optimization flags, and distributed training is handled by Ac
 import os
 import random
 import re
+import sys
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import evaluate
 import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio.transforms as T
-from accelerate import Accelerator
 from datasets import Dataset, load_dataset
-from einops import rearrange
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
+    PreTrainedModel,
+    PretrainedConfig,
     Trainer,
     TrainingArguments,
     WhisperModel,
@@ -47,10 +48,16 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
-    """Extended TrainingArguments with custom fields."""
+    """Extended TrainingArguments with custom fields for ASR."""
 
     resume_from_checkpoint: Optional[str] = field(
         default=None, metadata={"help": "Path to checkpoint to resume training from"}
+    )
+    torch_compile: bool = field(
+        default=False, metadata={"help": "Whether to use torch.compile for optimization"}
+    )
+    compile_mode: str = field(
+        default="default", metadata={"help": "Torch compile mode: 'default', 'reduce-overhead', 'max-autotune'"}
     )
 
 
@@ -60,13 +67,8 @@ class ModelArguments:
     Unified configuration for all model components.
     """
 
-    # Conformer Config
+    # Audio Config
     n_mels: int = field(default=80, metadata={"help": "Number of Mel bands."})
-    d_model: int = field(default=512, metadata={"help": "Dimension of the model."})
-    n_head: int = field(default=8, metadata={"help": "Number of attention heads."})
-    num_layers: int = field(default=12, metadata={"help": "Number of encoder layers."})
-    kernel_size: int = field(default=15, metadata={"help": "Kernel size for Conformer."})
-    conformer_dropout: float = field(default=0.1, metadata={"help": "Dropout for Conformer."})
 
     # SmolLM2 Config
     decoder_model_name: str = field(
@@ -82,11 +84,6 @@ class ModelArguments:
         metadata={"help": "Modules to apply LoRA to."},
     )
 
-    # Projector Config
-    num_queries: int = field(default=24, metadata={"help": "Number of queries for projector."})
-    projector_num_heads: int = field(default=8, metadata={"help": "Number of heads for projector."})
-    projector_dropout: float = field(default=0.1, metadata={"help": "Dropout for projector."})
-    projector_num_layers: int = field(default=2, metadata={"help": "Number of layers in the deep projector."})
 
 
 @dataclass
@@ -126,34 +123,21 @@ class DataArguments:
     )
 
 
-class SpecAugment(nn.Module):
-    def __init__(
-        self,
-        freq_mask_param: int = 27,
-        time_mask_param: int = 100,
-        n_freq_masks: int = 2,
-        n_time_masks: int = 2,
-    ) -> None:
-        super().__init__()
-        self.freq_masks = nn.ModuleList(
-            [T.FrequencyMasking(freq_mask_param=freq_mask_param) for _ in range(n_freq_masks)]
-        )
-        self.time_masks = nn.ModuleList(
-            [T.TimeMasking(time_mask_param=time_mask_param) for _ in range(n_time_masks)]
-        )
+class ASRConfig(PretrainedConfig):
+    """Configuration for ASRModel."""
+    model_type = "asr_whisper_smollm2"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for freq_mask in self.freq_masks:
-            x = freq_mask(x)
-        for time_mask in self.time_masks:
-            x = time_mask(x)
-        return x
+    def __init__(self, model_args: Optional[ModelArguments] = None, **kwargs):
+        super().__init__(**kwargs)
+        if model_args:
+            for key, value in model_args.__dict__.items():
+                setattr(self, key, value)
 
 
 class WhisperEncoder(nn.Module):
     """Frozen Whisper encoder wrapper."""
 
-    def __init__(self, config: ModelArguments):
+    def __init__(self, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
         # Load Whisper-small model
         self.whisper = WhisperModel.from_pretrained(
@@ -162,14 +146,11 @@ class WhisperEncoder(nn.Module):
             token=False
         )
 
-        # Freeze all parameters
         for param in self.whisper.parameters():
             param.requires_grad = False
 
-        # Store the output dimension (768 for whisper-small)
         self.d_model = self.whisper.config.d_model
 
-        # Set to eval mode to disable dropout
         self.whisper.eval()
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
@@ -182,320 +163,38 @@ class WhisperEncoder(nn.Module):
         """
         batch_size, n_mels, time_frames = x.shape
 
-        # Use torch.nn.functional.pad for standard padding
-        # Whisper expects exactly 3000 frames
+
         if time_frames < 3000:
-            # Pad on the right to reach 3000 frames
             pad_amount = 3000 - time_frames
             x = torch.nn.functional.pad(x, (0, pad_amount), mode='constant', value=0)
         elif time_frames > 3000:
-            # Truncate to 3000 frames
             x = x[:, :, :3000]
 
-        # Get encoder outputs
         with torch.no_grad():
+            # Ensure input dtype matches the model's dtype
+            x = x.to(self.whisper.dtype)
             outputs = self.whisper.encoder(x)
             encoder_outputs = outputs.last_hidden_state
 
-        # Truncate output to match actual input length
-        # Whisper downsamples by 2x, so input_frames -> input_frames/2
         if time_frames < 3000:
             output_frames = (time_frames + 1) // 2
             encoder_outputs = encoder_outputs[:, :output_frames, :]
 
         return encoder_outputs
 
-    @property
-    def gradient_checkpointing(self):
-        return False
-
-    @gradient_checkpointing.setter
-    def gradient_checkpointing(self, value):
-        # No-op since Whisper encoder is frozen
-        pass
-
-
-class ConvolutionModule(nn.Module):
-    """Convolution module for Conformer block."""
-
-    def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1):
-        super().__init__()
-        assert kernel_size % 2 == 1, "kernel_size must be odd for 'same' padding"
-
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.pointwise_conv1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1, bias=False)
-        self.glu = nn.GLU(dim=1)
-        self.depthwise_conv = nn.Conv1d(
-            d_model,
-            d_model,
-            kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
-            groups=d_model,
-            bias=False,
-        )
-        self.activation = nn.SiLU()
-        self.pointwise_conv2 = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (batch, time, d_model)
-        Returns:
-            Output tensor of shape (batch, time, d_model)
-        """
-        residual = x
-        x = self.layer_norm(x)
-
-        # Transpose for conv1d operations: (batch, time, d_model) -> (batch, d_model, time)
-        x = x.transpose(1, 2)
-
-        # Pointwise conv -> GLU
-        x = self.pointwise_conv1(x)
-        x = self.glu(x)
-
-        # Depthwise conv
-        x = self.depthwise_conv(x)
-        x = self.activation(x)
-
-        # Second pointwise conv
-        x = self.pointwise_conv2(x)
-        x = self.dropout(x)
-
-        # Transpose back: (batch, d_model, time) -> (batch, time, d_model)
-        x = x.transpose(1, 2)
-
-        return residual + x
-
-
-class FeedForwardModule(nn.Module):
-    """Feed-forward module for Conformer block."""
-
-    def __init__(self, d_model: int, d_ff: Optional[int] = None, dropout: float = 0.1):
-        super().__init__()
-        d_ff = d_ff or 4 * d_model
-
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
-        self.activation = nn.SiLU()
-        self.dropout1 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (batch, time, d_model)
-        Returns:
-            Output tensor of shape (batch, time, d_model)
-        """
-        residual = x
-        x = self.layer_norm(x)
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.dropout1(x)
-        x = self.linear2(x)
-        x = self.dropout2(x)
-        return residual + 0.5 * x  # Half-step residual as in Conformer paper
-
-
-class ConformerBlock(nn.Module):
-    """Single Conformer block with the characteristic sandwich structure."""
-
-    def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        d_ff: Optional[int] = None,
-        kernel_size: int = 31,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        # First feed-forward module
-        self.ff1 = FeedForwardModule(d_model, d_ff, dropout)
-
-        # Multi-head self-attention module
-        self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(
-            d_model, n_head, dropout=dropout, batch_first=True, bias=False
-        )
-        self.attn_dropout = nn.Dropout(dropout)
-
-        # Convolution module
-        self.conv_module = ConvolutionModule(d_model, kernel_size, dropout)
-
-        # Second feed-forward module
-        self.ff2 = FeedForwardModule(d_model, d_ff, dropout)
-
-        # Final layer norm
-        self.final_layer_norm = nn.LayerNorm(d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (batch, time, d_model)
-            key_padding_mask: Padding mask of shape (batch, time)
-        Returns:
-            Output tensor of shape (batch, time, d_model)
-        """
-        # First feed-forward
-        x = self.ff1(x)
-
-        # Multi-head self-attention with residual
-        residual = x
-        x = self.self_attn_layer_norm(x)
-        x, _ = self.self_attn(x, x, x, key_padding_mask=key_padding_mask)
-        x = self.attn_dropout(x)
-        x = residual + x
-
-        # Convolution module
-        x = self.conv_module(x)
-
-        # Second feed-forward
-        x = self.ff2(x)
-
-        # Final layer norm
-        x = self.final_layer_norm(x)
-
-        return x
-
-
-class ConformerEncoder(nn.Module):
-    """True Conformer encoder with proper architecture."""
-
-    def __init__(self, config: ModelArguments):
-        super().__init__()
-        self.config = config
-        self._gradient_checkpointing = False  # Use private attribute to follow HF convention
-
-        # Convolutional subsampling with stride 2 for each layer
-        # Total subsampling factor = 2^num_subsample_layers
-        self.subsample_layers = 2  # Number of conv layers with stride 2
-        self.subsample_factor = 2**self.subsample_layers  # Total subsampling: 4x
-
-        # Convolutional subsampling - simplified without normalization layers
-        # The normalization will happen after reshaping
-        self.subsample = nn.Sequential(
-            nn.Conv2d(1, config.d_model, 3, 2, 1, bias=False),
-            nn.SiLU(),
-            nn.Conv2d(config.d_model, config.d_model, 3, 2, 1, bias=False),
-            nn.SiLU(),
-        )
-
-        # Linear projection after subsampling with normalization
-        # Calculate feature dimension after frequency subsampling
-        freq_subsample_factor = (
-            self.subsample_factor
-        )  # Frequency dimension also reduced by same factor
-        input_dim = config.d_model * (config.n_mels // freq_subsample_factor)
-
-        # Add layer norm before projection to stabilize gradients
-        self.input_norm = nn.LayerNorm(input_dim)
-        self.input_proj = nn.Linear(input_dim, config.d_model, bias=False)
-        self.dropout = nn.Dropout(config.conformer_dropout)
-
-        # Stack of Conformer blocks
-        self.conformer_blocks = nn.ModuleList(
-            [
-                ConformerBlock(
-                    d_model=config.d_model,
-                    n_head=config.n_head,
-                    d_ff=config.d_model * 4,
-                    kernel_size=config.kernel_size,
-                    dropout=config.conformer_dropout,
-                )
-                for _ in range(config.num_layers)
-            ]
-        )
-
-    def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input mel-spectrogram of shape (batch, n_mels, time)
-            input_lengths: Lengths of input sequences
-        Returns:
-            Encoded features of shape (batch, time, d_model)
-        """
-        x = x.contiguous()
-
-        # Convolutional subsampling
-        x = x.unsqueeze(1)  # Add channel dimension
-        x = self.subsample(x)
-
-        # Clamp values to prevent explosion
-        x = torch.clamp(x, min=-10, max=10)
-
-        x = rearrange(x, "b c f t -> b t (c f)")
-        x = self.input_norm(x)  # Normalize before projection
-        x = self.input_proj(x)
-        x = self.dropout(x)
-
-        # Calculate output lengths after subsampling
-        # Use integer arithmetic to avoid floating point errors
-        # For Conv2d with kernel=3, stride=2, padding=1:
-        # output = floor((input + 2*padding - kernel) / stride) + 1
-        output_lengths = input_lengths.clone()
-
-        # Apply convolution length calculation for each subsampling layer
-        # Using explicit parameters to match the actual Conv2d layers
-        for _ in range(self.subsample_layers):
-            # Matches nn.Conv2d(_, _, kernel_size=3, stride=2, padding=1)
-            output_lengths = torch.div(output_lengths + 2 * 1 - 3, 2, rounding_mode='floor') + 1
-
-        # Ensure output lengths don't exceed actual tensor size
-        max_len = x.size(1)
-        output_lengths = torch.minimum(output_lengths, torch.tensor(max_len, device=output_lengths.device))
-
-        # Create padding mask
-        key_padding_mask = (
-            torch.arange(max_len, device=x.device)[None, :] >= output_lengths[:, None]
-        )
-
-        # Apply Conformer blocks with optional gradient checkpointing
-        for conformer_block in self.conformer_blocks:
-            if self._gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training
-                x = self._checkpoint_forward(conformer_block, x, key_padding_mask)
-            else:
-                x = conformer_block(x, key_padding_mask)
-
-        return x
-
-    def _checkpoint_forward(self, module, *args):
-        """Helper method for gradient checkpointing with proper handling."""
-        from torch.utils.checkpoint import checkpoint
-        return checkpoint(module, *args, use_reentrant=False)
-
-    @property
-    def gradient_checkpointing(self):
-        return self._gradient_checkpointing
-
-    @gradient_checkpointing.setter
-    def gradient_checkpointing(self, value):
-        self._gradient_checkpointing = value
-
 
 class AudioProjector(nn.Module):
     """Simple 2-layer MLP projector for audio features with careful initialization."""
-    def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
+    def __init__(self, audio_dim: int, text_dim: int, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
         self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
         self.act = nn.GELU()
         self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
 
-        # Initialize weights conservatively for stability (Qwen-style)
         with torch.no_grad():
-            # Xavier uniform with very small gain to prevent gradient explosion
-            # This is critical for stable training when connecting frozen encoder to trainable decoder
             nn.init.xavier_uniform_(self.linear_1.weight, gain=0.02)
             nn.init.xavier_uniform_(self.linear_2.weight, gain=0.02)
 
-            # Zero bias initialization is often more stable than random
             nn.init.zeros_(self.linear_1.bias)
             nn.init.zeros_(self.linear_2.bias)
 
@@ -507,52 +206,29 @@ class AudioProjector(nn.Module):
 
 
 class SmolLM2Decoder(nn.Module):
-    def __init__(self, config: ModelArguments):
+    def __init__(self, config: Union[ModelArguments, ASRConfig]):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
             config.decoder_model_name, dtype=torch.bfloat16, token=False
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
 
-        # Handle padding token configuration first
+        # Standard approach: use EOS token as padding token if not set
         if self.tokenizer.pad_token is None:
-            # Check if model already has a pad token configured
-            if hasattr(self.model.config, 'pad_token_id') and self.model.config.pad_token_id is not None:
-                # Use the model's existing pad token
-                vocab = self.tokenizer.get_vocab()
-                # Try to find the token corresponding to the model's pad_token_id
-                for token, token_id in vocab.items():
-                    if token_id == self.model.config.pad_token_id:
-                        self.tokenizer.pad_token = token
-                        break
-                else:
-                    # If no corresponding token found, add a new one
-                    self._add_padding_token()
-            else:
-                # Neither tokenizer nor model has padding configured
-                self._add_padding_token()
-        else:
-            # Tokenizer has pad token, ensure model config is synchronized
-            if hasattr(self.model.config, 'pad_token_id'):
-                self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Handle BOS token for models where tokenizer doesn't have it
-        # (e.g., Qwen models), we can use the pad token as BOS
-        if self.tokenizer.bos_token_id is None and hasattr(self.model.config, 'bos_token_id'):
-            # Use pad token as BOS token (common practice)
-            self.tokenizer.bos_token = self.tokenizer.pad_token
-            self.tokenizer.bos_token_id = self.tokenizer.pad_token_id
+        # Sync model config with tokenizer
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.config.bos_token_id = self.tokenizer.bos_token_id
+        self.model.config.eos_token_id = self.tokenizer.eos_token_id
 
-        # Update generation config if it exists (standard HuggingFace approach)
+        # Update generation config if it exists
         if hasattr(self.model, 'generation_config'):
             self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            # Set BOS/EOS tokens based on what's available in the tokenizer
             if self.tokenizer.bos_token_id is not None:
                 self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
-                self.model.config.bos_token_id = self.tokenizer.bos_token_id
-            if self.tokenizer.eos_token_id is not None:
-                self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
-                self.model.config.eos_token_id = self.tokenizer.eos_token_id
+            self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
 
         # Continue with LoRA setup if needed
         if config.use_lora:
@@ -568,52 +244,41 @@ class SmolLM2Decoder(nn.Module):
             )
             self.model = get_peft_model(self.model, lora_config)
 
-    def _add_padding_token(self):
-        """Add a padding token to the tokenizer and resize model embeddings."""
-        # Add the padding token
-        self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
-
-        # Resize model embeddings to accommodate the new token
-        self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=False)
-
-        # Initialize the new embedding with the mean of existing embeddings
-        with torch.no_grad():
-            embeddings = self.model.get_input_embeddings()
-            if embeddings is not None and hasattr(embeddings, "weight"):
-                embedding_weight: torch.nn.Parameter = embeddings.weight  # type: ignore
-                # Initialize new token embedding as mean of existing embeddings
-                embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
-
-        # Update model config to sync with tokenizer
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
-
     def forward(self, **kwargs):
         """Simple forward pass through the decoder model."""
         return self.model(**kwargs)
 
 
+class ASRModel(PreTrainedModel):
+    """ASR model using standard HuggingFace PreTrainedModel."""
+    config_class = ASRConfig
+    base_model_prefix = "asr"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["WhisperEncoder", "SmolLM2Decoder", "AudioProjector"]
 
-
-
-class ASRModel(nn.Module):
-    def __init__(self, config: ModelArguments) -> None:
-        super().__init__()
-        self.model_args = config  # Store model args for saving
+    def __init__(self, config: Union[ASRConfig, ModelArguments]) -> None:
+        # Convert ModelArguments to ASRConfig if needed
+        if isinstance(config, ModelArguments):
+            config = ASRConfig(model_args=config)
+        super().__init__(config)
+        self.model_args = config  # Store for compatibility
         self.encoder = WhisperEncoder(config)
         self.decoder = SmolLM2Decoder(config)
-        # Store the decoder's config as the model config for HuggingFace Trainer compatibility
         self.config = self.decoder.model.config
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
-        # Whisper-small outputs 768-dim features
         audio_dim = self.encoder.d_model  # 768 for whisper-small
         self.audio_projector = AudioProjector(audio_dim, text_dim, config)
-        self.spec_augment = SpecAugment()
-
-        # Add audio-specific special tokens
         self.add_audio_special_tokens()
 
-        # Initialize weights with smaller values for stability
-        self._init_weights()
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing for the decoder model only."""
+        if hasattr(self.decoder.model, 'gradient_checkpointing_enable'):
+            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the decoder model."""
+        if hasattr(self.decoder.model, 'gradient_checkpointing_disable'):
+            self.decoder.model.gradient_checkpointing_disable()
 
     def add_audio_special_tokens(self):
         """Add audio-specific special tokens for better audio-text alignment."""
@@ -626,131 +291,19 @@ class ASRModel(nn.Module):
             ]
         }
 
-        # Add special tokens to tokenizer
         num_added = self.decoder.tokenizer.add_special_tokens(special_tokens)
 
         if num_added > 0:
-            # Resize model embeddings to accommodate new tokens
             self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer))
 
-            # Initialize new token embeddings with small random values
             with torch.no_grad():
                 embeddings = self.decoder.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, "weight"):
-                    # Initialize new tokens with small random values
                     embeddings.weight[-num_added:].normal_(mean=0.0, std=0.02)
 
-        # Store token IDs for use in forward pass
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
         self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
-
-    def create_audio_attention_mask(self, audio_len: int, text_len: int, batch_size: int, device: torch.device) -> torch.Tensor:
-        """
-        Create Qwen-style attention mask where:
-        - Audio tokens can attend to each other bidirectionally
-        - Text tokens use causal masking
-        - Text tokens can attend to all audio tokens
-
-        Args:
-            audio_len: Length of audio sequence (including special tokens)
-            text_len: Length of text sequence
-            batch_size: Batch size
-            device: Device to create mask on
-
-        Returns:
-            Attention mask of shape (batch_size, 1, total_len, total_len) for compatibility
-            with HuggingFace transformers
-        """
-        total_len = audio_len + text_len
-
-        # Create base mask - all ones (all tokens can attend to each other initially)
-        mask = torch.ones((total_len, total_len), dtype=torch.float32, device=device)
-
-        # Apply causal masking ONLY to the text portion
-        # Text tokens cannot attend to future text tokens
-        text_start = audio_len
-        for i in range(text_start, total_len):
-            mask[i, i+1:] = 0
-
-        # The mask now has:
-        # - Full attention (bidirectional) for audio tokens to all audio tokens
-        # - Full attention from text tokens to all audio tokens
-        # - Causal attention for text tokens to text tokens
-
-        # Expand to batch size and add the num_heads dimension
-        # Shape: (batch_size, 1, total_len, total_len)
-        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
-
-        return mask
-
-    def _init_weights(self):
-        """Initialize weights with more conservative values to prevent gradient explosion."""
-        for name, module in self.named_modules():
-            # Skip decoder weights - they're already pretrained
-            if 'decoder' in name:
-                continue
-
-            if isinstance(module, nn.Linear):
-                # Very conservative initialization to prevent gradient explosion
-                nn.init.xavier_uniform_(module.weight, gain=0.02)  # Even smaller gain
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
-                # Very conservative initialization for conv layers
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                with torch.no_grad():
-                    module.weight.data *= 0.1  # Much smaller scale
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d) or isinstance(module, nn.GroupNorm):
-                if hasattr(module, 'weight') and module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if hasattr(module, 'bias') and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if hasattr(module, 'weight') and module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if hasattr(module, 'bias') and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.MultiheadAttention):
-                # More conservative initialization for attention
-                for param in module.parameters():
-                    if param.dim() > 1:
-                        nn.init.xavier_uniform_(param, gain=0.1)
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """
-        Enable gradient checkpointing for both encoder and decoder models.
-        This method is called by the Trainer when gradient_checkpointing is enabled.
-        """
-        # Enable for encoder using property
-        self.encoder.gradient_checkpointing = True
-
-        # Enable for decoder using its native method
-        if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
-            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
-        elif hasattr(self.decoder.model, "enable_gradient_checkpointing"):
-            self.decoder.model.enable_gradient_checkpointing()
-
-    def gradient_checkpointing_disable(self):
-        """
-        Disable gradient checkpointing for both encoder and decoder models.
-        This method is called by the Trainer when gradient_checkpointing is disabled.
-        """
-        # Disable for encoder using property
-        self.encoder.gradient_checkpointing = False
-
-        # Disable for decoder using its native method
-        if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
-            self.decoder.model.gradient_checkpointing_disable()
-        elif hasattr(self.decoder.model, "disable_gradient_checkpointing"):
-            self.decoder.model.disable_gradient_checkpointing()
-
-    @property
-    def is_gradient_checkpointing(self):
-        """Check if gradient checkpointing is enabled."""
-        return self.encoder.gradient_checkpointing
 
     def forward(
         self,
@@ -758,265 +311,116 @@ class ASRModel(nn.Module):
         input_lengths: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        # Handle dict input from Trainer
-        if input_values is None and "input_values" in kwargs:
-            input_values = kwargs["input_values"]
-        if input_lengths is None and "input_lengths" in kwargs:
-            input_lengths = kwargs["input_lengths"]
+        **kwargs,
+    ):
+        """Forward pass with standard HuggingFace patterns."""
+        # Extract inputs from kwargs if needed (standard HF pattern)
+        if input_values is None:
+            input_values = kwargs.get("input_values")
+        if input_lengths is None:
+            input_lengths = kwargs.get("input_lengths")
 
         if input_values is None or input_lengths is None:
             raise ValueError("input_values and input_lengths are required")
 
-        if self.training:
-            input_values = self.spec_augment(input_values)
+        # Encode audio features
+        audio_features = self.encoder(input_values, input_lengths)
+        audio_embeds = self.audio_projector(audio_features)
 
-        # Use SDPA optimization only on CUDA devices
-        if input_values.is_cuda:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=True
-            ):
-                audio_features = self.encoder(input_values, input_lengths)
-        else:
-            # For CPU, MPS, or other devices, use default attention implementation
-            audio_features = self.encoder(input_values, input_lengths)
+        # Prepare embeddings with special tokens
+        batch_size, audio_seq_len, hidden_dim = audio_embeds.shape
+        device = audio_embeds.device
 
-        audio_prefix = self.audio_projector(audio_features)
+        # Get embedding layer for special tokens
+        embed_layer = self.decoder.model.get_input_embeddings()
 
-        embeddings = self.decoder.model.get_input_embeddings()
-        batch_size = audio_prefix.shape[0]
-        device = audio_prefix.device
+        # Create special token embeddings
+        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id, device=device, dtype=torch.long)
+        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id, device=device, dtype=torch.long)
 
-        if labels is not None and callable(embeddings):
-            # Create special token tensors
-            audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
-                                           dtype=torch.long, device=device)
-            audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
-                                         dtype=torch.long, device=device)
+        audio_start_embeds = embed_layer(audio_start_tokens)
+        audio_end_embeds = embed_layer(audio_end_tokens)
 
-            # Get embeddings for special tokens and text
-            audio_start_embeds = embeddings(audio_start_tokens)
-            audio_end_embeds = embeddings(audio_end_tokens)
-            text_embeds = embeddings(labels)
+        if labels is not None:
+            # Training mode: combine audio and text
+            text_embeds = embed_layer(labels)
 
-            # Convert audio_prefix to same dtype as text embeddings
-            if audio_prefix.dtype != text_embeds.dtype:
-                audio_prefix = audio_prefix.to(text_embeds.dtype)
+            # Ensure dtype consistency
+            audio_embeds = audio_embeds.to(text_embeds.dtype)
 
-            # Combine: <audio_start> [audio_features] <audio_end> [text]
-            combined_embeds = torch.cat([
-                audio_start_embeds,
-                audio_prefix,
-                audio_end_embeds,
-                text_embeds
-            ], dim=1)
-
-            # Calculate lengths for custom attention mask
-            audio_total_len = 1 + audio_prefix.shape[1] + 1  # start + features + end
-            text_len = labels.shape[1]
-
-            # Create Qwen-style attention mask with bidirectional audio and causal text
-            # This creates a 4D mask that some models support for custom attention patterns
-            custom_attention_mask = self.create_audio_attention_mask(
-                audio_len=audio_total_len,
-                text_len=text_len,
-                batch_size=batch_size,
-                device=device
+            # Combine embeddings: [audio_start, audio_features, audio_end, text]
+            inputs_embeds = torch.cat(
+                [audio_start_embeds, audio_embeds, audio_end_embeds, text_embeds],
+                dim=1
             )
-
-            # For models that don't support 4D masks, we'll also create a standard 2D mask
-            # as a fallback (indicates which positions have real tokens vs padding)
-            if attention_mask is not None:
-                # Combine audio masks with provided text attention mask
-                audio_start_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
-                audio_mask = torch.ones(audio_prefix.shape[:2], dtype=torch.long, device=device)
-                audio_end_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
-                standard_attention_mask = torch.cat([
-                    audio_start_mask,
-                    audio_mask,
-                    audio_end_mask,
-                    attention_mask
-                ], dim=1)
-            else:
-                # All positions are valid (no padding)
-                standard_attention_mask = torch.ones(
-                    (batch_size, audio_total_len + text_len), dtype=torch.long, device=device
-                )
-
-            # Use standard 2D mask for now (most compatible)
-            # For models that support 4D attention masks (like some Qwen variants),
-            # you can use: combined_attention_mask = custom_attention_mask
-            # This would enable bidirectional attention for audio and causal for text
-            combined_attention_mask = standard_attention_mask
-
-            # Uncomment to use custom attention pattern (if model supports 4D masks):
-            # combined_attention_mask = custom_attention_mask
-
-            # Create labels: mask audio tokens with -100
-            audio_start_labels = torch.full((batch_size, 1), -100, dtype=labels.dtype, device=device)
-            audio_prefix_labels = torch.full(audio_prefix.shape[:2], -100, dtype=labels.dtype, device=device)
-            audio_end_labels = torch.full((batch_size, 1), -100, dtype=labels.dtype, device=device)
-
-            combined_labels = torch.cat([
-                audio_start_labels,
-                audio_prefix_labels,
-                audio_end_labels,
-                labels
-            ], dim=1)
-        else:
-            # Inference mode: only use audio with boundary tokens
-            audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
-                                           dtype=torch.long, device=device)
-            audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
-                                         dtype=torch.long, device=device)
-
-            audio_start_embeds = embeddings(audio_start_tokens)
-            audio_end_embeds = embeddings(audio_end_tokens)
-
-            # Convert to decoder dtype
-            decoder_dtype = next(self.decoder.model.parameters()).dtype
-            if audio_prefix.dtype != decoder_dtype:
-                audio_prefix = audio_prefix.to(decoder_dtype)
-            if audio_start_embeds.dtype != decoder_dtype:
-                audio_start_embeds = audio_start_embeds.to(decoder_dtype)
-            if audio_end_embeds.dtype != decoder_dtype:
-                audio_end_embeds = audio_end_embeds.to(decoder_dtype)
-
-            combined_embeds = torch.cat([
-                audio_start_embeds,
-                audio_prefix,
-                audio_end_embeds
-            ], dim=1)
 
             # Create attention mask
-            combined_attention_mask = torch.ones(
-                combined_embeds.shape[:2], dtype=torch.long, device=device
+            audio_len = audio_seq_len + 2  # +2 for special tokens
+            if attention_mask is not None:
+                # Extend attention mask for audio tokens
+                audio_mask = torch.ones(batch_size, audio_len, dtype=attention_mask.dtype, device=device)
+                attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+            else:
+                attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+
+            # Prepare labels: mask audio tokens with -100 (ignore index)
+            audio_labels = torch.full((batch_size, audio_len), -100, dtype=labels.dtype, device=device)
+            labels = torch.cat([audio_labels, labels], dim=1)
+        else:
+            # Inference mode: audio only
+            inputs_embeds = torch.cat(
+                [audio_start_embeds, audio_embeds, audio_end_embeds],
+                dim=1
             )
+            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+            labels = None
 
-            combined_labels = None
-
-        outputs = self.decoder.model.forward(
-            inputs_embeds=combined_embeds,
-            attention_mask=combined_attention_mask,
-            labels=combined_labels,
+        # Forward through decoder
+        outputs = self.decoder.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            return_dict=True,
         )
 
-        # During training, only return loss and logits to avoid DynamicCache padding issues
-        # During inference/generation, return full outputs including KV cache
-        if self.training and hasattr(outputs, "loss") and hasattr(outputs, "logits"):
-            from transformers.modeling_outputs import CausalLMOutputWithPast
-
-            return CausalLMOutputWithPast(
-                loss=outputs.loss,
-                logits=outputs.logits,
-                past_key_values=None,  # Don't return cache during training
-                hidden_states=None,
-                attentions=None,
-            )
-
-        # Return full outputs (including KV cache) for eval/generation
         return outputs
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(
         self,
         input_values: torch.Tensor,
         input_lengths: torch.Tensor,
         max_new_tokens: int = 100,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        do_sample: bool = True,
         **kwargs
     ) -> torch.Tensor:
-        """
-        Generate text transcription from audio input with special tokens.
+        """Generate text from audio input using standard HF generation."""
+        # Get audio embeddings
+        audio_features = self.encoder(input_values, input_lengths)
+        audio_embeds = self.audio_projector(audio_features)
 
-        Args:
-            input_values: Mel-spectrogram of shape (batch, n_mels, time)
-            input_lengths: Lengths of input sequences
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p (nucleus) sampling parameter
-            do_sample: Whether to use sampling or greedy decoding
-            **kwargs: Additional arguments for generate method
+        batch_size = audio_embeds.shape[0]
+        device = audio_embeds.device
+        embed_layer = self.decoder.model.get_input_embeddings()
 
-        Returns:
-            Generated token IDs
-        """
-        # Process audio through encoder with SDPA optimization
-        if input_values.is_cuda:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=True
-            ):
-                audio_features = self.encoder(input_values, input_lengths)
-        else:
-            audio_features = self.encoder(input_values, input_lengths)
+        # Create special token embeddings
+        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id, device=device, dtype=torch.long)
+        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id, device=device, dtype=torch.long)
 
-        # Project audio features to text embedding space
-        audio_prefix = self.audio_projector(audio_features)
+        audio_start_embeds = embed_layer(audio_start_tokens)
+        audio_end_embeds = embed_layer(audio_end_tokens)
 
-        # Setup for generation
-        batch_size = audio_prefix.shape[0]
-        device = audio_prefix.device
-        embeddings = self.decoder.model.get_input_embeddings()
+        # Combine embeddings for generation
+        inputs_embeds = torch.cat(
+            [audio_start_embeds, audio_embeds, audio_end_embeds],
+            dim=1
+        )
 
-        # Create special token embeddings for better structure
-        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
-                                       dtype=torch.long, device=device)
-        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
-                                     dtype=torch.long, device=device)
-
-        audio_start_embeds = embeddings(audio_start_tokens)
-        audio_end_embeds = embeddings(audio_end_tokens)
-
-        # Add BOS token if it exists (for generation start)
-        if self.decoder.tokenizer.bos_token_id is not None:
-            bos_tokens = torch.full((batch_size, 1), self.decoder.tokenizer.bos_token_id,
-                                   dtype=torch.long, device=device)
-            bos_embeds = embeddings(bos_tokens)
-
-            # Combine: <audio_start> [features] <audio_end> <bos>
-            combined_embeds = torch.cat([
-                audio_start_embeds,
-                audio_prefix,
-                audio_end_embeds,
-                bos_embeds
-            ], dim=1)
-        else:
-            # No BOS token: <audio_start> [features] <audio_end>
-            combined_embeds = torch.cat([
-                audio_start_embeds,
-                audio_prefix,
-                audio_end_embeds
-            ], dim=1)
-
-        # Ensure correct dtype
-        decoder_dtype = next(self.decoder.model.parameters()).dtype
-        if combined_embeds.dtype != decoder_dtype:
-            combined_embeds = combined_embeds.to(decoder_dtype)
-
-        # Create attention mask (all positions are valid)
-        attention_mask = torch.ones(combined_embeds.shape[:2], dtype=torch.long, device=device)
-
-        # Set generation parameters
-        generation_config = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "do_sample": do_sample,
-            "pad_token_id": self.decoder.tokenizer.pad_token_id,
-            "eos_token_id": self.decoder.tokenizer.eos_token_id,
-        }
-
-        # Merge with any additional kwargs
-        generation_config.update(kwargs)
-
-        # Generate tokens
         return self.decoder.model.generate(
-            inputs_embeds=combined_embeds,
-            attention_mask=attention_mask,
-            **generation_config
+            inputs_embeds=inputs_embeds,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.decoder.tokenizer.pad_token_id,
+            eos_token_id=self.decoder.tokenizer.eos_token_id,
+            **kwargs
         )
 
     def transcribe(self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs) -> List[str]:
@@ -1042,6 +446,46 @@ class ASRModel(nn.Module):
         )
 
         return transcriptions
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save model using HuggingFace standard format."""
+        # Save config
+        if hasattr(self, 'model_args') and isinstance(self.model_args, ModelArguments):
+            # Convert ModelArguments to config for saving
+            config = ASRConfig(model_args=self.model_args)
+            config.save_pretrained(save_directory)
+        else:
+            super().save_pretrained(save_directory, **kwargs)
+
+        # Save tokenizer
+        if hasattr(self.decoder, 'tokenizer'):
+            self.decoder.tokenizer.save_pretrained(save_directory)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        """Load model using HuggingFace standard format."""
+        # Load config
+        config = ASRConfig.from_pretrained(pretrained_model_name_or_path)
+
+        # Create model
+        model = cls(config)
+
+        # Load state dict
+        import os
+        from safetensors.torch import load_file
+
+        model_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        if os.path.exists(model_file):
+            state_dict = load_file(model_file)
+        else:
+            model_file = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+            if os.path.exists(model_file):
+                state_dict = torch.load(model_file, map_location="cpu")
+            else:
+                raise FileNotFoundError(f"No model weights found in {pretrained_model_name_or_path}")
+
+        model.load_state_dict(state_dict, strict=False)
+        return model
 
 
 @dataclass
@@ -1170,16 +614,15 @@ class DataCollator:
 
 
 
-def parse_config(
-    config_file: str
-) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
+def parse_config(config_file: str) -> Tuple[ModelArguments, DataArguments, CustomTrainingArguments]:
     """Parse configuration from JSON file."""
     if not os.path.exists(config_file):
-        raise FileNotFoundError(f"Config file '{config_file}' not found!")
+        raise FileNotFoundError(f"Config file not found: {config_file}")
 
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
     model_args, data_args, training_args = parser.parse_json_file(
-        json_file=config_file, allow_extra_keys=True
+        json_file=config_file,
+        allow_extra_keys=True
     )
 
     # Essential settings for ASR
@@ -1190,362 +633,144 @@ def parse_config(
 
 
 def initialize_model(
-    model_args: ModelArguments
+    model_args: ModelArguments,
+    compile_model: bool = False,
+    compile_mode: str = "default"
 ) -> Tuple[ASRModel, AutoTokenizer]:
-    """Initialize the ASR model and tokenizer."""
-    # Initialize model and tokenizer
-
+    """Initialize the ASR model and tokenizer with optional compilation."""
     model = ASRModel(model_args)
     tokenizer = model.decoder.tokenizer
+    if compile_model and torch.__version__ >= "2.0.0":
+        # Compile the entire model instead of components to avoid unwrapping issues
+        model = torch.compile(model, mode=compile_mode, fullgraph=False)
+    elif compile_model:
+        import warnings
+        warnings.warn("torch.compile requires PyTorch 2.0+, skipping compilation")
 
     return model, tokenizer
 
 
 def load_datasets(data_args: DataArguments) -> Tuple[Dataset, Dataset]:
-    """Load training and validation datasets."""
-    from datasets import concatenate_datasets
-
-    # Load datasets
-
-    # Adjust num_proc based on platform
+    """Load training and validation datasets using standard HuggingFace patterns."""
+    from datasets import DatasetDict, concatenate_datasets
     import platform
-    if platform.system() == "Darwin":  # Mac
-        safe_num_proc = min(data_args.num_proc, 1) if data_args.num_proc else None
-    else:  # Linux/CUDA
-        safe_num_proc = data_args.num_proc if data_args.num_proc else None
-
-    train_datasets = []
-    val_datasets = []
-
+    safe_num_proc = 1 if platform.system() == "Darwin" else data_args.num_proc
+    dataset_dicts = []
     for config, train_split, eval_split in zip(
         data_args.dataset_configs, data_args.train_splits, data_args.eval_splits
     ):
-        # Load dataset configuration
-
-        train_ds = load_dataset(
+        ds_dict = load_dataset(
             data_args.dataset_name,
             config,
-            split=train_split,
+            split={"train": train_split, "validation": eval_split},
             cache_dir=data_args.dataset_cache_dir,
             num_proc=safe_num_proc,
         )
-        train_datasets.append(train_ds)
-
-        val_ds = load_dataset(
-            data_args.dataset_name,
-            config,
-            split=eval_split,
-            cache_dir=data_args.dataset_cache_dir,
-            num_proc=safe_num_proc,
-        )
-        val_datasets.append(val_ds)
-
-    # Concatenate all datasets
-    train_dataset = concatenate_datasets(train_datasets)
-    val_dataset = concatenate_datasets(val_datasets)
-
-    # Dataset sizes recorded
-
-    # Limit samples if specified (for overfitting experiments)
-    if data_args.max_train_samples is not None:
+        dataset_dicts.append(ds_dict)
+    if len(dataset_dicts) > 1:
+        train_dataset = concatenate_datasets([d["train"] for d in dataset_dicts])
+        val_dataset = concatenate_datasets([d["validation"] for d in dataset_dicts])
+    else:
+        train_dataset = dataset_dicts[0]["train"]
+        val_dataset = dataset_dicts[0]["validation"]
+    if data_args.max_train_samples:
         train_dataset = train_dataset.select(range(min(data_args.max_train_samples, len(train_dataset))))
-
-    if data_args.max_eval_samples is not None:
+    if data_args.max_eval_samples:
         val_dataset = val_dataset.select(range(min(data_args.max_eval_samples, len(val_dataset))))
-
-    # Datasets loaded successfully
 
     return train_dataset, val_dataset
 
 
 
 def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict[str, float]:
-    """Compute WER metric for evaluation.
-
-    Args:
-        eval_pred: EvalPrediction object from Trainer
-        tokenizer: Tokenizer for decoding
-    """
-    predictions = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    # Handle small evaluation sets
-    total_samples = len(predictions)
-    # Sample up to 10% of data or max 100 samples for WER calculation to save time
-    max_samples = min(max(10, int(total_samples * 0.1)), 100)
-
-    if total_samples > max_samples:
-        indices = random.sample(range(total_samples), max_samples)
-        predictions = predictions[indices]
-        label_ids = label_ids[indices]
-    else:
-        max_samples = total_samples
-
-    # Decode predictions and labels
-    if len(predictions.shape) == 3:
-        # If predictions are logits, get argmax
+    """Compute WER metric using standard HuggingFace patterns."""
+    predictions, label_ids = eval_pred.predictions, eval_pred.label_ids
+    if predictions.ndim == 3:
         predictions = np.argmax(predictions, axis=-1)
-
-    # Replace -100 with pad_token_id for labels
-    label_ids = np.where(label_ids == -100, tokenizer.pad_token_id, label_ids)
-
-    # Decode texts
-    pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-    label_texts = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-
-    # Normalize texts
-    pred_texts = [text.lower().strip() for text in pred_texts]
-    label_texts = [text.lower().strip() for text in label_texts]
-
-    # Calculate WER
-    wer_metric = evaluate.load("wer")
-    wer = wer_metric.compute(predictions=pred_texts, references=label_texts)
-
-    return {
-        "wer": wer,
-        "wer_samples": max_samples,
-    }
-
-
-def setup_trainer(
-    model: ASRModel,
-    tokenizer: AutoTokenizer,
-    training_args: CustomTrainingArguments,
-    train_dataset: Dataset,
-    val_dataset: Dataset,
-    model_args: ModelArguments,
-    data_args: DataArguments,
-    accelerator: Accelerator,
-) -> Trainer:
-    """Setup the trainer with data collator and compute metrics."""
-    # Create data collator
-    data_collator = DataCollator(
-        tokenizer=tokenizer,
-        sample_rate=data_args.sample_rate,
-        n_mels=model_args.n_mels,
-        max_audio_seconds=data_args.max_audio_seconds,
-        max_text_words=data_args.max_text_words,
+    label_ids[label_ids == -100] = tokenizer.pad_token_id
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    wer_metric = evaluate.load("wer", cache_dir="./metrics_cache")
+    wer = wer_metric.compute(
+        predictions=decoded_preds,
+        references=decoded_labels
     )
 
-    # Create compute_metrics function with tokenizer bound
-    def compute_metrics_fn(eval_pred):
-        return compute_metrics(eval_pred, tokenizer)
+    return {"wer": wer}
 
-    # Initialize standard Trainer
-    # Only compute metrics if explicitly requested in config
-    use_metrics = getattr(training_args, 'compute_metrics', False)
 
+
+def evaluate_checkpoint(checkpoint_dir: str, config_file: str) -> None:
+    """Evaluate a checkpoint using standard HuggingFace patterns."""
+    model_args, data_args, training_args = parse_config(config_file)
+    training_args.do_train = False
+    training_args.do_eval = True
+    training_args.per_device_eval_batch_size = 8
+    model = ASRModel.from_pretrained(checkpoint_dir)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
+    if training_args.torch_compile and torch.__version__ >= "2.0.0":
+        model = torch.compile(model, mode=training_args.compile_mode, fullgraph=False)
+
+    _, val_dataset = load_datasets(data_args)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        eval_dataset=val_dataset,
+        data_collator=DataCollator(
+            tokenizer=tokenizer,
+            sample_rate=data_args.sample_rate,
+            n_mels=model_args.n_mels,
+            max_audio_seconds=data_args.max_audio_seconds,
+            max_text_words=data_args.max_text_words,
+        ),
+        compute_metrics=lambda eval_pred: compute_metrics(eval_pred, tokenizer),
+    )
+
+    metrics = trainer.evaluate()
+    trainer.log_metrics("eval", metrics)
+    trainer.save_metrics("eval", metrics)
+
+
+def main(config_file: str) -> None:
+    """Main training function using standard HuggingFace patterns."""
+    model_args, data_args, training_args = parse_config(config_file)
+    model, tokenizer = initialize_model(
+        model_args,
+        compile_model=training_args.torch_compile,
+        compile_mode=training_args.compile_mode
+    )
+
+    train_dataset, val_dataset = load_datasets(data_args)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=data_collator,
+        data_collator=DataCollator(
+            tokenizer=tokenizer,
+            sample_rate=data_args.sample_rate,
+            n_mels=model_args.n_mels,
+            max_audio_seconds=data_args.max_audio_seconds,
+            max_text_words=data_args.max_text_words,
+        ),
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics_fn if use_metrics else None,
+        compute_metrics=lambda eval_pred: compute_metrics(eval_pred, tokenizer),
     )
 
-    return trainer
-
-
-# run_training function removed - just use trainer.train() directly
-
-
-def evaluate_checkpoint(checkpoint_dir: str, config_file: str) -> None:
-    """Evaluate a checkpoint using HuggingFace Trainer."""
-    from accelerate import Accelerator
-
-    # Initialize accelerator for evaluation
-    accelerator = Accelerator()
-
-    # Parse configuration
-    model_args, data_args, training_args = parse_config(config_file)
-
-    # Initialize model and tokenizer
-    model, tokenizer = initialize_model(model_args)
-
-    # Load checkpoint weights
-    print(f"Loading checkpoint from {checkpoint_dir}")
-    checkpoint_file = None
-
-    if os.path.exists(os.path.join(checkpoint_dir, "model.safetensors")):
-        checkpoint_file = os.path.join(checkpoint_dir, "model.safetensors")
-    elif os.path.exists(os.path.join(checkpoint_dir, "pytorch_model.bin")):
-        checkpoint_file = os.path.join(checkpoint_dir, "pytorch_model.bin")
-
-    if checkpoint_file:
-        # Load state dict
-        if checkpoint_file.endswith(".safetensors"):
-            from safetensors.torch import load_file
-            state_dict = load_file(checkpoint_file)
-        else:
-            state_dict = torch.load(checkpoint_file, map_location="cpu")
-
-        model.load_state_dict(state_dict, strict=False)
-        print(f"Loaded model weights from {os.path.basename(checkpoint_file)}")
-
-    # Load datasets
-    _, val_dataset = load_datasets(data_args)
-
-    # Sample subset for quick evaluation
-    eval_samples = min(100, len(val_dataset))
-    if eval_samples < len(val_dataset):
-        indices = random.sample(range(len(val_dataset)), eval_samples)
-        val_dataset = val_dataset.select(indices)
-    print(f"Evaluating on {eval_samples} samples from validation set")
-
-    # Setup trainer for evaluation only
-    training_args.per_device_eval_batch_size = 8  # Smaller batch for evaluation
-    training_args.dataloader_num_workers = 2
-    training_args.remove_unused_columns = False
-    training_args.label_names = ["labels"]
-
-    trainer = setup_trainer(
-        model=model,
-        tokenizer=tokenizer,
-        training_args=training_args,
-        train_dataset=None,  # No training dataset needed
-        val_dataset=val_dataset,
-        model_args=model_args,
-        data_args=data_args,
-        accelerator=accelerator,
-    )
-
-    # Run evaluation using Trainer
-    print("Running evaluation...")
-    metrics = trainer.evaluate()
-
-    # Print metrics
-    print(f"\n{'='*60}")
-    print(f"Evaluation Results for checkpoint: {checkpoint_dir}")
-    print(f"{'='*60}")
-    for key, value in metrics.items():
-        print(f"{key}: {value:.4f}")
-    print(f"Number of samples evaluated: {eval_samples}")
-    print(f"{'='*60}\n")
-
-    # Optionally generate predictions for a few samples to see quality
-    if eval_samples <= 10:
-        print("\nGenerating sample predictions...")
-        predictions = trainer.predict(val_dataset)
-
-        # If predictions contain generated text, display them
-        if hasattr(predictions, 'predictions'):
-            pred_ids = predictions.predictions
-            label_ids = predictions.label_ids
-
-            # Decode and display
-            if len(pred_ids.shape) == 3:
-                pred_ids = np.argmax(pred_ids, axis=-1)
-
-            pred_texts = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-            label_ids = np.where(label_ids == -100, tokenizer.pad_token_id, label_ids)
-            label_texts = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-
-            print(f"\n{'='*60}")
-            print("Sample Predictions:")
-            print(f"{'='*60}")
-            for i in range(min(5, len(pred_texts))):
-                print(f"\nSample {i + 1}:")
-                print(f"Truth: {label_texts[i].lower().strip()}")
-                print(f"Pred:  {pred_texts[i].lower().strip()}")
-            print(f"{'='*60}\n")
-
-
-def main() -> None:
-    """Main training function - simplified with Accelerate."""
-    import sys
-
-    # Check if running in eval mode
-    if len(sys.argv) >= 2 and sys.argv[1] == "--eval":
-        if len(sys.argv) < 5:
-            raise ValueError(
-                "Evaluation mode requires checkpoint directory and config file!\n"
-                "Usage: python train.py --eval --checkpoint <checkpoint_dir> --config <config_file.json>\n"
-                "Example: python train.py --eval --checkpoint ./outputs/checkpoint-1000 --config configs/experiment.json"
-            )
-
-        checkpoint_idx = sys.argv.index("--checkpoint") + 1
-        config_idx = sys.argv.index("--config") + 1
-
-        checkpoint_dir = sys.argv[checkpoint_idx]
-        config_file = sys.argv[config_idx]
-
-        if not os.path.exists(checkpoint_dir):
-            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
-
-        if not os.path.exists(config_file):
-            raise FileNotFoundError(f"Config file not found: {config_file}")
-
-        evaluate_checkpoint(checkpoint_dir, config_file)
-        return
-
-    # Check if pushing to hub
-    push_to_hub = "--push-to-hub" in sys.argv
-    hub_model_id = None
-    if push_to_hub:
-        hub_idx = sys.argv.index("--push-to-hub") + 1
-        if hub_idx < len(sys.argv) and not sys.argv[hub_idx].startswith("--"):
-            hub_model_id = sys.argv[hub_idx]
-        else:
-            raise ValueError("--push-to-hub requires a model ID (e.g., username/model-name)")
-
-    # Initialize Accelerator
-    accelerator = Accelerator()
-
-    # Require a config file to be provided
-    if len(sys.argv) < 2 or sys.argv[1] != "--config":
-        raise ValueError(
-            "Config file is required!\n"
-            "Usage: accelerate launch train.py --config <config_file.json> [--push-to-hub <model_id>]\n"
-            "Example: accelerate launch train.py --config experiment_config.json --push-to-hub username/asr-model"
-        )
-
-    if len(sys.argv) < 3:
-        raise ValueError(
-            "Config file path is missing!\n"
-            "Usage: accelerate launch train.py --config <config_file.json>"
-        )
-
-    config_file = sys.argv[2]
-
-    # Parse configuration
-    model_args, data_args, training_args = parse_config(config_file)
-
-    # Override push_to_hub settings if specified via command line
-    if push_to_hub:
-        training_args.push_to_hub = True
-        training_args.hub_model_id = hub_model_id
-
-    # Initialize model
-    model, tokenizer = initialize_model(model_args)
-
-    # Load datasets
-    train_dataset, val_dataset = load_datasets(data_args)
-
-    # Setup trainer
-    trainer = setup_trainer(
-        model=model,
-        tokenizer=tokenizer,
-        training_args=training_args,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        model_args=model_args,
-        data_args=data_args,
-        accelerator=accelerator,
-    )
-
-    # Run training
-    if training_args.resume_from_checkpoint and os.path.exists(training_args.resume_from_checkpoint):
-        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    else:
-        trainer.train()
-
-    # Save final model
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()
 
-    # If push_to_hub was specified, the trainer will automatically push the final model
-
-
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("Usage: python train.py <config.json> [--eval <checkpoint_dir>]")
+        print("Examples:")
+        print("  Training: python train.py configs/experiment.json")
+        print("  Evaluation: python train.py configs/experiment.json --eval ./checkpoint-100")
+        sys.exit(1)
+
+    config_file = sys.argv[1]
+    if len(sys.argv) >= 4 and sys.argv[2] == "--eval":
+        checkpoint_dir = sys.argv[3]
+        evaluate_checkpoint(checkpoint_dir, config_file)
+    else:
+        main(config_file)

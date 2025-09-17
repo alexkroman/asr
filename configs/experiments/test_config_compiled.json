@@ -27,7 +27,7 @@
   "dataset_cache_dir": "./datasets_cache",
   "num_proc": 1,
 
-  "output_dir": "./test_output",
+  "output_dir": "./test_output_compiled",
   "overwrite_output_dir": true,
   "max_steps": 10,
   "per_device_train_batch_size": 1,
@@ -60,6 +60,6 @@
   "generation_max_length": 50,
   "test_checkpoint_loading": true,
   "resume_from_checkpoint": null,
-  "torch_compile": false,
-  "compile_mode": "default"
+  "torch_compile": true,
+  "compile_mode": "reduce-overhead"
 }

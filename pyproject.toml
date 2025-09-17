@@ -133,18 +133,19 @@ dependencies = [
 ]
 
 [tool.hatch.envs.default.scripts]
-# Training scripts
-train = "accelerate launch src/train.py --config {args:configs/experiments/small_test.json}"
-train-prod = "accelerate launch src/train.py --config configs/experiments/production.json"
-train-test = "accelerate launch src/train.py --config configs/experiments/test_config.json"
+# Training scripts - simplified JSON-only configuration
+train = "python src/train.py {args:configs/experiments/test_config.json}"
+train-prod = "accelerate launch src/train.py configs/experiments/production.json"
+train-test = "python src/train.py configs/experiments/test_config.json"
+train-compiled = "python src/train.py configs/experiments/test_config_compiled.json"
 
 # Mac-specific scripts
-train-mac = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/test_config.json"
-train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
+train-mac = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py configs/experiments/test_config.json"
+train-mac-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py configs/experiments/mac_minimal.json"
 
-# Evaluation
-eval = "python src/train.py --eval --checkpoint {args:./mac_minimal_output/checkpoint-8000} --config configs/experiments/mac_minimal.json"
-eval-mac = "python src/train.py --eval --checkpoint {args:./mac_minimal_output/checkpoint-8000} --config configs/experiments/mac_minimal.json"
+# Evaluation - simplified syntax
+eval = "python src/train.py {args:configs/experiments/test_config.json} --eval {args:./checkpoint-100}"
+eval-mac = "python src/train.py configs/experiments/mac_minimal.json --eval {args:./mac_minimal_output/checkpoint-8000}"
 
 # Development tools
 lint = [
@@ -200,10 +201,10 @@ HF_DATASETS_DOWNLOAD_WORKERS = "32"
 HF_DATASETS_IN_MEMORY_MAX_SIZE = "0"
 
 [tool.hatch.envs.cuda.scripts]
-train-production = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json"
-train-and-push = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py --config configs/experiments/production.json --push-to-hub {args:mazesmazes/asr}"
-eval-production = "python src/train.py --eval --checkpoint {args:./production_output/checkpoint-1000} --config configs/experiments/production.json"
-eval = "python src/train.py --eval --checkpoint {args} --config configs/experiments/production.json"
+train-production = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py configs/experiments/production.json"
+train-production-nocompile = "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40_optimized.yaml src/train.py configs/experiments/production_nocompile.json"
+eval-production = "python src/train.py configs/experiments/production.json --eval {args:./production_output/checkpoint-1000}"
+eval = "python src/train.py configs/experiments/production.json --eval {args}"
 
 [tool.hatch.envs.mac]
 template = "default"
@@ -215,11 +216,12 @@ TOKENIZERS_PARALLELISM = "false"
 MPS_ALLOCATOR_POLICY = "default"
 
 [tool.hatch.envs.mac.scripts]
-train-development = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json}"
-train-minimal = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config configs/experiments/mac_minimal.json"
+train = "python src/train.py {args:configs/experiments/test_config.json}"
+train-minimal = "python src/train.py configs/experiments/mac_minimal.json"
+train-compiled = "python src/train.py configs/experiments/test_config_compiled.json"
+eval = "python src/train.py {args:configs/experiments/test_config.json} --eval {args:./checkpoint-100}"
 
-[tool.hatch.scripts]
-eval = "accelerate launch --config_file configs/accelerate/accelerate_config_mac.yaml src/train.py --config {args:configs/experiments/test_config.json} --eval-only"
+# Global scripts can be defined here if needed
 
 [tool.hatch.envs.test]
 dependencies = [
