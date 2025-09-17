@@ -4,14 +4,13 @@ services:
   train:
     build:
       context: .
-      dockerfile: Dockerfile.simple
+      dockerfile: Dockerfile
     image: asr-training:latest
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_HOME=/workspace/.cache/huggingface
       - HF_DATASETS_CACHE=/workspace/datasets
-      - WANDB_API_KEY=${WANDB_API_KEY}
     volumes:
       - ./data:/workspace/data
       - ./outputs:/workspace/outputs
@@ -21,8 +20,24 @@ services:
     command: ["+experiments=production"]
 
   train-dev:
-    extends: train
-    command: ["+experiments=test", "training.max_steps=100"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    image: asr-training:latest-arm64
+    environment:
+      - HF_HOME=/workspace/.cache/huggingface
+      - HF_DATASETS_CACHE=/workspace/datasets
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+      - PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+    volumes:
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - ~/.cache/huggingface:/workspace/.cache/huggingface
+      - ./datasets_cache:/workspace/datasets_cache
+    shm_size: '8gb'
+    command: ["hatch", "run", "train-mac"]
     profiles: ["dev"]
 
   tensorboard:

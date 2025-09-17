@@ -8,6 +8,6 @@ defaults:
 # Mac-specific overrides
 training:
   output_dir: ./outputs/mac_minimal_model
-  max_steps: 25000
-  eval_steps: 1000
-  save_steps: 1000
+  max_steps: 100
+  eval_steps: 100
+  save_steps: 100
