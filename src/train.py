@@ -481,12 +481,23 @@ class ConformerEncoder(nn.Module):
 
 
 class AudioProjector(nn.Module):
-    """Simple 2-layer MLP projector for audio features."""
+    """Simple 2-layer MLP projector for audio features with careful initialization."""
     def __init__(self, audio_dim: int, text_dim: int, config: ModelArguments):
         super().__init__()
         self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
         self.act = nn.GELU()
         self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
+
+        # Initialize weights conservatively for stability (Qwen-style)
+        with torch.no_grad():
+            # Xavier uniform with very small gain to prevent gradient explosion
+            # This is critical for stable training when connecting frozen encoder to trainable decoder
+            nn.init.xavier_uniform_(self.linear_1.weight, gain=0.02)
+            nn.init.xavier_uniform_(self.linear_2.weight, gain=0.02)
+
+            # Zero bias initialization is often more stable than random
+            nn.init.zeros_(self.linear_1.bias)
+            nn.init.zeros_(self.linear_2.bias)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         hidden_states = self.linear_1(audio_features)
@@ -598,8 +609,80 @@ class ASRModel(nn.Module):
         self.audio_projector = AudioProjector(audio_dim, text_dim, config)
         self.spec_augment = SpecAugment()
 
+        # Add audio-specific special tokens
+        self.add_audio_special_tokens()
+
         # Initialize weights with smaller values for stability
         self._init_weights()
+
+    def add_audio_special_tokens(self):
+        """Add audio-specific special tokens for better audio-text alignment."""
+        special_tokens = {
+            "additional_special_tokens": [
+                "<|audio_start|>",
+                "<|audio_end|>",
+                "<|audio_pad|>",
+                "<|audio_sep|>",  # For potential future multi-audio support
+            ]
+        }
+
+        # Add special tokens to tokenizer
+        num_added = self.decoder.tokenizer.add_special_tokens(special_tokens)
+
+        if num_added > 0:
+            # Resize model embeddings to accommodate new tokens
+            self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer))
+
+            # Initialize new token embeddings with small random values
+            with torch.no_grad():
+                embeddings = self.decoder.model.get_input_embeddings()
+                if embeddings is not None and hasattr(embeddings, "weight"):
+                    # Initialize new tokens with small random values
+                    embeddings.weight[-num_added:].normal_(mean=0.0, std=0.02)
+
+        # Store token IDs for use in forward pass
+        self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
+        self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
+        self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+
+    def create_audio_attention_mask(self, audio_len: int, text_len: int, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Create Qwen-style attention mask where:
+        - Audio tokens can attend to each other bidirectionally
+        - Text tokens use causal masking
+        - Text tokens can attend to all audio tokens
+
+        Args:
+            audio_len: Length of audio sequence (including special tokens)
+            text_len: Length of text sequence
+            batch_size: Batch size
+            device: Device to create mask on
+
+        Returns:
+            Attention mask of shape (batch_size, 1, total_len, total_len) for compatibility
+            with HuggingFace transformers
+        """
+        total_len = audio_len + text_len
+
+        # Create base mask - all ones (all tokens can attend to each other initially)
+        mask = torch.ones((total_len, total_len), dtype=torch.float32, device=device)
+
+        # Apply causal masking ONLY to the text portion
+        # Text tokens cannot attend to future text tokens
+        text_start = audio_len
+        for i in range(text_start, total_len):
+            mask[i, i+1:] = 0
+
+        # The mask now has:
+        # - Full attention (bidirectional) for audio tokens to all audio tokens
+        # - Full attention from text tokens to all audio tokens
+        # - Causal attention for text tokens to text tokens
+
+        # Expand to batch size and add the num_heads dimension
+        # Shape: (batch_size, 1, total_len, total_len)
+        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
+        return mask
 
     def _init_weights(self):
         """Initialize weights with more conservative values to prevent gradient explosion."""
@@ -702,38 +785,115 @@ class ASRModel(nn.Module):
         audio_prefix = self.audio_projector(audio_features)
 
         embeddings = self.decoder.model.get_input_embeddings()
+        batch_size = audio_prefix.shape[0]
+        device = audio_prefix.device
+
         if labels is not None and callable(embeddings):
+            # Create special token tensors
+            audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
+                                           dtype=torch.long, device=device)
+            audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
+                                         dtype=torch.long, device=device)
+
+            # Get embeddings for special tokens and text
+            audio_start_embeds = embeddings(audio_start_tokens)
+            audio_end_embeds = embeddings(audio_end_tokens)
             text_embeds = embeddings(labels)
 
             # Convert audio_prefix to same dtype as text embeddings
             if audio_prefix.dtype != text_embeds.dtype:
                 audio_prefix = audio_prefix.to(text_embeds.dtype)
 
-            combined_embeds = torch.cat([audio_prefix, text_embeds], dim=1)
+            # Combine: <audio_start> [audio_features] <audio_end> [text]
+            combined_embeds = torch.cat([
+                audio_start_embeds,
+                audio_prefix,
+                audio_end_embeds,
+                text_embeds
+            ], dim=1)
+
+            # Calculate lengths for custom attention mask
+            audio_total_len = 1 + audio_prefix.shape[1] + 1  # start + features + end
+            text_len = labels.shape[1]
+
+            # Create Qwen-style attention mask with bidirectional audio and causal text
+            # This creates a 4D mask that some models support for custom attention patterns
+            custom_attention_mask = self.create_audio_attention_mask(
+                audio_len=audio_total_len,
+                text_len=text_len,
+                batch_size=batch_size,
+                device=device
+            )
+
+            # For models that don't support 4D masks, we'll also create a standard 2D mask
+            # as a fallback (indicates which positions have real tokens vs padding)
+            if attention_mask is not None:
+                # Combine audio masks with provided text attention mask
+                audio_start_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+                audio_mask = torch.ones(audio_prefix.shape[:2], dtype=torch.long, device=device)
+                audio_end_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+                standard_attention_mask = torch.cat([
+                    audio_start_mask,
+                    audio_mask,
+                    audio_end_mask,
+                    attention_mask
+                ], dim=1)
+            else:
+                # All positions are valid (no padding)
+                standard_attention_mask = torch.ones(
+                    (batch_size, audio_total_len + text_len), dtype=torch.long, device=device
+                )
+
+            # Use standard 2D mask for now (most compatible)
+            # For models that support 4D attention masks (like some Qwen variants),
+            # you can use: combined_attention_mask = custom_attention_mask
+            # This would enable bidirectional attention for audio and causal for text
+            combined_attention_mask = standard_attention_mask
+
+            # Uncomment to use custom attention pattern (if model supports 4D masks):
+            # combined_attention_mask = custom_attention_mask
+
+            # Create labels: mask audio tokens with -100
+            audio_start_labels = torch.full((batch_size, 1), -100, dtype=labels.dtype, device=device)
+            audio_prefix_labels = torch.full(audio_prefix.shape[:2], -100, dtype=labels.dtype, device=device)
+            audio_end_labels = torch.full((batch_size, 1), -100, dtype=labels.dtype, device=device)
+
+            combined_labels = torch.cat([
+                audio_start_labels,
+                audio_prefix_labels,
+                audio_end_labels,
+                labels
+            ], dim=1)
         else:
-            # Convert to decoder dtype when no labels
+            # Inference mode: only use audio with boundary tokens
+            audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
+                                           dtype=torch.long, device=device)
+            audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
+                                         dtype=torch.long, device=device)
+
+            audio_start_embeds = embeddings(audio_start_tokens)
+            audio_end_embeds = embeddings(audio_end_tokens)
+
+            # Convert to decoder dtype
             decoder_dtype = next(self.decoder.model.parameters()).dtype
             if audio_prefix.dtype != decoder_dtype:
                 audio_prefix = audio_prefix.to(decoder_dtype)
-            combined_embeds = audio_prefix
+            if audio_start_embeds.dtype != decoder_dtype:
+                audio_start_embeds = audio_start_embeds.to(decoder_dtype)
+            if audio_end_embeds.dtype != decoder_dtype:
+                audio_end_embeds = audio_end_embeds.to(decoder_dtype)
 
-        audio_mask = torch.ones(
-            audio_prefix.shape[:2], dtype=torch.long, device=input_values.device
-        )
-        if attention_mask is not None and labels is not None:
-            combined_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
-        else:
-            combined_attention_mask = audio_mask
+            combined_embeds = torch.cat([
+                audio_start_embeds,
+                audio_prefix,
+                audio_end_embeds
+            ], dim=1)
 
-        if labels is not None:
-            prefix_labels = torch.full(
-                audio_prefix.shape[:2],
-                fill_value=-100,
-                dtype=labels.dtype,
-                device=labels.device,
+            # Create attention mask
+            combined_attention_mask = torch.ones(
+                combined_embeds.shape[:2], dtype=torch.long, device=device
             )
-            combined_labels = torch.cat([prefix_labels, labels], dim=1)
-        else:
+
             combined_labels = None
 
         outputs = self.decoder.model.forward(
@@ -763,54 +923,125 @@ class ASRModel(nn.Module):
         self,
         input_values: torch.Tensor,
         input_lengths: torch.Tensor,
-        **kwargs: Dict[str, Union[int, float, torch.Tensor]],
+        max_new_tokens: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        do_sample: bool = True,
+        **kwargs
     ) -> torch.Tensor:
-        # Process through encoder (encoder handles its own dtype internally)
-        audio_features = self.encoder(input_values, input_lengths)
+        """
+        Generate text transcription from audio input with special tokens.
 
-        # Project audio features to text embedding dimension
+        Args:
+            input_values: Mel-spectrogram of shape (batch, n_mels, time)
+            input_lengths: Lengths of input sequences
+            max_new_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p (nucleus) sampling parameter
+            do_sample: Whether to use sampling or greedy decoding
+            **kwargs: Additional arguments for generate method
+
+        Returns:
+            Generated token IDs
+        """
+        # Process audio through encoder with SDPA optimization
+        if input_values.is_cuda:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
+            ):
+                audio_features = self.encoder(input_values, input_lengths)
+        else:
+            audio_features = self.encoder(input_values, input_lengths)
+
+        # Project audio features to text embedding space
         audio_prefix = self.audio_projector(audio_features)
 
-        # Ensure audio_prefix matches decoder's dtype (explicitly set to bfloat16 in __init__)
-        decoder_dtype = next(self.decoder.model.parameters()).dtype
-        audio_prefix = audio_prefix.to(dtype=decoder_dtype)
-
-        # Create BOS token to start generation
+        # Setup for generation
         batch_size = audio_prefix.shape[0]
         device = audio_prefix.device
-
-        # Get BOS token ID (use pad token if no BOS token)
-        bos_token_id = self.decoder.tokenizer.bos_token_id
-        if bos_token_id is None:
-            bos_token_id = self.decoder.tokenizer.pad_token_id
-
-        # Create decoder input IDs with BOS token
-        decoder_input_ids = torch.full(
-            (batch_size, 1),
-            bos_token_id,
-            dtype=torch.long,
-            device=device
-        )
-
-        # Get BOS embeddings
         embeddings = self.decoder.model.get_input_embeddings()
-        bos_embeds = embeddings(decoder_input_ids)
 
-        # Concatenate audio prefix with BOS token
-        combined_embeds = torch.cat([audio_prefix, bos_embeds], dim=1)
+        # Create special token embeddings for better structure
+        audio_start_tokens = torch.full((batch_size, 1), self.audio_start_id,
+                                       dtype=torch.long, device=device)
+        audio_end_tokens = torch.full((batch_size, 1), self.audio_end_id,
+                                     dtype=torch.long, device=device)
 
-        # Create attention mask for the combined embeddings
-        attention_mask = torch.ones(
-            combined_embeds.shape[:2],
-            dtype=torch.long,
-            device=device
-        )
+        audio_start_embeds = embeddings(audio_start_tokens)
+        audio_end_embeds = embeddings(audio_end_tokens)
 
+        # Add BOS token if it exists (for generation start)
+        if self.decoder.tokenizer.bos_token_id is not None:
+            bos_tokens = torch.full((batch_size, 1), self.decoder.tokenizer.bos_token_id,
+                                   dtype=torch.long, device=device)
+            bos_embeds = embeddings(bos_tokens)
+
+            # Combine: <audio_start> [features] <audio_end> <bos>
+            combined_embeds = torch.cat([
+                audio_start_embeds,
+                audio_prefix,
+                audio_end_embeds,
+                bos_embeds
+            ], dim=1)
+        else:
+            # No BOS token: <audio_start> [features] <audio_end>
+            combined_embeds = torch.cat([
+                audio_start_embeds,
+                audio_prefix,
+                audio_end_embeds
+            ], dim=1)
+
+        # Ensure correct dtype
+        decoder_dtype = next(self.decoder.model.parameters()).dtype
+        if combined_embeds.dtype != decoder_dtype:
+            combined_embeds = combined_embeds.to(decoder_dtype)
+
+        # Create attention mask (all positions are valid)
+        attention_mask = torch.ones(combined_embeds.shape[:2], dtype=torch.long, device=device)
+
+        # Set generation parameters
+        generation_config = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "do_sample": do_sample,
+            "pad_token_id": self.decoder.tokenizer.pad_token_id,
+            "eos_token_id": self.decoder.tokenizer.eos_token_id,
+        }
+
+        # Merge with any additional kwargs
+        generation_config.update(kwargs)
+
+        # Generate tokens
         return self.decoder.model.generate(
             inputs_embeds=combined_embeds,
             attention_mask=attention_mask,
-            **kwargs
+            **generation_config
         )
+
+    def transcribe(self, input_values: torch.Tensor, input_lengths: torch.Tensor, **kwargs) -> List[str]:
+        """
+        Convenience method to generate and decode transcriptions.
+
+        Args:
+            input_values: Mel-spectrogram input
+            input_lengths: Input lengths
+            **kwargs: Generation parameters
+
+        Returns:
+            List of decoded transcription strings
+        """
+        # Generate tokens
+        generated_tokens = self.generate(input_values, input_lengths, **kwargs)
+
+        # Decode to text, skipping special tokens
+        transcriptions = self.decoder.tokenizer.batch_decode(
+            generated_tokens,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+
+        return transcriptions
 
 
 @dataclass
