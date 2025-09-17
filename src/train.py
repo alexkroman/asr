@@ -480,7 +480,7 @@ class SmolLM2Decoder(nn.Module):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name, token=False)
 
-        # Handle padding token configuration
+        # Handle padding token configuration first
         if self.tokenizer.pad_token is None:
             # Check if model already has a pad token configured
             if hasattr(self.model.config, 'pad_token_id') and self.model.config.pad_token_id is not None:
@@ -532,8 +532,24 @@ class SmolLM2Decoder(nn.Module):
                 # Initialize new token embedding as mean of existing embeddings
                 embedding_weight.data[-1] = embedding_weight.data[:-1].mean(dim=0)
 
-        # Update model config
+        # Update model config and generation config to sync with tokenizer
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+        # For models where tokenizer doesn't have BOS but model expects it
+        # (e.g., Qwen models), we can use the pad token as BOS
+        if self.tokenizer.bos_token_id is None and hasattr(self.model.config, 'bos_token_id'):
+            # Use pad token as BOS token (common practice)
+            self.tokenizer.bos_token = self.tokenizer.pad_token
+            self.tokenizer.bos_token_id = self.tokenizer.pad_token_id
+
+        # Update generation config if it exists (standard HuggingFace approach)
+        if hasattr(self.model, 'generation_config'):
+            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
+            # Set BOS/EOS tokens based on what's available in the tokenizer
+            if self.tokenizer.bos_token_id is not None:
+                self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
+            if self.tokenizer.eos_token_id is not None:
+                self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
 
     def forward(self, **kwargs):
         """Simple forward pass through the decoder model."""
@@ -546,9 +562,11 @@ class SmolLM2Decoder(nn.Module):
 class ASRModel(nn.Module):
     def __init__(self, config: ModelArguments) -> None:
         super().__init__()
-        self.config = config  # Store config for saving
+        self.model_args = config  # Store model args for saving
         self.encoder = ConformerEncoder(config)
         self.decoder = SmolLM2Decoder(config)
+        # Store the decoder's config as the model config for HuggingFace Trainer compatibility
+        self.config = self.decoder.model.config
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
         self.audio_projector = DeepAudioProjector(config.d_model, text_dim, config)
         self.spec_augment = SpecAugment()

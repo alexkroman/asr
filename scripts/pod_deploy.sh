@@ -21,7 +21,7 @@ ssh -p $SSH_PORT -i $SSH_KEY $SSH_USER@$SSH_HOST 'mkdir -p /workspace/src /works
 
 # Copy files to remote server
 scp -P $SSH_PORT -i $SSH_KEY pyproject.toml README.md .env $SSH_USER@$SSH_HOST:/workspace/
-scp -P $SSH_PORT -i $SSH_KEY scripts/install-deps.sh scripts/push_to_hub.py $SSH_USER@$SSH_HOST:/workspace/scripts/
+scp -P $SSH_PORT -i $SSH_KEY scripts/install-deps.sh $SSH_USER@$SSH_HOST:/workspace/scripts/
 scp -P $SSH_PORT -i $SSH_KEY src/train.py src/__init__.py $SSH_USER@$SSH_HOST:/workspace/src/
 scp -P $SSH_PORT -i $SSH_KEY configs/accelerate/a40_optimized.yaml $SSH_USER@$SSH_HOST:/workspace/configs/accelerate/
 scp -P $SSH_PORT -i $SSH_KEY configs/experiments/production.json $SSH_USER@$SSH_HOST:/workspace/configs/experiments/

@@ -6,7 +6,7 @@
   "kernel_size": 15,
   "conformer_dropout": 0.15,
 
-  "decoder_model_name": "HuggingFaceTB/SmolLM2-360M-Instruct",
+  "decoder_model_name": "Qwen/Qwen3-0.6B",
   "use_lora": true,
   "lora_r": 128,
   "lora_alpha": 64,
