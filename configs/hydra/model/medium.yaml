@@ -1,10 +1,10 @@
-# Large model configuration
-decoder_model_name: Qwen/Qwen2.5-1.5B-Instruct
+# Medium model configuration
+decoder_model_name: Qwen/Qwen2.5-0.5B-Instruct
 
 # LoRA configuration
 use_lora: true
-lora_r: 32
-lora_alpha: 12
+lora_r: 16
+lora_alpha: 32
 lora_dropout: 0.05
 lora_target_modules:
   - q_proj

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🎙️ Conformer-SmolLM2 ASR - Hydra Version
-Training script using Hydra for configuration management.
+🎙️ ASR Training - Hydra Version
+Training script using Hydra for configuration management with Whisper encoder and Qwen decoder.
 """
 
 import os
@@ -27,7 +27,7 @@ from transformers import (
     WhisperModel,
 )
 
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
 
 # Minimal environment setup - Accelerate handles the rest
 workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
@@ -38,7 +38,6 @@ os.environ["HF_DATASETS_CACHE"] = os.environ.get(
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 warnings.filterwarnings("ignore")
-
 
 class WhisperEncoder(nn.Module):
     """Frozen Whisper encoder wrapper."""
@@ -100,7 +99,7 @@ class AudioProjector(nn.Module):
 
     def __init__(self, audio_dim: int, text_dim: int, config: DictConfig):
         super().__init__()
-        self.norm = LlamaRMSNorm(audio_dim, eps=1e-6)
+        self.norm = RMSNorm(audio_dim, eps=1e-6)
 
         self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
         self.act = nn.GELU()
@@ -119,7 +118,7 @@ class AudioProjector(nn.Module):
         return hidden_states
 
 
-class SmolLM2Decoder(nn.Module):
+class LLMDecoder(nn.Module):
     def __init__(self, config: DictConfig):
         super().__init__()
         self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
@@ -170,7 +169,7 @@ class ASRModel(PreTrainedModel):
 
     base_model_prefix = "asr"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["WhisperEncoder", "SmolLM2Decoder", "AudioProjector"]
+    _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
 
     def __init__(self, config: DictConfig) -> None:
         # Create a minimal config for PreTrainedModel
@@ -181,7 +180,7 @@ class ASRModel(PreTrainedModel):
 
         self.hydra_config = config
         self.encoder = WhisperEncoder(config)
-        self.decoder = SmolLM2Decoder(config)
+        self.decoder = LLMDecoder(config)
         self.config = self.decoder.model.config
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
         audio_dim = self.encoder.d_model

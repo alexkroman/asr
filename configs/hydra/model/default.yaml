@@ -1,5 +1,5 @@
 # Model configuration
-decoder_model_name: HuggingFaceTB/SmolLM2-360M-Instruct
+decoder_model_name: Qwen/Qwen2.5-0.5B-Instruct
 
 # LoRA configuration
 use_lora: true
