@@ -139,7 +139,7 @@ format = [
 # Docker commands
 docker-build = "docker build --platform=linux/amd64 -f Dockerfile -t asr-training:latest ."
 docker-build-local = "docker build -f Dockerfile.local -t asr-training:local ."
-docker-push = "bash -c 'docker tag asr-training:latest ${DOCKER_REGISTRY}/asr-training:latest && docker push ${DOCKER_REGISTRY}/asr-training:latest'"
+docker-push = "bash -c 'docker tag asr-training:latest ghcr.io/alexkroman/asr-training:latest && docker push ghcr.io/alexkroman/asr-training:latest'"
 deploy-docker-local = "docker compose --profile dev up train-dev"
 
 [tool.hatch.envs.cuda]
@@ -147,7 +147,7 @@ template = "default"
 features = ["cuda", "optimized"]
 
 [tool.hatch.envs.cuda.env-vars]
-HF_HOME = "/workspace/.cache/huggingface"
+HF_HOME = "/workspace/.cache/huggin gface"
 HF_DATASETS_CACHE = "/workspace/datasets"
 TORCH_HOME = "/workspace/.cache/torch"
 HF_HUB_ENABLE_HF_TRANSFER = "1"
