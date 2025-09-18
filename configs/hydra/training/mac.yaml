@@ -47,19 +47,15 @@ push_to_hub: false
 dataloader_num_workers: 0  # Important for Mac
 gradient_checkpointing: true
 fp16: false
-bf16: true
+bf16: false
 dataloader_pin_memory: false  # Important for Mac
 max_grad_norm: 1.0
 
 # Misc
 seed: 42
 save_safetensors: false  # Faster on Mac
-# generation_max_length: 10  # Not a valid TrainingArguments parameter
 disable_tqdm: false
 log_level: info
-# use_cache: false  # Not a valid TrainingArguments parameter
-compute_metrics: true
-predict_with_generate: false
 
 # Required by HF Trainer
 remove_unused_columns: false

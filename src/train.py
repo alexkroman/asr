@@ -519,7 +519,7 @@ def main(cfg: DictConfig) -> None:
         ),
         tokenizer=tokenizer,
         compute_metrics=compute_metrics_with_samples,
-        callbacks=[prediction_callback] if cfg.training.compute_metrics else [],
+        callbacks=[prediction_callback],
     )
 
     trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)

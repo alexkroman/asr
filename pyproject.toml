@@ -140,7 +140,7 @@ format = [
 docker-build = "docker build --platform=linux/amd64 -f Dockerfile -t asr-training:latest ."
 docker-build-local = "docker build -f Dockerfile.local -t asr-training:local ."
 docker-push = "bash -c 'docker tag asr-training:latest ghcr.io/alexkroman/asr-training:latest && docker push ghcr.io/alexkroman/asr-training:latest'"
-deploy-docker-local = "docker compose --profile dev up train-dev"
+docker-local = "docker compose --profile dev up train-dev"
 
 # RunPod commands
 create-a20 = 'runpodctl create pod --name "ASR Training A20" --gpuType "NVIDIA RTX A5000" --templateId "29wto61thf"'
