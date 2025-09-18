@@ -21,8 +21,7 @@ COPY pyproject.toml uv.lock ./
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
 # Install dependencies using uv for reproducible builds
-RUN uv sync --frozen && \
-    uv pip install --no-cache-dir torchcodec
+RUN uv sync --frozen
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/

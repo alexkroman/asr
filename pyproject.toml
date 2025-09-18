@@ -19,9 +19,7 @@ classifiers = [
 dependencies = [
     # Core ML frameworks
     "torch>=2.0.0",
-    # Note: torchcodec is required but must be installed separately:
-    # pip install torchcodec (CPU) or
-    # pip install torchcodec --index-url=https://download.pytorch.org/whl/cu121 (CUDA)
+    "torchcodec",
     "transformers>=4.35.0",
     "accelerate>=0.24.0",
     "datasets>=2.14.0",

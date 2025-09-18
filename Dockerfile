@@ -1,4 +1,4 @@
-FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 AS base
+FROM runpod/base:1.0.0-ubuntu2404 AS base
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -21,8 +21,7 @@ COPY pyproject.toml uv.lock ./
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
 # Install dependencies using uv for reproducible builds
-RUN uv sync --frozen --extra cuda --extra optimized && \
-    uv pip install --no-cache torchcodec --index-url=https://download.pytorch.org/whl/cu121
+RUN uv sync --frozen --extra cuda --extra optimized
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
