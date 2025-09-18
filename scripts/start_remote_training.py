@@ -77,19 +77,33 @@ export NCCL_P2P_DISABLE=0  # Enable GPU peer-to-peer communication
 export NCCL_IB_DISABLE=0  # Enable InfiniBand if available
 {env_string}
 echo "===== Training Starting ====="
-echo "Starting training with experiment: {experiment}"
-echo "PATH: $PATH"
-echo "Working directory: $(pwd)"
-echo "Python: $(which python3)"
-echo "Python version: $(python3 --version)"
-echo "PyTorch version: $(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'Failed to import torch')"
-echo "CUDA available: $(python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'Failed to check CUDA')"
-echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "Experiment: {experiment}"
+echo "Python: $(python3 --version)"
+echo "CUDA available: $(python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null)"
 echo "============================="
 
+
+# Function to cleanup on exit
+cleanup() {{
+    echo "Cleaning up..."
+    exit
+}}
+
+# Set trap to cleanup on script exit
+trap cleanup EXIT INT TERM
+
 # Run the training command and capture any errors
-echo "Launching training with accelerate..."
-accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments={experiment} 2>&1
+echo "Launching training with experiment: {experiment}"
+
+# Start TensorBoard in background after we're in the right directory
+echo "Starting TensorBoard on port 6006..."
+(cd /workspace && nohup tensorboard --logdir=/workspace/outputs --port=6006 --bind_all > /tmp/tensorboard.log 2>&1 &)
+echo "TensorBoard started in background"
+echo "You can access TensorBoard by port-forwarding: ssh -L 6006:localhost:6006 -p {port} root@{host}"
+sleep 2  # Give TensorBoard a moment to start
+
+# Now run the training
+cd /workspace && accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments={experiment} 2>&1
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
@@ -99,8 +113,9 @@ else
     echo "===== Training Completed Successfully ====="
 fi
 
-# Keep the session alive for debugging
-echo "Session staying alive for debugging. Press Ctrl+C to exit."
+# Keep the session alive
+echo "Training session complete. TensorBoard is running on port 6006"
+echo "Press Ctrl+C to exit."
 sleep infinity
 """
 

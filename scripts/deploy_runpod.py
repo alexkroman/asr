@@ -47,6 +47,10 @@ apt-get update
 echo "Installing system dependencies..."
 apt-get install -y ffmpeg tmux rsync curl
 
+echo "Installing uv package manager..."
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
 echo "System setup complete!"
 """
 
@@ -55,13 +59,9 @@ echo "System setup complete!"
 {setup_script}
 EOF"""
 
-    try:
-        run_command(cmd)
-        print("Remote dependencies installed successfully!")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to install dependencies: {e}")
-        return False
+    run_command(cmd)
+    print("Remote dependencies installed successfully!")
+    return True
 
 
 def sync_project(host, port, project_root):
@@ -78,7 +78,7 @@ def sync_project(host, port, project_root):
         "--exclude=env",
         "--exclude=.env",
         "--exclude=.claude",  # Don't sync Claude settings
-        "--exclude=data/",  # Don't sync data directory
+        "--exclude=./data/",  # Don't sync root data directory but allow configs/hydra/data/
         "--exclude=datasets_cache/",  # Don't sync dataset cache
         "--exclude=outputs",
         "--exclude=logs",
@@ -109,29 +109,21 @@ def sync_project(host, port, project_root):
         -e "ssh -i ~/.ssh/id_ed25519 -p {port} -o StrictHostKeyChecking=no" \
         {project_root}/ root@{host}:/workspace/"""
 
-    try:
-        run_command(rsync_cmd)
-        print("Project synced successfully!")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to sync project: {e}")
-        return False
+    run_command(rsync_cmd)
+    print("Project synced successfully!")
+    return True
 
 
 def install_python_dependencies(host, port):
-    """Install Python dependencies using system pip on RunPod."""
+    """Install Python dependencies using uv on RunPod."""
     print("\nInstalling Python dependencies...")
 
-    # RunPod already has PyTorch installed, we just need the other packages
-    print("Checking existing PyTorch installation...")
+    # Display PyTorch version
+    print("Checking PyTorch installation...")
     cmd_check = f"""ssh -i ~/.ssh/id_ed25519 -p {port} -o StrictHostKeyChecking=no root@{host} \
         'python3 -c "import torch; print(\\"PyTorch \\" + torch.__version__ + \\" with CUDA \\" + str(torch.cuda.is_available()))" 2>&1'"""
-
-    try:
-        result = run_command(cmd_check, capture_output=True)
-        print(f"Found: {result}")
-    except subprocess.CalledProcessError:
-        print("Warning: Could not verify PyTorch installation")
+    result = run_command(cmd_check, capture_output=True)
+    print(f"Found: {result}")
 
     # Install only the packages not provided by RunPod
     required_packages = [
@@ -145,6 +137,7 @@ def install_python_dependencies(host, port):
         "omegaconf>=2.3.0",
         "hf-transfer",  # For fast HuggingFace downloads
         "ninja",  # For faster CUDA kernel compilation
+        "torchcodec",  # Required by datasets for audio decoding
     ]
 
     # These packages can speed up training but may require special installation
@@ -156,17 +149,19 @@ def install_python_dependencies(host, port):
 
     packages_str = " ".join(f'"{pkg}"' for pkg in required_packages)
 
-    print(f"Installing required packages: {', '.join(required_packages)}")
-    cmd = f"""ssh -i ~/.ssh/id_ed25519 -p {port} -o StrictHostKeyChecking=no root@{host} \
-        'pip3 install {packages_str} --upgrade 2>&1'"""
+    print(f"Installing: {', '.join(required_packages)}")
 
-    try:
-        run_command(cmd)
-        print("Python dependencies installed successfully!")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to install Python dependencies: {e}")
-        return False
+    # Use uv with --system to work with system Python and respect existing packages
+    # The --system flag tells uv to use the system Python instead of creating a venv
+    # This preserves the pre-installed CUDA-optimized PyTorch while installing our dependencies
+    cmd = f"""ssh -i ~/.ssh/id_ed25519 -p {port} -o StrictHostKeyChecking=no root@{host} \
+        'export PATH="/root/.local/bin:/root/.cargo/bin:$PATH" && \
+         echo "Using uv to install packages while preserving system PyTorch..." && \
+         uv pip install --system {packages_str} 2>&1'"""
+
+    run_command(cmd)
+    print("Python dependencies installed successfully!")
+    return True
 
 
 def main():
@@ -191,20 +186,15 @@ def main():
 
     # Setup remote dependencies
     if not args.skip_setup:
-        if not setup_remote_dependencies(args.host, args.port):
-            print("\nWarning: Some system dependencies may not have installed correctly.")
-            print("You can continue, but some features might not work.")
+        setup_remote_dependencies(args.host, args.port)
 
     # Sync project files
     if not args.skip_sync:
-        if not sync_project(args.host, args.port, project_root):
-            sys.exit(1)
+        sync_project(args.host, args.port, project_root)
 
     # Install Python dependencies
     if not args.skip_deps:
-        if not install_python_dependencies(args.host, args.port):
-            print("\nWarning: Python dependencies installation had issues.")
-            print("You may need to run 'uv sync' manually on the remote instance.")
+        install_python_dependencies(args.host, args.port)
 
     print("\n" + "="*50)
     print("Deployment complete!")

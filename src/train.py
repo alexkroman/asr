@@ -311,6 +311,7 @@ class DataCollator:
         valid_features = []
         for f in features:
             try:
+                # The audio is already properly handled by HuggingFace datasets
                 audio_array = f["audio"]["array"]
                 audio_len_sec = len(audio_array) / self.sample_rate
                 text_len_words = len(f["text"].split())
@@ -402,7 +403,8 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         train_dataset = dataset_dicts[0]["train"]
         val_dataset = dataset_dicts[0]["validation"]
 
-    # Ensure audio is decoded and resampled correctly
+    # Cast audio column to ensure proper sampling rate
+    # HuggingFace handles the decoding efficiently
     train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
     val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
 
@@ -517,7 +519,7 @@ def main(cfg: DictConfig) -> None:
             feature_extractor=feature_extractor,
             config=cfg,
         ),
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics_with_samples,
         callbacks=[prediction_callback],
     )
