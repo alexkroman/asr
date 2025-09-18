@@ -5,8 +5,8 @@ Training script using Hydra for configuration management with Whisper encoder an
 """
 
 import os
-import warnings
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import evaluate
 import hydra
@@ -16,6 +16,7 @@ import torch.nn as nn
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, TaskType, get_peft_model
+from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -27,15 +28,13 @@ from transformers import (
     WhisperFeatureExtractor,
     WhisperModel,
 )
-
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
-from torch.utils.tensorboard import SummaryWriter
 
 # Minimal environment setup - Accelerate handles the rest
-workspace_dir = "/workspace" if os.path.exists("/workspace") else os.path.expanduser("~/.cache")
+workspace_dir = "/workspace" if Path("/workspace").exists() else str(Path("~/.cache").expanduser())
 os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
 os.environ["HF_DATASETS_CACHE"] = os.environ.get(
-    "HF_DATASETS_CACHE", os.path.join(workspace_dir, "datasets")
+    "HF_DATASETS_CACHE", str(Path(workspace_dir) / "datasets")
 )
 
 class WhisperEncoder(nn.Module):
@@ -75,7 +74,7 @@ class WhisperEncoder(nn.Module):
             actual_output_frames = (original_time_frames + 1) // 2
             encoder_outputs = encoder_outputs[:, :actual_output_frames, :]
 
-        return encoder_outputs
+        return encoder_outputs  # type: ignore[no-any-return]
 
 
 class AudioProjector(nn.Module):
@@ -96,8 +95,7 @@ class AudioProjector(nn.Module):
         hidden_states = self.norm(audio_features)
         hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
-        return hidden_states
+        return self.linear_2(hidden_states)  # type: ignore[no-any-return]
 
 class LLMDecoder(nn.Module):
     def __init__(self, config: DictConfig):
@@ -117,7 +115,7 @@ class LLMDecoder(nn.Module):
         self.model.config.bos_token_id = self.tokenizer.bos_token_id
         self.model.config.eos_token_id = self.tokenizer.eos_token_id
 
-        if hasattr(self.model, "generation_config"):
+        if hasattr(self.model, "generation_config") and self.model.generation_config is not None:
             self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
             if self.tokenizer.bos_token_id is not None:
                 self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
@@ -257,14 +255,13 @@ class ASRModel(PreTrainedModel):
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
             labels = None
 
-        outputs = self.decoder.model(
+        return self.decoder.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             return_dict=True,
         )
 
-        return outputs
 
     @torch.no_grad()
     def generate(
@@ -293,7 +290,7 @@ class ASRModel(PreTrainedModel):
 
         inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
 
-        return self.decoder.model.generate(
+        return self.decoder.model.generate(  # type: ignore[no-any-return]
             inputs_embeds=inputs_embeds,
             max_new_tokens=max_new_tokens,
             pad_token_id=self.decoder.tokenizer.pad_token_id,
@@ -306,7 +303,7 @@ class DataCollator:
 
     def __init__(
         self,
-        tokenizer: AutoTokenizer,
+        tokenizer: Any,
         feature_extractor: WhisperFeatureExtractor,
         config: DictConfig,
     ):
@@ -355,7 +352,7 @@ class DataCollator:
             audio_arrays,
             sampling_rate=self.sample_rate,
             return_tensors="pt",
-            padding=True,
+            padding="longest",
         )
 
         padded_specs = audio_features.input_features
@@ -367,17 +364,16 @@ class DataCollator:
 
         labels = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt")
 
-        output_batch = {
+        return {
             "input_values": padded_specs,
             "input_lengths": input_lengths,
             "labels": labels["input_ids"],
             "attention_mask": labels["attention_mask"],
         }
 
-        return output_batch
 
 
-def initialize_model(config: DictConfig) -> Tuple[ASRModel, AutoTokenizer, WhisperFeatureExtractor]:
+def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
     """Initialize the ASR model, tokenizer, and feature extractor."""
     model = ASRModel(config)
     tokenizer = model.decoder.tokenizer
@@ -388,6 +384,7 @@ def initialize_model(config: DictConfig) -> Tuple[ASRModel, AutoTokenizer, Whisp
 def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
     """Load training and validation datasets."""
     import platform
+
     from datasets import Audio, concatenate_datasets
 
     safe_num_proc = 1 if platform.system() == "Darwin" else config.data.num_proc
@@ -450,7 +447,7 @@ class PredictionLoggingCallback(TrainerCallback):
 
                 # Create formatted text table for TensorBoard
                 text_table = "| Ground Truth | Prediction |\n|---|---|\n"
-                for i, (truth, pred) in enumerate(samples[:self.num_samples]):
+                for _i, (truth, pred) in enumerate(samples[:self.num_samples]):
                     # Escape markdown special characters
                     truth = truth.replace('|', '\\|').replace('\n', ' ')
                     pred = pred.replace('|', '\\|').replace('\n', ' ')
@@ -461,11 +458,19 @@ class PredictionLoggingCallback(TrainerCallback):
                     self.writer.flush()
 
 
-def compute_metrics(eval_pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict[str, float]:
+def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, float]:
     """Compute WER metric and store sample predictions."""
     predictions, label_ids = eval_pred.predictions, eval_pred.label_ids
+    # Handle tuple of arrays (logits, hidden_states)
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+
     if predictions.ndim == 3:
         predictions = np.argmax(predictions, axis=-1)
+    # Ensure label_ids is an array and create a copy
+    if isinstance(label_ids, tuple):
+        label_ids = label_ids[0]
+    label_ids = label_ids.copy()
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
@@ -497,7 +502,8 @@ def main(cfg: DictConfig) -> None:
     train_dataset, val_dataset = load_datasets(cfg)
 
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
-    training_args = TrainingArguments(**training_args_dict)
+    assert isinstance(training_args_dict, dict), "Training args must be a dict"
+    training_args = TrainingArguments(**training_args_dict)  # type: ignore[arg-type]
 
     prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=5)
 
