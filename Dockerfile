@@ -12,19 +12,17 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /workspace
 
-# Install uv and hatch for fast dependency management
-RUN pip install --no-cache-dir uv hatch
+# Install hatch for dependency management
+RUN pip install --no-cache-dir hatch
 
 # Copy dependency files first for better caching
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml hatch.toml ./
 # Create a minimal src/__init__.py for package installation
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
-# Install dependencies using uv for speed and reproducibility
-# First sync base dependencies from lock file
-RUN uv sync --frozen && \
-    uv pip install --no-cache torchcodec --index-url=https://download.pytorch.org/whl/cu121 && \
-    hatch env create cuda
+# Install dependencies using Hatch
+RUN hatch env create cuda && \
+    hatch run cuda:pip install --no-cache torchcodec --index-url=https://download.pytorch.org/whl/cu121
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
