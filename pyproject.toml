@@ -119,6 +119,7 @@ packages = ["src"]
 
 # Hatch environments
 [tool.hatch.envs.default]
+installer = "uv"
 dependencies = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
