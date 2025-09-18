@@ -36,5 +36,5 @@ ENV HF_DATASETS_DOWNLOAD_WORKERS=32
 ENV HF_DATASETS_IN_MEMORY_MAX_SIZE=0
 ENV OMP_NUM_THREADS=9
 
-# Run the training command directly
-ENTRYPOINT ["bash", "-c", "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments=production"]
+# Run the training command directly through uv
+# ENTRYPOINT ["uv", "run", "accelerate", "launch", "--config_file", "configs/accelerate/a40.yaml", "src/train.py", "+experiments=production"]
