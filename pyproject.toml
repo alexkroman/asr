@@ -163,7 +163,7 @@ template = "default"
 features = ["cuda", "optimized"]
 
 [tool.hatch.envs.cuda.env-vars]
-HF_HOME = "/workspace/.cache/huggin gface"
+HF_HOME = "/workspace/.cache/huggingface"
 HF_DATASETS_CACHE = "/workspace/datasets"
 TORCH_HOME = "/workspace/.cache/torch"
 HF_HUB_ENABLE_HF_TRANSFER = "1"

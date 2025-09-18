@@ -4,9 +4,7 @@
 Training script using Hydra for configuration management with Whisper encoder and Qwen decoder.
 """
 
-import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import evaluate
 import hydra
@@ -15,12 +13,13 @@ import torch
 import torch.nn as nn
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     EvalPrediction,
+    PretrainedConfig,
     PreTrainedModel,
     Trainer,
     TrainerCallback,
@@ -29,13 +28,6 @@ from transformers import (
     WhisperModel,
 )
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
-
-# Minimal environment setup - Accelerate handles the rest
-workspace_dir = "/workspace" if Path("/workspace").exists() else str(Path("~/.cache").expanduser())
-os.environ["HF_HOME"] = os.environ.get("HF_HOME", workspace_dir)
-os.environ["HF_DATASETS_CACHE"] = os.environ.get(
-    "HF_DATASETS_CACHE", str(Path(workspace_dir) / "datasets")
-)
 
 
 class WhisperEncoder(nn.Module):
@@ -101,7 +93,7 @@ class AudioProjector(nn.Module):
 class LLMDecoder(nn.Module):
     def __init__(self, config: DictConfig):
         super().__init__()
-        self.model: nn.Module = AutoModelForCausalLM.from_pretrained(
+        self.model: Union[PreTrainedModel, PeftModel, PeftMixedModel] = AutoModelForCausalLM.from_pretrained(
             config.model.decoder_model_name,
             dtype=torch.bfloat16,
             token=False,
@@ -142,7 +134,6 @@ class ASRModel(PreTrainedModel):
     _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
 
     def __init__(self, config: DictConfig) -> None:
-        from transformers import PretrainedConfig
 
         minimal_config = PretrainedConfig()
         super().__init__(minimal_config)
