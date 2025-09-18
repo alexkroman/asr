@@ -132,12 +132,13 @@ def install_python_dependencies(host, port):
         "datasets==3.6.0",
         "peft>=0.6.0",
         "evaluate>=0.4.0",
+        "jiwer>=3.0.0",  # For WER (Word Error Rate) calculation
         "tensorboard>=2.14.0",
         "hydra-core>=1.3.0",
         "omegaconf>=2.3.0",
         "hf-transfer",  # For fast HuggingFace downloads
         "ninja",  # For faster CUDA kernel compilation
-        "soundfile", 
+        "soundfile",
         "librosa" # Required by datasets for audio decoding
     ]
 

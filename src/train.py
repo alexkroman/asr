@@ -492,23 +492,26 @@ def main(cfg: DictConfig) -> None:
 
     print(OmegaConf.to_yaml(cfg))
 
-    if cfg.eval_checkpoint:
-        print(f"Evaluation mode: Loading checkpoint from {cfg.eval_checkpoint}")
-        # TODO: Implement evaluation logic
-        return
-
     model, tokenizer, feature_extractor = initialize_model(cfg)
     train_dataset, val_dataset = load_datasets(cfg)
 
+    if cfg.eval_checkpoint:
+        print(f"Evaluation mode: Loading checkpoint from {cfg.eval_checkpoint}")
+        # Load the checkpoint
+        from transformers import AutoModelForCausalLM
+        model = ASRModel.from_pretrained(cfg.eval_checkpoint)
+
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
     assert isinstance(training_args_dict, dict), "Training args must be a dict"
+    # Remove compute_metrics from training args as it's not a TrainingArguments parameter
+    compute_metrics_enabled = training_args_dict.pop("compute_metrics", True)
     training_args = TrainingArguments(**training_args_dict)  # type: ignore[arg-type]
 
     prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=5)
 
     # Custom compute metrics that stores samples
     def compute_metrics_with_samples(eval_pred):
-        if not cfg.training.compute_metrics:
+        if not compute_metrics_enabled:
             return None
         metrics = compute_metrics(eval_pred, tokenizer)
         if "_sample_predictions" in metrics:
@@ -530,8 +533,13 @@ def main(cfg: DictConfig) -> None:
         callbacks=[prediction_callback],
     )
 
-    trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
-    trainer.save_model()
+    if cfg.eval_checkpoint:
+        # Only run evaluation
+        results = trainer.evaluate()
+        print(f"Evaluation results: {results}")
+    else:
+        trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
+        trainer.save_model()
 
 
 if __name__ == "__main__":

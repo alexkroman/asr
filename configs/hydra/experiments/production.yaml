@@ -2,7 +2,7 @@
 
 defaults:
   - override /model: large
-  - override /data: full
+  - override /data: production_split
   - override /training: production
 
 # Production-specific overrides

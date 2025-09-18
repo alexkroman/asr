@@ -3,7 +3,7 @@ output_dir: ./outputs/production_model
 overwrite_output_dir: false
 
 # Training configuration
-max_steps: 50000
+max_steps: 20000
 per_device_train_batch_size: 8
 per_device_eval_batch_size: 8
 gradient_accumulation_steps: 4
@@ -32,13 +32,14 @@ report_to:
 
 # Evaluation
 eval_strategy: steps
-eval_steps: 10
+eval_steps: 500
+compute_metrics: true
 
 # Saving
 save_strategy: steps
-save_steps: 1000
+save_steps: 500
 save_total_limit: 5
-load_best_model_at_end: true
+load_best_model_at_end: false
 metric_for_best_model: eval_loss
 greater_is_better: false
 
@@ -46,7 +47,7 @@ greater_is_better: false
 push_to_hub: false
 
 # Performance
-dataloader_num_workers: 8
+dataloader_num_workers: 6
 gradient_checkpointing: true
 fp16: false
 bf16: true
