@@ -66,13 +66,9 @@ export TORCH_HOME=/workspace/.cache/torch
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export HF_DATASETS_DOWNLOAD_WORKERS=32
 export HF_DATASETS_IN_MEMORY_MAX_SIZE=0
-export OMP_NUM_THREADS=9
 
-# Performance optimizations
-export CUDA_LAUNCH_BLOCKING=0  # Async CUDA operations
 export TOKENIZERS_PARALLELISM=false  # Disable parallel tokenization to avoid deadlocks
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512  # Better memory management
-export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"  # Support various GPU architectures
 export NCCL_P2P_DISABLE=0  # Enable GPU peer-to-peer communication
 export NCCL_IB_DISABLE=0  # Enable InfiniBand if available
 {env_string}

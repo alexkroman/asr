@@ -83,6 +83,7 @@ class LLMDecoder(nn.Module):
             config.model.decoder_model_name,
             dtype=torch.bfloat16,
             token=False,
+            use_cache=False,  # Disable KV cache for training (incompatible with gradient checkpointing)
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model.decoder_model_name, token=False)
 
@@ -278,96 +279,79 @@ class ASRModel(PreTrainedModel):
         )
 
 
-def preprocess_audio_text(
-    examples: Dict[str, Any],
-    feature_extractor: WhisperFeatureExtractor,
-    tokenizer: Any,
-    sample_rate: int,
-) -> Dict[str, Any]:
-    """Preprocess audio and text examples for the dataset."""
-    audio_arrays = [x["array"] for x in examples["audio"]]
-
-    # Process audio with feature extractor
-    audio_features = feature_extractor(
-        audio_arrays,
-        sampling_rate=sample_rate,
-        return_attention_mask=True,
-        return_tensors="pt",
-        padding="longest",
-    )
-
-    # Process text with tokenizer
-    text_outputs = tokenizer(
-        examples["text"],
-        padding="longest",
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    return {
-        "input_values": audio_features.input_features,
-        "encoder_attention_mask": audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None,
-        "labels": text_outputs["input_ids"],
-        "attention_mask": text_outputs["attention_mask"],
-    }
-
-
 class DataCollator:
-    """Simple data collator that only handles batching and padding."""
+    """Data collator that performs preprocessing on-the-fly."""
 
     def __init__(
         self,
         tokenizer: Any,
         feature_extractor: WhisperFeatureExtractor,
+        config: DictConfig,
     ):
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor
-        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.sample_rate = config.data.sample_rate
+        self.max_audio_seconds = config.data.max_audio_seconds
+        self.max_text_words = config.data.max_text_words
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
-        # Stack tensors that are already preprocessed
-        batch = {}
-
-        # Get all keys from the first feature
-        keys = features[0].keys()
-
-        for key in keys:
-            if key == "encoder_attention_mask" and features[0][key] is None:
+        # Filter samples that are too long
+        valid_features = []
+        for f in features:
+            try:
+                audio_array = f["audio"]["array"]
+                audio_len_sec = len(audio_array) / self.sample_rate
+                text_len_words = len(f["text"].split())
+                if (
+                    audio_len_sec <= self.max_audio_seconds
+                    and text_len_words <= self.max_text_words
+                ):
+                    valid_features.append(f)
+            except Exception:
                 continue
 
-            if isinstance(features[0][key], torch.Tensor):
-                # Pad sequences to the same length within the batch
-                if key == "input_values":
-                    # Pad mel spectrograms along the time dimension
-                    max_len = max(f[key].shape[-1] for f in features)
-                    padded = []
-                    for f in features:
-                        spec = f[key]
-                        if spec.shape[-1] < max_len:
-                            pad_amount = max_len - spec.shape[-1]
-                            spec = torch.nn.functional.pad(spec, (0, pad_amount), value=0)
-                        padded.append(spec)
-                    batch[key] = torch.stack(padded)
-                elif key in ["labels", "attention_mask"]:
-                    # Pad text tokens
-                    max_len = max(f[key].shape[-1] for f in features)
-                    padded = []
-                    for f in features:
-                        seq = f[key]
-                        if seq.shape[-1] < max_len:
-                            pad_amount = max_len - seq.shape[-1]
-                            pad_value = self.pad_token_id if key == "labels" else 0
-                            seq = torch.nn.functional.pad(seq, (0, pad_amount), value=pad_value)
-                        padded.append(seq)
-                    batch[key] = torch.stack(padded)
-                else:
-                    # Stack other tensors directly
-                    batch[key] = torch.stack([f[key] for f in features])
-            else:
-                # Handle non-tensor values
-                batch[key] = [f[key] for f in features]
+        if not valid_features:
+            # Return a dummy batch if all samples were filtered
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            return {
+                "input_values": torch.zeros((1, 80, 3000)),
+                "encoder_attention_mask": torch.ones((1, 1500)),
+                "labels": torch.full((1, 10), pad_token_id, dtype=torch.long),
+                "attention_mask": torch.ones((1, 10), dtype=torch.long),
+            }
 
-        return batch
+        # Extract audio arrays and texts
+        audio_arrays = []
+        texts = []
+        for f in valid_features:
+            audio_arrays.append(f["audio"]["array"])
+            texts.append(f["text"])
+
+        # Process audio with feature extractor
+        # Whisper expects exactly 3000 frames (30 seconds at 16kHz)
+        audio_features = self.feature_extractor(
+            audio_arrays,
+            sampling_rate=self.sample_rate,
+            return_tensors="pt",
+            return_attention_mask=True,
+            padding="max_length",  # Pad to max_length
+            max_length=480000,  # 30 seconds * 16000 Hz = 480000 samples
+        )
+
+        # Process text with tokenizer
+        labels = self.tokenizer(
+            texts,
+            padding="longest",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        return {
+            "input_values": audio_features.input_features,
+            "encoder_attention_mask": audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None,
+            "labels": labels["input_ids"],
+            "attention_mask": labels["attention_mask"],
+        }
 
 
 def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
@@ -378,19 +362,10 @@ def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureE
     return model, tokenizer, feature_extractor
 
 
-def load_datasets(
-    config: DictConfig,
-    feature_extractor: WhisperFeatureExtractor,
-    tokenizer: Any
-) -> Tuple[Dataset, Dataset]:
-    """Load training and validation datasets with preprocessing."""
-    import platform
-
+def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
+    """Load training and validation datasets."""
     from datasets import Audio, concatenate_datasets
 
-    # Use multiprocessing for both filter and map operations
-    filter_num_proc = 1 if platform.system() == "Darwin" else config.data.num_proc
-    map_num_proc = 1  # Use single process for map operations to avoid tokenizer issues
     dataset_dicts = []
 
     for i, dataset_config in enumerate(config.data.dataset_configs):
@@ -403,7 +378,6 @@ def load_datasets(
             dataset_config,
             split={"train": train_split, "validation": eval_split},
             cache_dir=config.data.dataset_cache_dir,
-            num_proc=filter_num_proc,
         )
         dataset_dicts.append(ds_dict)
 
@@ -423,57 +397,6 @@ def load_datasets(
         )
     if config.data.max_eval_samples:
         val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
-
-    # Filter samples based on length constraints
-    def filter_by_length(example):
-        audio_len_sec = len(example["audio"]["array"]) / config.data.sample_rate
-        text_len_words = len(example["text"].split())
-        return (
-            audio_len_sec <= config.data.max_audio_seconds
-            and text_len_words <= config.data.max_text_words
-        )
-
-    train_dataset = train_dataset.filter(
-        filter_by_length,
-        num_proc=filter_num_proc,
-        load_from_cache_file=True,
-        desc="Filtering training data by length"
-    )
-    val_dataset = val_dataset.filter(
-        filter_by_length,
-        num_proc=filter_num_proc,
-        load_from_cache_file=True,
-        desc="Filtering validation data by length"
-    )
-
-    # Apply preprocessing
-    def preprocess_batch(examples):
-        return preprocess_audio_text(examples, feature_extractor, tokenizer, config.data.sample_rate)
-
-    # Remove original columns and keep only preprocessed features
-    columns_to_remove = train_dataset.column_names
-
-    train_dataset = train_dataset.map(
-        preprocess_batch,
-        batched=True,
-        remove_columns=columns_to_remove,
-        num_proc=map_num_proc,
-        load_from_cache_file=True,
-        desc="Preprocessing training data",
-    )
-
-    val_dataset = val_dataset.map(
-        preprocess_batch,
-        batched=True,
-        remove_columns=columns_to_remove,
-        num_proc=map_num_proc,
-        load_from_cache_file=True,
-        desc="Preprocessing validation data",
-    )
-
-    # Set format to PyTorch tensors
-    train_dataset.set_format(type="torch")
-    val_dataset.set_format(type="torch")
 
     return train_dataset, val_dataset
 
@@ -510,15 +433,17 @@ class PredictionLoggingCallback(TrainerCallback):
 def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, float]:
     """Compute WER metric and store sample predictions."""
     predictions, label_ids = eval_pred.predictions, eval_pred.label_ids
+
     if isinstance(predictions, tuple):
         predictions = predictions[0]
-
     if predictions.ndim == 3:
         predictions = np.argmax(predictions, axis=-1)
     if isinstance(label_ids, tuple):
         label_ids = label_ids[0]
+
     label_ids = label_ids.copy()
     label_ids[label_ids == -100] = tokenizer.pad_token_id
+
     decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
@@ -538,16 +463,39 @@ def main(cfg: DictConfig) -> None:
 
     print(OmegaConf.to_yaml(cfg))
 
-    model, tokenizer, feature_extractor = initialize_model(cfg)
-    train_dataset, val_dataset = load_datasets(cfg, feature_extractor, tokenizer)
+    # Enable TensorFloat32 for better performance on Ampere and newer GPUs
+    torch.set_float32_matmul_precision('high')
 
+    model, tokenizer, feature_extractor = initialize_model(cfg)
+    train_dataset, val_dataset = load_datasets(cfg)
+
+    # Handle checkpoint loading for evaluation or resuming
     if cfg.eval_checkpoint:
         print(f"Evaluation mode: Loading checkpoint from {cfg.eval_checkpoint}")
         model = ASRModel.from_pretrained(cfg.eval_checkpoint)
+    elif cfg.resume_from_checkpoint:
+        print(f"Resuming training from checkpoint: {cfg.resume_from_checkpoint}")
+        # The Trainer will handle loading optimizer and scheduler states
+
+    # Apply torch.compile for faster training (PyTorch 2.0+)
+    if hasattr(cfg.training, 'use_torch_compile') and cfg.training.use_torch_compile:
+        try:
+            print("Compiling model with torch.compile for optimized performance...")
+            compile_mode = cfg.training.get('torch_compile_mode', 'reduce-overhead')
+            model = torch.compile(model, mode=compile_mode)
+            print(f"Model compiled with mode: {compile_mode}")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
+            print("Continuing without compilation...")
 
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
     assert isinstance(training_args_dict, dict), "Training args must be a dict"
+
+    # Pop custom fields that aren't part of TrainingArguments
     compute_metrics_enabled = training_args_dict.pop("compute_metrics", True)
+    training_args_dict.pop("use_torch_compile", None)  # Remove torch compile config
+    training_args_dict.pop("torch_compile_mode", None)  # Remove torch compile mode
+
     training_args = TrainingArguments(**training_args_dict)  # type: ignore[arg-type]
 
     prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=10)
@@ -568,6 +516,7 @@ def main(cfg: DictConfig) -> None:
         data_collator=DataCollator(
             tokenizer=tokenizer,
             feature_extractor=feature_extractor,
+            config=cfg,
         ),
         processing_class=tokenizer,
         compute_metrics=compute_metrics_with_samples,

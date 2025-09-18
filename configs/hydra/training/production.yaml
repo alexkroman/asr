@@ -4,7 +4,7 @@ overwrite_output_dir: false
 
 # Training configuration
 max_steps: 20000
-per_device_train_batch_size: 8
+per_device_train_batch_size: 4
 per_device_eval_batch_size: 8
 gradient_accumulation_steps: 4
 eval_accumulation_steps: 1
@@ -46,12 +46,16 @@ greater_is_better: false
 push_to_hub: false
 
 # Performance
-dataloader_num_workers: 6
-gradient_checkpointing: true
+dataloader_num_workers: 20  # Optimized for Xeon Gold 6342 (24 cores)
+gradient_checkpointing: false
 fp16: false
 bf16: true
 dataloader_pin_memory: true
 max_grad_norm: 1.0
+
+# Torch compile (PyTorch 2.0+)
+use_torch_compile: false  # Disabled - incompatible with current model architecture
+torch_compile_mode: default  # Options: default, reduce-overhead, max-autotune
 
 # Misc
 seed: 42

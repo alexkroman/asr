@@ -51,6 +51,10 @@ bf16: true
 dataloader_pin_memory: true
 max_grad_norm: 1.0
 
+# Torch compile (PyTorch 2.0+)
+use_torch_compile: false  # Disabled by default
+torch_compile_mode: default  # Options: default, reduce-overhead, max-autotune
+
 # Misc
 seed: 42
 save_safetensors: true
