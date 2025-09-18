@@ -68,7 +68,7 @@ The training script (`src/train.py`) uses Hugging Face's Trainer API with custom
 For Mac development:
 - `PYTORCH_ENABLE_MPS_FALLBACK=1` - Enable fallback for unsupported MPS operations
 - `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0` - Optimize MPS memory usage
-- `TOKENIZERS_PARALLELISM=false` - Avoid tokenizer warnings
+- `TOKENIZERS_PARALLELISM=false` - Disable parallel tokenization to avoid deadlocks with multiprocessing
 
 For RunPod/CUDA:
 - `HF_HOME=/workspace/.cache/huggingface` - Cache directory

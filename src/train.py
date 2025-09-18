@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-🎙️ ASR Training - Hydra Version
-Training script using Hydra for configuration management with Whisper encoder and Qwen decoder.
+🎙️ ASR Training
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -33,7 +32,6 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
 class WhisperEncoder(nn.Module):
     def __init__(self, config: DictConfig):
         super().__init__()
-        # Load Whisper-small model
         self.whisper = WhisperModel.from_pretrained(
             "openai/whisper-small", dtype=torch.bfloat16, token=False
         )
@@ -44,29 +42,15 @@ class WhisperEncoder(nn.Module):
         self.d_model = self.whisper.config.d_model
         self.whisper.eval()
 
-    def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
-        batch_size, n_mels, time_frames = x.shape
-        original_time_frames = time_frames
-
-        expected_frames = 3000
-
-        if time_frames < expected_frames:
-            pad_amount = expected_frames - time_frames
-            x = torch.nn.functional.pad(x, (0, pad_amount), mode="constant", value=0)
-        elif time_frames > expected_frames:
-            x = x[:, :, :expected_frames]
-            original_time_frames = expected_frames
-
+    def forward(self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        input_features and attention_mask come directly from the WhisperFeatureExtractor.
+        """
         with torch.no_grad():
-            x = x.to(self.whisper.dtype)
-            outputs = self.whisper.encoder(x)
-            encoder_outputs = outputs.last_hidden_state
-
-        if original_time_frames < expected_frames:
-            actual_output_frames = (original_time_frames + 1) // 2
-            encoder_outputs = encoder_outputs[:, :actual_output_frames, :]
-
-        return encoder_outputs  # type: ignore[no-any-return]
+            input_features = input_features.to(self.whisper.dtype)
+            # The model internally handles the attention mask to ignore padding
+            outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
+            return outputs.last_hidden_state
 
 
 class AudioProjector(nn.Module):
@@ -89,9 +73,7 @@ class AudioProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
 
-        hidden_states = hidden_states * 0.01
-        
-        return hidden_states
+        return hidden_states * 0.01
 
 
 class LLMDecoder(nn.Module):
@@ -185,7 +167,7 @@ class ASRModel(PreTrainedModel):
                     for i in range(num_added):
                         embeddings.weight[-num_added + i] = mean_embedding + torch.randn_like(
                             embeddings.weight[0]
-                        ) * (std_embedding * 0.02)  
+                        ) * (std_embedding * 0.02)
 
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
@@ -194,20 +176,20 @@ class ASRModel(PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor] = None,
-        input_lengths: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if input_values is None:
             input_values = kwargs.get("input_values")
-        if input_lengths is None:
-            input_lengths = kwargs.get("input_lengths")
+        if encoder_attention_mask is None:
+            encoder_attention_mask = kwargs.get("encoder_attention_mask")
 
-        if input_values is None or input_lengths is None:
-            raise ValueError("input_values and input_lengths are required")
+        if input_values is None:
+            raise ValueError("input_values are required")
 
-        audio_features = self.encoder(input_values, input_lengths)
+        audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
 
         batch_size, audio_seq_len, hidden_dim = audio_embeds.shape
@@ -264,11 +246,11 @@ class ASRModel(PreTrainedModel):
     def generate(
         self,
         input_values: torch.Tensor,
-        input_lengths: torch.Tensor,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 100,
         **kwargs,
     ) -> torch.Tensor:
-        audio_features = self.encoder(input_values, input_lengths)
+        audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
 
         batch_size = audio_embeds.shape[0]
@@ -296,79 +278,96 @@ class ASRModel(PreTrainedModel):
         )
 
 
+def preprocess_audio_text(
+    examples: Dict[str, Any],
+    feature_extractor: WhisperFeatureExtractor,
+    tokenizer: Any,
+    sample_rate: int,
+) -> Dict[str, Any]:
+    """Preprocess audio and text examples for the dataset."""
+    audio_arrays = [x["array"] for x in examples["audio"]]
+
+    # Process audio with feature extractor
+    audio_features = feature_extractor(
+        audio_arrays,
+        sampling_rate=sample_rate,
+        return_attention_mask=True,
+        return_tensors="pt",
+        padding="longest",
+    )
+
+    # Process text with tokenizer
+    text_outputs = tokenizer(
+        examples["text"],
+        padding="longest",
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    return {
+        "input_values": audio_features.input_features,
+        "encoder_attention_mask": audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None,
+        "labels": text_outputs["input_ids"],
+        "attention_mask": text_outputs["attention_mask"],
+    }
+
+
 class DataCollator:
-    """Data collator that performs preprocessing on-the-fly."""
+    """Simple data collator that only handles batching and padding."""
 
     def __init__(
         self,
         tokenizer: Any,
         feature_extractor: WhisperFeatureExtractor,
-        config: DictConfig,
     ):
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor
-        self.sample_rate = config.data.sample_rate
-        self.max_audio_seconds = config.data.max_audio_seconds
-        self.max_text_words = config.data.max_text_words
-        self.n_mels = 80  # Whisper uses 80 mel bins
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
-        # Filter samples that are too long
-        valid_features = []
-        for f in features:
-            try:
-                # The audio is already properly handled by HuggingFace datasets
-                audio_array = f["audio"]["array"]
-                audio_len_sec = len(audio_array) / self.sample_rate
-                text_len_words = len(f["text"].split())
-                if (
-                    audio_len_sec <= self.max_audio_seconds
-                    and text_len_words <= self.max_text_words
-                ):
-                    valid_features.append(f)
-            except Exception:
+        # Stack tensors that are already preprocessed
+        batch = {}
+
+        # Get all keys from the first feature
+        keys = features[0].keys()
+
+        for key in keys:
+            if key == "encoder_attention_mask" and features[0][key] is None:
                 continue
 
-        if not valid_features:
-            pad_token_id = (
-                self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            )
-            dummy_seq_len = 10
-            return {
-                "input_values": torch.zeros((1, self.n_mels, 100)),
-                "input_lengths": torch.tensor([100]),
-                "labels": torch.full((1, dummy_seq_len), pad_token_id, dtype=torch.long),
-                "attention_mask": torch.ones((1, dummy_seq_len), dtype=torch.long),
-            }
+            if isinstance(features[0][key], torch.Tensor):
+                # Pad sequences to the same length within the batch
+                if key == "input_values":
+                    # Pad mel spectrograms along the time dimension
+                    max_len = max(f[key].shape[-1] for f in features)
+                    padded = []
+                    for f in features:
+                        spec = f[key]
+                        if spec.shape[-1] < max_len:
+                            pad_amount = max_len - spec.shape[-1]
+                            spec = torch.nn.functional.pad(spec, (0, pad_amount), value=0)
+                        padded.append(spec)
+                    batch[key] = torch.stack(padded)
+                elif key in ["labels", "attention_mask"]:
+                    # Pad text tokens
+                    max_len = max(f[key].shape[-1] for f in features)
+                    padded = []
+                    for f in features:
+                        seq = f[key]
+                        if seq.shape[-1] < max_len:
+                            pad_amount = max_len - seq.shape[-1]
+                            pad_value = self.pad_token_id if key == "labels" else 0
+                            seq = torch.nn.functional.pad(seq, (0, pad_amount), value=pad_value)
+                        padded.append(seq)
+                    batch[key] = torch.stack(padded)
+                else:
+                    # Stack other tensors directly
+                    batch[key] = torch.stack([f[key] for f in features])
+            else:
+                # Handle non-tensor values
+                batch[key] = [f[key] for f in features]
 
-        audio_arrays = []
-        texts = []
-        for f in valid_features:
-            audio_arrays.append(f["audio"]["array"])
-            texts.append(f["text"])
-
-        audio_features = self.feature_extractor(
-            audio_arrays,
-            sampling_rate=self.sample_rate,
-            return_tensors="pt",
-            padding="longest",
-        )
-
-        padded_specs = audio_features.input_features
-
-        input_lengths = torch.tensor(
-            [min(len(arr) // 160, 3000) for arr in audio_arrays],
-            dtype=torch.long,
-        )
-
-        labels = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt")
-
-        return {
-            "input_values": padded_specs,
-            "input_lengths": input_lengths,
-            "labels": labels["input_ids"],
-            "attention_mask": labels["attention_mask"],
-        }
+        return batch
 
 
 def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
@@ -379,13 +378,19 @@ def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureE
     return model, tokenizer, feature_extractor
 
 
-def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
-    """Load training and validation datasets."""
+def load_datasets(
+    config: DictConfig,
+    feature_extractor: WhisperFeatureExtractor,
+    tokenizer: Any
+) -> Tuple[Dataset, Dataset]:
+    """Load training and validation datasets with preprocessing."""
     import platform
 
     from datasets import Audio, concatenate_datasets
 
-    safe_num_proc = 1 if platform.system() == "Darwin" else config.data.num_proc
+    # Use multiprocessing for both filter and map operations
+    filter_num_proc = 1 if platform.system() == "Darwin" else config.data.num_proc
+    map_num_proc = 1  # Use single process for map operations to avoid tokenizer issues
     dataset_dicts = []
 
     for i, dataset_config in enumerate(config.data.dataset_configs):
@@ -398,7 +403,7 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
             dataset_config,
             split={"train": train_split, "validation": eval_split},
             cache_dir=config.data.dataset_cache_dir,
-            num_proc=safe_num_proc,
+            num_proc=filter_num_proc,
         )
         dataset_dicts.append(ds_dict)
 
@@ -409,8 +414,6 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         train_dataset = dataset_dicts[0]["train"]
         val_dataset = dataset_dicts[0]["validation"]
 
-    # Cast audio column to ensure proper sampling rate
-    # HuggingFace handles the decoding efficiently
     train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
     val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
 
@@ -420,6 +423,57 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         )
     if config.data.max_eval_samples:
         val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
+
+    # Filter samples based on length constraints
+    def filter_by_length(example):
+        audio_len_sec = len(example["audio"]["array"]) / config.data.sample_rate
+        text_len_words = len(example["text"].split())
+        return (
+            audio_len_sec <= config.data.max_audio_seconds
+            and text_len_words <= config.data.max_text_words
+        )
+
+    train_dataset = train_dataset.filter(
+        filter_by_length,
+        num_proc=filter_num_proc,
+        load_from_cache_file=True,
+        desc="Filtering training data by length"
+    )
+    val_dataset = val_dataset.filter(
+        filter_by_length,
+        num_proc=filter_num_proc,
+        load_from_cache_file=True,
+        desc="Filtering validation data by length"
+    )
+
+    # Apply preprocessing
+    def preprocess_batch(examples):
+        return preprocess_audio_text(examples, feature_extractor, tokenizer, config.data.sample_rate)
+
+    # Remove original columns and keep only preprocessed features
+    columns_to_remove = train_dataset.column_names
+
+    train_dataset = train_dataset.map(
+        preprocess_batch,
+        batched=True,
+        remove_columns=columns_to_remove,
+        num_proc=map_num_proc,
+        load_from_cache_file=True,
+        desc="Preprocessing training data",
+    )
+
+    val_dataset = val_dataset.map(
+        preprocess_batch,
+        batched=True,
+        remove_columns=columns_to_remove,
+        num_proc=map_num_proc,
+        load_from_cache_file=True,
+        desc="Preprocessing validation data",
+    )
+
+    # Set format to PyTorch tensors
+    train_dataset.set_format(type="torch")
+    val_dataset.set_format(type="torch")
 
     return train_dataset, val_dataset
 
@@ -435,19 +489,15 @@ class PredictionLoggingCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         """Log sample predictions after evaluation."""
         if metrics and hasattr(state, "log_history") and len(state.log_history) > 0:
-            # Get TensorBoard writer from trainer
             if self.writer is None and args.logging_dir:
                 self.writer = SummaryWriter(log_dir=args.logging_dir)
 
-            # Get sample predictions if they were stored
             if hasattr(state, "sample_predictions"):
                 samples = state.sample_predictions
                 step = state.global_step
 
-                # Create formatted text table for TensorBoard
                 text_table = "| Ground Truth | Prediction |\n|---|---|\n"
                 for _i, (truth, pred) in enumerate(samples[: self.num_samples]):
-                    # Escape markdown special characters
                     truth = truth.replace("|", "\\|").replace("\n", " ")
                     pred = pred.replace("|", "\\|").replace("\n", " ")
                     text_table += f"| {truth} | {pred} |\n"
@@ -460,13 +510,11 @@ class PredictionLoggingCallback(TrainerCallback):
 def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, float]:
     """Compute WER metric and store sample predictions."""
     predictions, label_ids = eval_pred.predictions, eval_pred.label_ids
-    # Handle tuple of arrays (logits, hidden_states)
     if isinstance(predictions, tuple):
         predictions = predictions[0]
 
     if predictions.ndim == 3:
         predictions = np.argmax(predictions, axis=-1)
-    # Ensure label_ids is an array and create a copy
     if isinstance(label_ids, tuple):
         label_ids = label_ids[0]
     label_ids = label_ids.copy()
@@ -474,13 +522,11 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, floa
     decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     decoded_labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-    # Store some sample predictions for logging (will be accessed by callback)
     sample_predictions = list(zip(decoded_labels[:10], decoded_preds[:10]))
 
     wer_metric = evaluate.load("wer", cache_dir="./metrics_cache")
     wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
 
-    # Return metrics with samples attached
     metrics = {"wer": wer}
     metrics["_sample_predictions"] = sample_predictions  # Prefix with _ to avoid logging as metric
     return metrics
@@ -493,23 +539,19 @@ def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     model, tokenizer, feature_extractor = initialize_model(cfg)
-    train_dataset, val_dataset = load_datasets(cfg)
+    train_dataset, val_dataset = load_datasets(cfg, feature_extractor, tokenizer)
 
     if cfg.eval_checkpoint:
         print(f"Evaluation mode: Loading checkpoint from {cfg.eval_checkpoint}")
-        # Load the checkpoint
-        from transformers import AutoModelForCausalLM
         model = ASRModel.from_pretrained(cfg.eval_checkpoint)
 
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
     assert isinstance(training_args_dict, dict), "Training args must be a dict"
-    # Remove compute_metrics from training args as it's not a TrainingArguments parameter
     compute_metrics_enabled = training_args_dict.pop("compute_metrics", True)
     training_args = TrainingArguments(**training_args_dict)  # type: ignore[arg-type]
 
-    prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=5)
+    prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=10)
 
-    # Custom compute metrics that stores samples
     def compute_metrics_with_samples(eval_pred):
         if not compute_metrics_enabled:
             return None
@@ -526,7 +568,6 @@ def main(cfg: DictConfig) -> None:
         data_collator=DataCollator(
             tokenizer=tokenizer,
             feature_extractor=feature_extractor,
-            config=cfg,
         ),
         processing_class=tokenizer,
         compute_metrics=compute_metrics_with_samples,
@@ -534,7 +575,6 @@ def main(cfg: DictConfig) -> None:
     )
 
     if cfg.eval_checkpoint:
-        # Only run evaluation
         results = trainer.evaluate()
         print(f"Evaluation results: {results}")
     else:
