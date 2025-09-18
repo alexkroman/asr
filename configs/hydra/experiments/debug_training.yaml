@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /model: small  # Use small model for debugging
+  - override /data: tiny  # Use tiny dataset for quick testing
+  - override /training: default
+
+# Debug-specific overrides
+training:
+  output_dir: ./outputs/debug_model
+  max_steps: 100
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  # Fixed learning rate for debugging
+  learning_rate: 5e-5
+  lr_scheduler_type: constant  # No scheduling for debugging
+  warmup_steps: 0  # No warmup
+
+  # Aggressive gradient clipping
+  max_grad_norm: 0.5
+
+  # Frequent logging
+  logging_steps: 1
+  eval_steps: 50
+  save_steps: 50
+
+  # Disable mixed precision for debugging
+  fp16: false
+  bf16: false
+
+  # Enable gradient checking
+  logging_nan_inf_filter: true
+
+# Model settings for debugging
+model:
+  lora_r: 8  # Smaller LoRA rank
+  lora_alpha: 16

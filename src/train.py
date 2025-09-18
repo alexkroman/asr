@@ -78,16 +78,20 @@ class AudioProjector(nn.Module):
         self.act = nn.GELU()
         self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
 
-        nn.init.normal_(self.linear_1.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.linear_1.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.linear_1.bias)
-        nn.init.normal_(self.linear_2.weight, mean=0.0, std=0.002)
+        nn.init.normal_(self.linear_2.weight)
         nn.init.zeros_(self.linear_2.bias)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         hidden_states = self.norm(audio_features)
         hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
-        return self.linear_2(hidden_states)  # type: ignore[no-any-return]
+        hidden_states = self.linear_2(hidden_states)
+
+        hidden_states = hidden_states * 0.01
+        
+        return hidden_states
 
 
 class LLMDecoder(nn.Module):
@@ -174,12 +178,14 @@ class ASRModel(PreTrainedModel):
             with torch.no_grad():
                 embeddings = self.decoder.model.get_input_embeddings()
                 if embeddings is not None and hasattr(embeddings, "weight"):
-                    std_embedding = embeddings.weight[:-num_added].std()
+                    existing_embeds = embeddings.weight[:-num_added]
+                    mean_embedding = existing_embeds.mean(dim=0)
+                    std_embedding = existing_embeds.std()
 
                     for i in range(num_added):
-                        embeddings.weight[-num_added + i] = torch.randn_like(
+                        embeddings.weight[-num_added + i] = mean_embedding + torch.randn_like(
                             embeddings.weight[0]
-                        ) * (std_embedding * 0.02)
+                        ) * (std_embedding * 0.02)  
 
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")

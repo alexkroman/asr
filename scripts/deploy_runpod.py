@@ -137,14 +137,8 @@ def install_python_dependencies(host, port):
         "omegaconf>=2.3.0",
         "hf-transfer",  # For fast HuggingFace downloads
         "ninja",  # For faster CUDA kernel compilation
-        "soundfile",  # Required by datasets for audio decoding
-    ]
-
-    # These packages can speed up training but may require special installation
-    optional_packages = [
-        # "flash-attn>=2.0.0",  # Requires CUDA compilation, install separately if needed
-        # "xformers",  # Memory-efficient transformers, install with: pip3 install xformers --index-url https://download.pytorch.org/whl/cu118
-        # "deepspeed",  # For distributed training, needs special setup
+        "soundfile", 
+        "librosa" # Required by datasets for audio decoding
     ]
 
     packages_str = " ".join(f'"{pkg}"' for pkg in required_packages)
