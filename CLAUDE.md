@@ -7,27 +7,37 @@ This is an ASR (Automatic Speech Recognition) training pipeline that combines a 
 
 ## Key Commands
 
-### Development & Linting
-- **Lint code**: `hatch run lint` (runs ruff check and mypy on src/)
-- **Format code**: `hatch run format` (runs ruff format and black on src/)
-- **Run specific test**: `pytest tests/test_file.py::test_function`
-- **Run all tests**: `pytest tests/`
+### Development & Linting (Local)
+- **Lint code**: `uv run ruff check src && uv run mypy src`
+- **Format code**: `uv run ruff format src && uv run black src`
+- **Run specific test**: `uv run pytest tests/test_file.py::test_function`
+- **Run all tests**: `uv run pytest tests/`
 
 ### Training
-- **Train locally on Mac**: `hatch run train-mac` or `python src/train.py +experiments=mac_minimal`
-- **Train with custom config**: `python src/train.py +experiments=your_experiment`
-- **Train in production (RunPod)**: `hatch run cuda:train-prod`
-- **Evaluate checkpoint**: `python src/train.py +experiments=production eval_checkpoint=./outputs/production_model/checkpoint-1000`
+- **Train locally on Mac**: `uv run python src/train.py +experiments=mac_minimal`
+- **Train with custom config**: `uv run python src/train.py +experiments=your_experiment`
+- **Train on RunPod (uses system Python)**: `python3 -m accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments=production`
+- **Evaluate checkpoint**: `python3 src/train.py +experiments=production eval_checkpoint=./outputs/production_model/checkpoint-1000`
 
-### Docker & Deployment
-- **Build Docker image**: `hatch run docker-build`
-- **Build local Docker**: `hatch run docker-build-local`
-- **Push to registry**: `hatch run docker-push`
-- **Deploy locally**: `hatch run deploy-docker-local`
+### RunPod Deployment
+- **Deploy to RunPod**: `python scripts/deploy_runpod.py <IP_ADDRESS> <PORT>`
+- **Example with IP**: `python scripts/deploy_runpod.py 192.168.1.100 22222`
+- **Example with hostname**: `python scripts/deploy_runpod.py pod.runpod.io 22222`
+- **Skip system setup**: Add `--skip-setup` flag
+- **Skip file sync**: Add `--skip-sync` flag
+- **Skip dependency install**: Add `--skip-deps` flag
 
-### RunPod Management
-- **Create RunPod instance**: `hatch run create-a20`
-- **Sync code to RunPod**: `hatch run sync-to-runpod`
+### Remote Training Management
+- **Start training**: `python scripts/start_remote_training.py <IP_ADDRESS> <PORT>`
+- **Start with custom experiment**: `python scripts/start_remote_training.py <IP> <PORT> --experiment mac_minimal`
+- **Start without attaching**: `python scripts/start_remote_training.py <IP> <PORT> --no-attach`
+- **Attach to session**: `python scripts/attach_remote_session.py <IP_ADDRESS> <PORT>`
+- **List sessions**: `python scripts/attach_remote_session.py <IP> <PORT> --list`
+- **View logs without attaching**: `python scripts/attach_remote_session.py <IP> <PORT> --logs`
+- **Tmux controls when attached**:
+  - Detach (leave running): `Ctrl+B` then `D`
+  - Scroll mode: `Ctrl+B` then `[` (exit with `q`)
+  - Kill session: `Ctrl+B` then `:` then type `kill-session`
 
 ## Architecture
 
@@ -64,6 +74,9 @@ For RunPod/CUDA:
 - `HF_HOME=/workspace/.cache/huggingface` - Cache directory
 - `HF_DATASETS_CACHE=/workspace/datasets` - Dataset cache
 - `HF_HUB_ENABLE_HF_TRANSFER=1` - Enable fast downloads
+
+## RunPod Environment
+RunPod instances come with PyTorch pre-installed with CUDA support. The training scripts use the system Python (python3) directly rather than a virtual environment to avoid conflicts with the pre-installed CUDA libraries. The deployment script installs only the additional required packages (transformers, accelerate, etc.) via pip3.
 
 ## Dataset
 The project uses the LibriSpeech dataset from Hugging Face. Data processing includes:
