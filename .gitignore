@@ -193,3 +193,6 @@ events.out.tfevents.*
 *.temp
 *.swp
 *~
+
+# DVC
+/dvc.lock

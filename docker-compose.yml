@@ -14,6 +14,7 @@ services:
       - ./outputs:/workspace/outputs
       - ~/.cache/huggingface:/workspace/.cache/huggingface
       - ./datasets_cache:/workspace/datasets_cache
+      - ./configs:/workspace/configs
     shm_size: '16gb'
     command: ["+experiments=production"]
 
@@ -32,6 +33,7 @@ services:
       - ./outputs:/workspace/outputs
       - ~/.cache/huggingface:/workspace/.cache/huggingface
       - ./datasets_cache:/workspace/datasets_cache
+      - ./configs:/workspace/configs
     shm_size: '8gb'
     command: ["hatch", "run", "train-mac"]
     profiles: ["dev"]

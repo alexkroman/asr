@@ -3,14 +3,12 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     git \
     wget \
-    rsync \ 
+    rsync \
     tmux \
     ffmpeg \
     libsndfile1 \
     libsndfile1-dev \
     && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir hatch
 
 WORKDIR /workspace
 
@@ -19,16 +17,21 @@ COPY pyproject.toml .
 # Create a minimal src/__init__.py for package installation
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
-# Install dependencies - this layer will be cached unless pyproject.toml changes
-RUN hatch env create
-
-# Install torchcodec for CPU after main dependencies
-RUN hatch run pip install torchcodec
+# Install the package and all dependencies directly (simpler than Hatch in container)
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir "dvc[s3]>=3.0.0" && \
+    pip install --no-cache-dir torchcodec
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
 COPY configs/ ./configs/
 
-ENV HATCH_ENV=default
+# Set environment variables for local training
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV HF_DATASETS_CACHE=/workspace/datasets
+ENV PYTORCH_ENABLE_MPS_FALLBACK=1
+ENV PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+ENV TOKENIZERS_PARALLELISM=false
 
-ENTRYPOINT ["hatch", "run", "train-mac"]
+# Direct command instead of Hatch
+ENTRYPOINT ["python", "src/train.py", "+experiments=mac_minimal"]
