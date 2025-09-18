@@ -22,6 +22,9 @@ RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 # Install dependencies - this layer will be cached unless pyproject.toml changes
 RUN hatch env create cuda
 
+# Install torchcodec with CUDA support after main dependencies
+RUN hatch run cuda:pip install torchcodec --index-url=https://download.pytorch.org/whl/cu121
+
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
 COPY configs/ ./configs/
