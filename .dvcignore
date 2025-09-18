@@ -1,0 +1,44 @@
+# DVC ignore file - similar to .gitignore but for DVC tracking
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environment
+venv/
+env/
+ENV/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Outputs and logs (track these separately if needed)
+/outputs
+/logs
+/checkpoints
+*.log
+
+# Temporary files
+*.tmp
+.ipynb_checkpoints/
+
+# Model files (track these explicitly)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Don't track the cache within cache
+.cache/
