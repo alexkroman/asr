@@ -129,7 +129,7 @@ def install_python_dependencies(host, port):
     required_packages = [
         "transformers>=4.35.0",
         "accelerate>=0.24.0",
-        "datasets>=2.14.0",
+        "datasets==3.6.0",
         "peft>=0.6.0",
         "evaluate>=0.4.0",
         "tensorboard>=2.14.0",
@@ -137,7 +137,7 @@ def install_python_dependencies(host, port):
         "omegaconf>=2.3.0",
         "hf-transfer",  # For fast HuggingFace downloads
         "ninja",  # For faster CUDA kernel compilation
-        "torchcodec",  # Required by datasets for audio decoding
+        "soundfile",  # Required by datasets for audio decoding
     ]
 
     # These packages can speed up training but may require special installation
