@@ -12,18 +12,17 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /workspace
 
-# Install Hatch first
-RUN pip install --no-cache-dir hatch
+# Install uv for dependency management
+RUN pip install --no-cache-dir uv
 
 # Copy only dependency files first for better caching
-COPY pyproject.toml .
-COPY hatch.toml .
+COPY pyproject.toml uv.lock ./
 # Create a minimal src/__init__.py for package installation
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
-# Install dependencies using Hatch
-RUN hatch env create default && \
-    hatch run pip install --no-cache-dir torchcodec
+# Install dependencies using uv for reproducible builds
+RUN uv sync --frozen && \
+    uv pip install --no-cache-dir torchcodec
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
@@ -36,5 +35,5 @@ ENV PYTORCH_ENABLE_MPS_FALLBACK=1
 ENV PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 ENV TOKENIZERS_PARALLELISM=false
 
-# Use Hatch to run the training command
-ENTRYPOINT ["hatch", "run", "train-mac"]
+# Run the training command directly
+ENTRYPOINT ["python", "src/train.py", "+experiments=mac_minimal"]

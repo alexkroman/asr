@@ -12,17 +12,17 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /workspace
 
-# Install hatch for dependency management
-RUN pip install --no-cache-dir hatch
+# Install uv for dependency management
+RUN pip install --no-cache-dir uv
 
 # Copy dependency files first for better caching
-COPY pyproject.toml hatch.toml ./
+COPY pyproject.toml uv.lock ./
 # Create a minimal src/__init__.py for package installation
 RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
 
-# Install dependencies using Hatch
-RUN hatch env create cuda && \
-    hatch run cuda:pip install --no-cache torchcodec --index-url=https://download.pytorch.org/whl/cu121
+# Install dependencies using uv for reproducible builds
+RUN uv sync --frozen --extra cuda --extra optimized && \
+    uv pip install --no-cache torchcodec --index-url=https://download.pytorch.org/whl/cu121
 
 # Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
@@ -37,5 +37,5 @@ ENV HF_DATASETS_DOWNLOAD_WORKERS=32
 ENV HF_DATASETS_IN_MEMORY_MAX_SIZE=0
 ENV OMP_NUM_THREADS=9
 
-# Use Hatch to run the training command
-ENTRYPOINT ["hatch", "run", "cuda:train-prod"]
+# Run the training command directly
+ENTRYPOINT ["bash", "-c", "OMP_NUM_THREADS=9 accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments=production"]
