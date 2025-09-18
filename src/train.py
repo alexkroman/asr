@@ -37,8 +37,8 @@ os.environ["HF_DATASETS_CACHE"] = os.environ.get(
     "HF_DATASETS_CACHE", str(Path(workspace_dir) / "datasets")
 )
 
-class WhisperEncoder(nn.Module):
 
+class WhisperEncoder(nn.Module):
     def __init__(self, config: DictConfig):
         super().__init__()
         # Load Whisper-small model
@@ -96,6 +96,7 @@ class AudioProjector(nn.Module):
         hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
         return self.linear_2(hidden_states)  # type: ignore[no-any-return]
+
 
 class LLMDecoder(nn.Module):
     def __init__(self, config: DictConfig):
@@ -262,7 +263,6 @@ class ASRModel(PreTrainedModel):
             return_dict=True,
         )
 
-
     @torch.no_grad()
     def generate(
         self,
@@ -297,6 +297,7 @@ class ASRModel(PreTrainedModel):
             eos_token_id=self.decoder.tokenizer.eos_token_id,
             **kwargs,
         )
+
 
 class DataCollator:
     """Data collator that performs preprocessing on-the-fly."""
@@ -372,7 +373,6 @@ class DataCollator:
         }
 
 
-
 def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
     """Initialize the ASR model, tokenizer, and feature extractor."""
     model = ASRModel(config)
@@ -435,26 +435,26 @@ class PredictionLoggingCallback(TrainerCallback):
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         """Log sample predictions after evaluation."""
-        if metrics and hasattr(state, 'log_history') and len(state.log_history) > 0:
+        if metrics and hasattr(state, "log_history") and len(state.log_history) > 0:
             # Get TensorBoard writer from trainer
             if self.writer is None and args.logging_dir:
                 self.writer = SummaryWriter(log_dir=args.logging_dir)
 
             # Get sample predictions if they were stored
-            if hasattr(state, 'sample_predictions'):
+            if hasattr(state, "sample_predictions"):
                 samples = state.sample_predictions
                 step = state.global_step
 
                 # Create formatted text table for TensorBoard
                 text_table = "| Ground Truth | Prediction |\n|---|---|\n"
-                for _i, (truth, pred) in enumerate(samples[:self.num_samples]):
+                for _i, (truth, pred) in enumerate(samples[: self.num_samples]):
                     # Escape markdown special characters
-                    truth = truth.replace('|', '\\|').replace('\n', ' ')
-                    pred = pred.replace('|', '\\|').replace('\n', ' ')
+                    truth = truth.replace("|", "\\|").replace("\n", " ")
+                    pred = pred.replace("|", "\\|").replace("\n", " ")
                     text_table += f"| {truth} | {pred} |\n"
 
                 if self.writer:
-                    self.writer.add_text('predictions/samples', text_table, step)
+                    self.writer.add_text("predictions/samples", text_table, step)
                     self.writer.flush()
 
 
@@ -483,7 +483,7 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, floa
 
     # Return metrics with samples attached
     metrics = {"wer": wer}
-    metrics['_sample_predictions'] = sample_predictions  # Prefix with _ to avoid logging as metric
+    metrics["_sample_predictions"] = sample_predictions  # Prefix with _ to avoid logging as metric
     return metrics
 
 
@@ -512,8 +512,8 @@ def main(cfg: DictConfig) -> None:
         if not cfg.training.compute_metrics:
             return None
         metrics = compute_metrics(eval_pred, tokenizer)
-        if '_sample_predictions' in metrics:
-            trainer.state.sample_predictions = metrics.pop('_sample_predictions')
+        if "_sample_predictions" in metrics:
+            trainer.state.sample_predictions = metrics.pop("_sample_predictions")
         return metrics
 
     trainer = Trainer(
