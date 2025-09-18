@@ -13,11 +13,17 @@ RUN pip install --no-cache-dir hatch
 
 WORKDIR /workspace
 
+# Copy only dependency files first for better caching
 COPY pyproject.toml .
+# Create a minimal src/__init__.py for package installation
+RUN mkdir -p src && echo '__version__ = "0.1.0"' > src/__init__.py
+
+# Install dependencies - this layer will be cached unless pyproject.toml changes
+RUN hatch env create
+
+# Now copy the actual source code - changes here won't invalidate dependency cache
 COPY src/ ./src/
 COPY configs/ ./configs/
-
-RUN hatch env create
 
 ENV HATCH_ENV=default
 

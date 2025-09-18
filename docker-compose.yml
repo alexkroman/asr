@@ -41,6 +41,6 @@ services:
     ports:
       - "6006:6006"
     volumes:
-      - ./outputs:/logs
+      - ./logs:/logs
     command: ["tensorboard", "--logdir=/logs", "--host=0.0.0.0"]
     profiles: ["monitoring"]

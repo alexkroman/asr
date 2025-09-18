@@ -55,11 +55,10 @@ max_grad_norm: 1.0
 # Misc
 seed: 42
 save_safetensors: true
-do_generation_test: false
-generation_max_length: 100
+# generation_max_length: 100  # Not a valid TrainingArguments parameter
 disable_tqdm: false
 log_level: info
-use_cache: false
+# use_cache: false  # Not a valid TrainingArguments parameter
 compute_metrics: true
 predict_with_generate: true
 
