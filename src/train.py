@@ -134,6 +134,20 @@ class ASRModel(PreTrainedModel):
         self.audio_projector = AudioProjector(audio_dim, text_dim, config)
         self.add_audio_special_tokens()
 
+        # Pre-compute static instruction components for efficient generation
+        instruction = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+        input_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids
+
+        # Find the placeholder index once
+        chunk_idx_tensor = (input_ids[0] == self.audio_chunk_id).nonzero()
+        if chunk_idx_tensor.shape[0] == 0:
+            raise ValueError("'<|audio_chunk|>' token not found in instruction.")
+        self.chunk_idx = chunk_idx_tensor[0].item()
+
+        # Store the token IDs for the text parts as buffers
+        self.register_buffer("prompt_ids_start", input_ids[0, :self.chunk_idx])
+        self.register_buffer("prompt_ids_end", input_ids[0, self.chunk_idx + 1:])
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
             self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
@@ -245,50 +259,40 @@ class ASRModel(PreTrainedModel):
         max_new_tokens: int = 100,
         **kwargs,
     ) -> torch.Tensor:
-        # 1. Prepare the instruction prompt for inference
-        instruction = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
-        input_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids.to(input_values.device)
-
-        # 2. Get audio embeddings
+        # 1. Get audio embeddings (no change here)
         audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
         audio_embeds = audio_embeds.to(self.decoder.model.dtype)
 
-        # 3. Get text embeddings for the prompt
+        batch_size = audio_embeds.shape[0]
         embed_layer = self.decoder.model.get_input_embeddings()
-        text_embeds = embed_layer(input_ids)
 
-        # 4. Find placeholder and insert audio
-        batch_size = input_values.shape[0]
-        final_inputs_embeds = []
+        # 2. Get pre-computed text part embeddings
+        # Move IDs to the correct device, then get embeddings
+        prompt_embeds_start = embed_layer(self.prompt_ids_start.to(input_values.device))
+        prompt_embeds_end = embed_layer(self.prompt_ids_end.to(input_values.device))
 
-        for i in range(input_ids.shape[0]):
-            chunk_idx = (input_ids[i] == self.audio_chunk_id).nonzero()
-            if chunk_idx.shape[0] == 0:
-                raise ValueError(f"'<|audio_chunk|>' token not found in instruction.")
-            chunk_idx = chunk_idx[0].item()
+        # 3. Combine embeddings in a single, vectorized operation 🚀
+        # Expand text embeddings to match the batch size
+        batched_prompt_start = prompt_embeds_start.expand(batch_size, -1, -1)
+        batched_prompt_end = prompt_embeds_end.expand(batch_size, -1, -1)
 
-            # For each sample in the batch, create the combined embeddings
-            for j in range(batch_size):
-                combined_embeds = torch.cat([
-                    text_embeds[i, :chunk_idx],
-                    audio_embeds[j],
-                    text_embeds[i, chunk_idx + 1:],
-                ], dim=0)
-                final_inputs_embeds.append(combined_embeds)
+        # Concatenate along the sequence dimension (dim=1)
+        inputs_embeds = torch.cat([
+            batched_prompt_start,
+            audio_embeds,
+            batched_prompt_end
+        ], dim=1)
 
-        # Pad the combined embeddings if needed
-        if batch_size > 1:
-            inputs_embeds = torch.nn.utils.rnn.pad_sequence(final_inputs_embeds, batch_first=True, padding_value=0)
-        else:
-            inputs_embeds = final_inputs_embeds[0].unsqueeze(0)
+        # 4. Create the attention mask for the combined input
+        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
-        # 5. Generate and return only the response (not the instruction)
-        # Store the prompt length to slice it off later
+        # 5. Generate and return only the response
         prompt_length = inputs_embeds.shape[1]
 
         full_output = self.decoder.model.generate(
             inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,  # Pass the new attention mask
             max_new_tokens=max_new_tokens,
             pad_token_id=self.decoder.tokenizer.pad_token_id,
             eos_token_id=self.decoder.tokenizer.eos_token_id,
