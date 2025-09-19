@@ -7,5 +7,4 @@ defaults:
 
 # Production-specific overrides
 training:
-  output_dir: ./outputs/production_model
   push_to_hub: false

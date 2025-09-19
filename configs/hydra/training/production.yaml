@@ -23,7 +23,7 @@ adam_epsilon: 1e-8
 
 # Logging
 logging_dir: ./logs
-logging_steps: 10
+logging_steps: 5
 logging_first_step: true
 logging_nan_inf_filter: false
 report_to:
@@ -31,7 +31,7 @@ report_to:
 
 # Evaluation
 eval_strategy: steps
-eval_steps: 500
+eval_steps: 100
 compute_metrics: true
 
 # Saving
@@ -46,7 +46,7 @@ greater_is_better: false
 push_to_hub: false
 
 # Performance
-dataloader_num_workers: 20  # Optimized for Xeon Gold 6342 (24 cores)
+dataloader_num_workers: 4
 gradient_checkpointing: false
 fp16: false
 bf16: true

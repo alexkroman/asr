@@ -9,8 +9,8 @@ defaults:
 training:
   output_dir: ./outputs/production_model
   per_device_eval_batch_size: 1  # Reduce batch size for evaluation
-  eval_accumulation_steps: 4  # Accumulate gradients over multiple steps
-  dataloader_num_workers: 2  # Reduce number of workers
+  eval_accumulation_steps: 1  # Accumulate gradients over multiple steps
+  dataloader_num_workers: 1  # Reduce number of workers
   gradient_checkpointing: true  # Keep gradient checkpointing enabled
   fp16: false
   bf16: true

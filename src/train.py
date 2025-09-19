@@ -150,6 +150,7 @@ class ASRModel(PreTrainedModel):
                 "<|audio_end|>",
                 "<|audio_pad|>",
                 "<|audio_sep|>",
+                "<|audio_chunk|>",  # Placeholder for audio embeddings in instruction
             ]
         }
 
@@ -173,72 +174,65 @@ class ASRModel(PreTrainedModel):
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
         self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+        self.audio_chunk_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_chunk|>")
 
     def forward(
         self,
-        input_values: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        input_values: torch.Tensor,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if input_values is None:
-            input_values = kwargs.get("input_values")
-        if encoder_attention_mask is None:
-            encoder_attention_mask = kwargs.get("encoder_attention_mask")
-
-        if input_values is None:
-            raise ValueError("input_values are required")
-
+        # 1. Get audio embeddings
         audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
+        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
 
-        batch_size, audio_seq_len, hidden_dim = audio_embeds.shape
-        device = audio_embeds.device
-
+        # 2. Get text embeddings
         embed_layer = self.decoder.model.get_input_embeddings()
+        text_embeds = embed_layer(input_ids)
 
-        audio_start_tokens = torch.full(
-            (batch_size, 1), self.audio_start_id, device=device, dtype=torch.long
-        )
-        audio_end_tokens = torch.full(
-            (batch_size, 1), self.audio_end_id, device=device, dtype=torch.long
-        )
+        # 3. Find placeholder and insert audio
+        final_inputs_embeds = []
+        final_labels = []
+        for i in range(input_ids.shape[0]):  # Iterate over batch
+            chunk_idx = (input_ids[i] == self.audio_chunk_id).nonzero()
+            if chunk_idx.shape[0] == 0:
+                raise ValueError(f"'<|audio_chunk|>' token not found in input_ids.")
+            chunk_idx = chunk_idx[0].item()
 
-        audio_start_embeds = embed_layer(audio_start_tokens)
-        audio_end_embeds = embed_layer(audio_end_tokens)
+            # Concatenate: [text_before_chunk, audio_embeds, text_after_chunk]
+            combined_embeds = torch.cat([
+                text_embeds[i, :chunk_idx],
+                audio_embeds[i],
+                text_embeds[i, chunk_idx + 1:],
+            ], dim=0)
+            final_inputs_embeds.append(combined_embeds)
 
-        if labels is not None:
-            text_embeds = embed_layer(labels)
-            audio_embeds = audio_embeds.to(text_embeds.dtype)
+            # Adjust labels to match the new sequence length
+            # Insert -100 labels for the audio embeddings
+            audio_len = audio_embeds[i].shape[0]
+            label_before = labels[i, :chunk_idx]
+            label_after = labels[i, chunk_idx + 1:]
+            audio_labels = torch.full((audio_len,), -100, dtype=labels.dtype, device=labels.device)
+            combined_labels = torch.cat([label_before, audio_labels, label_after], dim=0)
+            final_labels.append(combined_labels)
 
-            inputs_embeds = torch.cat(
-                [audio_start_embeds, audio_embeds, audio_end_embeds, text_embeds], dim=1
-            )
+        # Pad the combined embeddings to the same length
+        inputs_embeds = torch.nn.utils.rnn.pad_sequence(final_inputs_embeds, batch_first=True, padding_value=0)
+        labels = torch.nn.utils.rnn.pad_sequence(final_labels, batch_first=True, padding_value=-100)
 
-            audio_len = audio_seq_len + 2
-            if attention_mask is not None:
-                audio_mask = torch.ones(
-                    batch_size, audio_len, dtype=attention_mask.dtype, device=device
-                )
-                attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
-            else:
-                attention_mask = torch.ones(
-                    inputs_embeds.shape[:2], dtype=torch.long, device=device
-                )
-
-            audio_labels = torch.full(
-                (batch_size, audio_len), -100, dtype=labels.dtype, device=device
-            )
-            labels = torch.cat([audio_labels, labels], dim=1)
-        else:
-            inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
-            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
-            labels = None
+        # Recreate the attention mask for the new embedding sequence length
+        new_attention_mask = torch.ones(inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=attention_mask.dtype)
+        # Mask padding positions
+        for i, embed in enumerate(final_inputs_embeds):
+            new_attention_mask[i, embed.shape[0]:] = 0
 
         return self.decoder.model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=new_attention_mask,
             labels=labels,
             return_dict=True,
         )
@@ -251,26 +245,49 @@ class ASRModel(PreTrainedModel):
         max_new_tokens: int = 100,
         **kwargs,
     ) -> torch.Tensor:
+        # 1. Prepare the instruction prompt for inference
+        instruction = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+        input_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids.to(input_values.device)
+
+        # 2. Get audio embeddings
         audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
+        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
 
-        batch_size = audio_embeds.shape[0]
-        device = audio_embeds.device
+        # 3. Get text embeddings for the prompt
         embed_layer = self.decoder.model.get_input_embeddings()
+        text_embeds = embed_layer(input_ids)
 
-        audio_start_tokens = torch.full(
-            (batch_size, 1), self.audio_start_id, device=device, dtype=torch.long
-        )
-        audio_end_tokens = torch.full(
-            (batch_size, 1), self.audio_end_id, device=device, dtype=torch.long
-        )
+        # 4. Find placeholder and insert audio
+        batch_size = input_values.shape[0]
+        final_inputs_embeds = []
 
-        audio_start_embeds = embed_layer(audio_start_tokens)
-        audio_end_embeds = embed_layer(audio_end_tokens)
+        for i in range(input_ids.shape[0]):
+            chunk_idx = (input_ids[i] == self.audio_chunk_id).nonzero()
+            if chunk_idx.shape[0] == 0:
+                raise ValueError(f"'<|audio_chunk|>' token not found in instruction.")
+            chunk_idx = chunk_idx[0].item()
 
-        inputs_embeds = torch.cat([audio_start_embeds, audio_embeds, audio_end_embeds], dim=1)
+            # For each sample in the batch, create the combined embeddings
+            for j in range(batch_size):
+                combined_embeds = torch.cat([
+                    text_embeds[i, :chunk_idx],
+                    audio_embeds[j],
+                    text_embeds[i, chunk_idx + 1:],
+                ], dim=0)
+                final_inputs_embeds.append(combined_embeds)
 
-        return self.decoder.model.generate(  # type: ignore[no-any-return]
+        # Pad the combined embeddings if needed
+        if batch_size > 1:
+            inputs_embeds = torch.nn.utils.rnn.pad_sequence(final_inputs_embeds, batch_first=True, padding_value=0)
+        else:
+            inputs_embeds = final_inputs_embeds[0].unsqueeze(0)
+
+        # 5. Generate and return only the response (not the instruction)
+        # Store the prompt length to slice it off later
+        prompt_length = inputs_embeds.shape[1]
+
+        full_output = self.decoder.model.generate(
             inputs_embeds=inputs_embeds,
             max_new_tokens=max_new_tokens,
             pad_token_id=self.decoder.tokenizer.pad_token_id,
@@ -278,9 +295,12 @@ class ASRModel(PreTrainedModel):
             **kwargs,
         )
 
+        # Return only the generated tokens (excluding the instruction prompt)
+        return full_output[:, prompt_length:]
+
 
 class DataCollator:
-    """Data collator that performs preprocessing on-the-fly."""
+    """Data collator that performs instruction formatting and masking."""
 
     def __init__(
         self,
@@ -312,45 +332,62 @@ class DataCollator:
 
         if not valid_features:
             # Return a dummy batch if all samples were filtered
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             return {
+                "input_ids": torch.zeros((1, 10), dtype=torch.long),
+                "labels": torch.zeros((1, 10), dtype=torch.long),
+                "attention_mask": torch.zeros((1, 10), dtype=torch.long),
                 "input_values": torch.zeros((1, 80, 3000)),
                 "encoder_attention_mask": torch.ones((1, 1500)),
-                "labels": torch.full((1, 10), pad_token_id, dtype=torch.long),
-                "attention_mask": torch.ones((1, 10), dtype=torch.long),
             }
 
-        # Extract audio arrays and texts
-        audio_arrays = []
-        texts = []
-        for f in valid_features:
-            audio_arrays.append(f["audio"]["array"])
-            texts.append(f["text"])
-
         # Process audio with feature extractor
-        # Whisper expects exactly 3000 frames (30 seconds at 16kHz)
+        audio_arrays = [f["audio"]["array"] for f in valid_features]
         audio_features = self.feature_extractor(
             audio_arrays,
             sampling_rate=self.sample_rate,
             return_tensors="pt",
             return_attention_mask=True,
-            padding="max_length",  # Pad to max_length
-            max_length=480000,  # 30 seconds * 16000 Hz = 480000 samples
+            padding="max_length",
+            max_length=480000,
         )
 
-        # Process text with tokenizer
-        labels = self.tokenizer(
+        # Define instruction template
+        instruction = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+
+        # Format texts with instruction
+        texts = [instruction + f["text"] for f in valid_features]
+
+        # Tokenize the full instruction-tuned texts
+        batch = self.tokenizer(
             texts,
             padding="longest",
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
 
+        # Create labels by cloning input_ids
+        labels = batch["input_ids"].clone()
+
+        # Find the start of the assistant's response for masking
+        # Tokenize the instruction prompt without the response
+        instruction_prompt_tokens = self.tokenizer(instruction, return_tensors="pt")["input_ids"]
+        prompt_length = instruction_prompt_tokens.shape[1]
+
+        # Mask all tokens that are part of the prompt (user instruction)
+        labels[:, :prompt_length] = -100
+
+        # Also mask any pad tokens in the labels
+        if self.tokenizer.pad_token_id is not None:
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+        batch["labels"] = labels
+
         return {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "labels": batch["labels"],
             "input_values": audio_features.input_features,
             "encoder_attention_mask": audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None,
-            "labels": labels["input_ids"],
-            "attention_mask": labels["attention_mask"],
         }
 
 
@@ -428,6 +465,8 @@ class PredictionLoggingCallback(TrainerCallback):
                 if self.writer:
                     self.writer.add_text("predictions/samples", text_table, step)
                     self.writer.flush()
+                
+                delattr(state, 'sample_predictions')
 
 
 def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any) -> Dict[str, float]:
