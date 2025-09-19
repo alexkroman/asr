@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - override /data: combined_librispeech_gigaspeech
+  - override /model: small
+  - override /training: production
+
+# Model-specific settings
+model:
+  use_lora: true
+  gradient_checkpointing: true
+
+# Training settings for combined dataset
+training:
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  logging_steps: 50
+  eval_steps: 500
+  save_steps: 500
+  eval_accumulation_steps: 4
+  warmup_ratio: 0.05
+  learning_rate: 1e-4
+
+# Output
+output_dir: ${hydra:runtime.cwd}/outputs/combined_librispeech_gigaspeech_${now:%Y%m%d_%H%M%S}

@@ -33,6 +33,7 @@ report_to:
 eval_strategy: steps
 eval_steps: 100
 compute_metrics: true
+wer_sample_size: 10  # Number of samples to use for WER calculation and prediction logging
 
 # Saving
 save_strategy: epoch
@@ -46,7 +47,7 @@ greater_is_better: false
 push_to_hub: false
 
 # Performance
-dataloader_num_workers: 4
+dataloader_num_workers: 16  # Optimized for Intel Xeon Gold 6342 (24 cores/48 threads)
 gradient_checkpointing: false
 fp16: false
 bf16: true

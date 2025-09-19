@@ -31,6 +31,7 @@ report_to: []
 # Evaluation
 eval_strategy: steps
 eval_steps: 100
+wer_sample_size: 10  # Number of samples to use for WER calculation and prediction logging
 
 # Saving
 save_strategy: epoch
