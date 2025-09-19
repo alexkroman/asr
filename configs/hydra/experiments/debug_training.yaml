@@ -8,22 +8,22 @@ defaults:
 # Debug-specific overrides
 training:
   output_dir: ./outputs/debug_model
-  max_steps: 100
+  num_train_epochs: 2
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 1
 
   # Fixed learning rate for debugging
   learning_rate: 5e-5
   lr_scheduler_type: constant  # No scheduling for debugging
-  warmup_steps: 0  # No warmup
+  warmup_ratio: 0.0  # No warmup
 
   # Aggressive gradient clipping
   max_grad_norm: 0.5
 
   # Frequent logging
   logging_steps: 1
-  eval_steps: 50
-  save_steps: 50
+  eval_steps: 100
+  save_per_epoch: 1
 
   # Disable mixed precision for debugging
   fp16: false

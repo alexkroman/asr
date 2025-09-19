@@ -3,7 +3,7 @@ output_dir: ./outputs/asr_model
 overwrite_output_dir: false
 
 # Training configuration
-max_steps: 10000
+num_train_epochs: 2
 per_device_train_batch_size: 2
 per_device_eval_batch_size: 2
 gradient_accumulation_steps: 8
@@ -30,11 +30,11 @@ report_to: []
 
 # Evaluation
 eval_strategy: steps
-eval_steps: 500
+eval_steps: 100
 
 # Saving
-save_strategy: steps
-save_steps: 500
+save_strategy: epoch
+save_per_epoch: 1
 save_total_limit: 3
 load_best_model_at_end: true
 metric_for_best_model: eval_loss
