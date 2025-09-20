@@ -3,9 +3,8 @@
 🎙️ ASR Training
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
-import evaluate
 import hydra
 import numpy as np
 import torch
@@ -13,15 +12,12 @@ import torch.nn as nn
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
-from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    EvalPrediction,
     PretrainedConfig,
     PreTrainedModel,
     Trainer,
-    TrainerCallback,
     TrainingArguments,
     WhisperFeatureExtractor,
     WhisperModel,
@@ -52,7 +48,7 @@ class WhisperEncoder(nn.Module):
             input_features = input_features.to(self.whisper.dtype)
             # The model internally handles the attention mask to ignore padding
             outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
-            return outputs.last_hidden_state
+            return cast(torch.Tensor, outputs.last_hidden_state)
 
 
 class AudioProjector(nn.Module):
@@ -75,7 +71,8 @@ class AudioProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
 
-        return hidden_states * 0.01
+        result: torch.Tensor = hidden_states * 0.01
+        return result
 
 
 class LLMDecoder(nn.Module):
@@ -136,22 +133,6 @@ class ASRModel(PreTrainedModel):
         audio_dim = self.encoder.d_model
         self.audio_projector = AudioProjector(audio_dim, text_dim, config)
         self.add_audio_special_tokens()
-
-        # Pre-compute static instruction components for efficient generation
-        instruction = (
-            "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
-        )
-        input_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids
-
-        # Find the placeholder index once
-        chunk_idx_tensor = (input_ids[0] == self.audio_chunk_id).nonzero()
-        if chunk_idx_tensor.shape[0] == 0:
-            raise ValueError("'<|audio_chunk|>' token not found in instruction.")
-        self.chunk_idx = chunk_idx_tensor[0].item()
-
-        # Store the token IDs for the text parts as buffers
-        self.register_buffer("prompt_ids_start", input_ids[0, : self.chunk_idx])
-        self.register_buffer("prompt_ids_end", input_ids[0, self.chunk_idx + 1 :])
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
@@ -263,55 +244,6 @@ class ASRModel(PreTrainedModel):
             return_dict=True,
         )
 
-    @torch.no_grad()
-    def generate(
-        self,
-        input_values: torch.Tensor,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 100,
-        **kwargs,
-    ) -> torch.Tensor:
-        # 1. Get audio embeddings (no change here)
-        audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
-        audio_embeds = self.audio_projector(audio_features)
-        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
-
-        batch_size = audio_embeds.shape[0]
-        embed_layer = self.decoder.model.get_input_embeddings()
-
-        # 2. Get pre-computed text part embeddings
-        # Move IDs to the correct device, then get embeddings
-        prompt_embeds_start = embed_layer(self.prompt_ids_start.to(input_values.device))
-        prompt_embeds_end = embed_layer(self.prompt_ids_end.to(input_values.device))
-
-        # 3. Combine embeddings in a single, vectorized operation 🚀
-        # Expand text embeddings to match the batch size
-        batched_prompt_start = prompt_embeds_start.expand(batch_size, -1, -1)
-        batched_prompt_end = prompt_embeds_end.expand(batch_size, -1, -1)
-
-        # Concatenate along the sequence dimension (dim=1)
-        inputs_embeds = torch.cat([batched_prompt_start, audio_embeds, batched_prompt_end], dim=1)
-
-        # 4. Create the attention mask for the combined input
-        attention_mask = torch.ones(
-            inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
-        )
-
-        # 5. Generate and return only the response
-        prompt_length = inputs_embeds.shape[1]
-
-        full_output = self.decoder.model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,  # Pass the new attention mask
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.decoder.tokenizer.pad_token_id,
-            eos_token_id=self.decoder.tokenizer.eos_token_id,
-            **kwargs,
-        )
-
-        # Return only the generated tokens (excluding the instruction prompt)
-        return full_output[:, prompt_length:]
-
 
 class DataCollator:
     """Data collator that performs instruction formatting and masking."""
@@ -328,7 +260,9 @@ class DataCollator:
         self.max_audio_seconds = config.data.max_audio_seconds
         self.max_text_words = config.data.max_text_words
 
-    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(
+        self, features: List[Dict[str, Any]]
+    ) -> Dict[str, Union[torch.Tensor, Optional[torch.Tensor], np.ndarray]]:
         # Filter samples that are too long
         valid_features = []
         for f in features:
@@ -411,9 +345,9 @@ class DataCollator:
             "attention_mask": batch["attention_mask"],
             "labels": batch["labels"],
             "input_values": audio_features.input_features,
-            "encoder_attention_mask": audio_features.attention_mask
-            if hasattr(audio_features, "attention_mask")
-            else None,
+            "encoder_attention_mask": (
+                audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None
+            ),
         }
 
 
@@ -426,8 +360,8 @@ def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureE
 
 
 def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
-    """Load training and validation datasets."""
-    from datasets import Audio, concatenate_datasets
+    """Load training and validation datasets in streaming mode."""
+    from datasets import Audio, interleave_datasets
 
     train_datasets = []
     val_datasets = []
@@ -440,142 +374,119 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
                 train_split = dataset_info.train_splits[i]
                 eval_split = dataset_info.eval_splits[i]
 
-                ds_dict = load_dataset(
+                # Streaming mode - loads data on-the-fly
+                train_ds = load_dataset(
                     "librispeech_asr",
                     dataset_config,
-                    split={"train": train_split, "validation": eval_split},
+                    split=train_split,
+                    streaming=True,
                     cache_dir=config.data.dataset_cache_dir,
-                    num_proc=config.data.num_proc,
                 )
-                train_datasets.append(ds_dict["train"])
-                val_datasets.append(ds_dict["validation"])
+                val_ds = load_dataset(
+                    "librispeech_asr",
+                    dataset_config,
+                    split=eval_split,
+                    streaming=True,
+                    cache_dir=config.data.dataset_cache_dir,
+                )
+
+                train_datasets.append(train_ds)
+                val_datasets.append(val_ds)
 
         elif dataset_info.name == "gigaspeech":
             # Load GigaSpeech (English only)
             import os
+
             token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
             subset = dataset_info.subset if hasattr(dataset_info, "subset") else "xs"
-            # GigaSpeech uses format like "xs" for English
-            ds_dict = load_dataset(
+
+            train_ds = load_dataset(
                 "speechcolab/gigaspeech",
-                subset,  # xs, s, m, l, xl are all English subsets
-                split={"train": dataset_info.train_split, "validation": dataset_info.eval_split},
+                subset,
+                split=dataset_info.train_split,
+                streaming=True,
                 cache_dir=config.data.dataset_cache_dir,
                 trust_remote_code=True,
-                num_proc=config.data.num_proc,
                 token=token,
             )
-            train_datasets.append(ds_dict["train"])
-            val_datasets.append(ds_dict["validation"])
+            val_ds = load_dataset(
+                "speechcolab/gigaspeech",
+                subset,
+                split=dataset_info.eval_split,
+                streaming=True,
+                cache_dir=config.data.dataset_cache_dir,
+                trust_remote_code=True,
+                token=token,
+            )
+
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
 
         elif dataset_info.name == "common_voice":
             # Load Common Voice dataset
             import os
+
             token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
             language = dataset_info.language if hasattr(dataset_info, "language") else "en"
-            ds_dict = load_dataset(
+
+            train_ds = load_dataset(
                 "mozilla-foundation/common_voice_17_0",
                 language,
-                split={"train": dataset_info.train_split, "validation": dataset_info.eval_split},
+                split=dataset_info.train_split,
+                streaming=True,
                 cache_dir=config.data.dataset_cache_dir,
                 trust_remote_code=True,
-                num_proc=config.data.num_proc,
                 token=token,
             )
-            # Common Voice uses 'sentence' field for transcription
-            for split in ["train", "validation"]:
-                ds_dict[split] = ds_dict[split].rename_column("sentence", "text")
-            train_datasets.append(ds_dict["train"])
-            val_datasets.append(ds_dict["validation"])
+            val_ds = load_dataset(
+                "mozilla-foundation/common_voice_17_0",
+                language,
+                split=dataset_info.eval_split,
+                streaming=True,
+                cache_dir=config.data.dataset_cache_dir,
+                trust_remote_code=True,
+                token=token,
+            )
+            # Rename 'sentence' to 'text' for Common Voice
+            train_ds = train_ds.rename_column("sentence", "text")
+            val_ds = val_ds.rename_column("sentence", "text")
 
-    # Concatenate all datasets if we have multiple
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
+
+    # Cast audio column to the correct sampling rate BEFORE interleaving
+    # This ensures all datasets have compatible features
+    for i in range(len(train_datasets)):
+        train_datasets[i] = train_datasets[i].cast_column(
+            "audio", Audio(sampling_rate=config.data.sample_rate)
+        )
+    for i in range(len(val_datasets)):
+        val_datasets[i] = val_datasets[i].cast_column(
+            "audio", Audio(sampling_rate=config.data.sample_rate)
+        )
+
+    # Interleave datasets for better mixing if we have multiple
     if len(train_datasets) > 1:
-        train_dataset = concatenate_datasets(train_datasets)
-        val_dataset = concatenate_datasets(val_datasets)
+        train_dataset = interleave_datasets(
+            train_datasets, stopping_strategy="first_exhausted"  # Stop when shortest dataset ends
+        )
+        val_dataset = interleave_datasets(val_datasets, stopping_strategy="first_exhausted")
     else:
         train_dataset = train_datasets[0]
         val_dataset = val_datasets[0]
 
-    train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
-    val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=config.data.sample_rate))
-
+    # Handle dataset size limits
     if config.data.max_train_samples:
-        train_dataset = train_dataset.select(
-            range(min(config.data.max_train_samples, len(train_dataset)))
-        )
+        train_dataset = train_dataset.take(config.data.max_train_samples)
     if config.data.max_eval_samples:
-        val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
+        # Take limited samples for evaluation
+        val_dataset = val_dataset.take(config.data.max_eval_samples)
+        # Convert to regular dataset to avoid streaming issues during evaluation
+        # This materializes only max_eval_samples into memory
+        val_samples = list(val_dataset)
+        val_dataset = Dataset.from_list(val_samples)
 
     return train_dataset, val_dataset
-
-
-class PredictionLoggingCallback(TrainerCallback):
-    """Callback to log sample predictions to TensorBoard during evaluation."""
-
-    def __init__(self, tokenizer, num_samples=5):
-        self.tokenizer = tokenizer
-        self.num_samples = num_samples
-        self.writer = None
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Log sample predictions after evaluation."""
-        if metrics and hasattr(state, "log_history") and len(state.log_history) > 0:
-            if self.writer is None and args.logging_dir:
-                self.writer = SummaryWriter(log_dir=args.logging_dir)
-
-            if hasattr(state, "sample_predictions"):
-                samples = state.sample_predictions
-                step = state.global_step
-
-                text_table = "| Ground Truth | Prediction |\n|---|---|\n"
-                for _i, (truth, pred) in enumerate(samples[: self.num_samples]):
-                    truth = truth.replace("|", "\\|").replace("\n", " ")
-                    pred = pred.replace("|", "\\|").replace("\n", " ")
-                    text_table += f"| {truth} | {pred} |\n"
-
-                if self.writer:
-                    self.writer.add_text("predictions/samples", text_table, step)
-                    self.writer.flush()
-
-                delattr(state, "sample_predictions")
-
-
-def compute_metrics(eval_pred: EvalPrediction, tokenizer: Any, wer_sample_size: int = 10) -> Dict[str, float]:
-    """
-    Compute WER metric on a subset of samples and store sample predictions.
-    Note: eval_loss is computed automatically by the Trainer on the full eval set.
-    """
-    predictions, label_ids = eval_pred.predictions, eval_pred.label_ids
-
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-    if predictions.ndim == 3:
-        predictions = np.argmax(predictions, axis=-1)
-    if isinstance(label_ids, tuple):
-        label_ids = label_ids[0]
-
-    # Only process a subset of samples for WER calculation and predictions
-    subset_size = min(wer_sample_size, len(predictions))
-    subset_predictions = predictions[:subset_size]
-    subset_label_ids = label_ids[:subset_size].copy()
-
-    # Replace -100 with pad token for decoding
-    subset_label_ids[subset_label_ids == -100] = tokenizer.pad_token_id
-
-    # Decode only the subset
-    decoded_preds = tokenizer.batch_decode(subset_predictions, skip_special_tokens=True)
-    decoded_labels = tokenizer.batch_decode(subset_label_ids, skip_special_tokens=True)
-
-    # Store sample predictions for logging
-    sample_predictions = list(zip(decoded_labels, decoded_preds))
-
-    # Calculate WER only on the subset
-    wer_metric = evaluate.load("wer", cache_dir="./metrics_cache")
-    wer = wer_metric.compute(predictions=decoded_preds, references=decoded_labels)
-
-    metrics = {"wer": wer, "wer_samples": subset_size}
-    metrics["_sample_predictions"] = sample_predictions  # Prefix with _ to avoid logging as metric
-    return metrics
 
 
 @hydra.main(version_base=None, config_path="../configs/hydra", config_name="config")
@@ -590,45 +501,15 @@ def main(cfg: DictConfig) -> None:
     model, tokenizer, feature_extractor = initialize_model(cfg)
     train_dataset, val_dataset = load_datasets(cfg)
 
-    # Handle checkpoint loading for evaluation or resuming
-    if cfg.eval_checkpoint:
-        print(f"Evaluation mode: Loading checkpoint from {cfg.eval_checkpoint}")
-        model = ASRModel.from_pretrained(cfg.eval_checkpoint)
-    elif cfg.resume_from_checkpoint:
+    # Handle checkpoint resuming
+    if cfg.resume_from_checkpoint:
         print(f"Resuming training from checkpoint: {cfg.resume_from_checkpoint}")
         # The Trainer will handle loading optimizer and scheduler states
-
-    # Apply torch.compile for faster training (PyTorch 2.0+)
-    if hasattr(cfg.training, "use_torch_compile") and cfg.training.use_torch_compile:
-        try:
-            print("Compiling model with torch.compile for optimized performance...")
-            compile_mode = cfg.training.get("torch_compile_mode", "reduce-overhead")
-            model = torch.compile(model, mode=compile_mode)
-            print(f"Model compiled with mode: {compile_mode}")
-        except Exception as e:
-            print(f"Warning: torch.compile failed: {e}")
-            print("Continuing without compilation...")
 
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
     assert isinstance(training_args_dict, dict), "Training args must be a dict"
 
-    # Pop custom fields that aren't part of TrainingArguments
-    compute_metrics_enabled = training_args_dict.pop("compute_metrics", True)
-    wer_sample_size = training_args_dict.pop("wer_sample_size", 10)  # Default to 10 samples
-    training_args_dict.pop("use_torch_compile", None)  # Remove torch compile config
-    training_args_dict.pop("torch_compile_mode", None)  # Remove torch compile mode
-
-    training_args = TrainingArguments(**training_args_dict)  # type: ignore[arg-type]
-
-    prediction_callback = PredictionLoggingCallback(tokenizer, num_samples=wer_sample_size)
-
-    def compute_metrics_with_samples(eval_pred):
-        if not compute_metrics_enabled:
-            return None
-        metrics = compute_metrics(eval_pred, tokenizer, wer_sample_size=wer_sample_size)
-        if "_sample_predictions" in metrics:
-            trainer.state.sample_predictions = metrics.pop("_sample_predictions")
-        return metrics
+    training_args = TrainingArguments(**training_args_dict)
 
     trainer = Trainer(
         model=model,
@@ -641,16 +522,12 @@ def main(cfg: DictConfig) -> None:
             config=cfg,
         ),
         processing_class=tokenizer,
-        compute_metrics=compute_metrics_with_samples,
-        callbacks=[prediction_callback],
+        # No compute_metrics - only eval_loss will be calculated
     )
 
-    if cfg.eval_checkpoint:
-        results = trainer.evaluate()
-        print(f"Evaluation results: {results}")
-    else:
-        trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
-        trainer.save_model()
+    # Train the model
+    trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
+    trainer.save_model()
 
 
 if __name__ == "__main__":

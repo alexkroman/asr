@@ -31,11 +31,9 @@ report_to: []
 # Evaluation
 eval_strategy: steps
 eval_steps: 100
-wer_sample_size: 10  # Number of samples to use for WER calculation and prediction logging
 
 # Saving
 save_strategy: epoch
-save_per_epoch: 1
 save_total_limit: 3
 load_best_model_at_end: true
 metric_for_best_model: eval_loss
@@ -51,10 +49,6 @@ fp16: false
 bf16: true
 dataloader_pin_memory: true
 max_grad_norm: 1.0
-
-# Torch compile (PyTorch 2.0+)
-use_torch_compile: false  # Disabled by default
-torch_compile_mode: default  # Options: default, reduce-overhead, max-autotune
 
 # Misc
 seed: 42

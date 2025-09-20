@@ -2,9 +2,13 @@
 
 defaults:
   - override /model: large
-  - override /data: production_split
+  - override /data: production_streaming  # Use streaming for faster startup
   - override /training: production
 
 # Production-specific overrides
 training:
   push_to_hub: false
+
+  # Streaming compatibility settings
+  dataloader_num_workers: 0  # Required for streaming datasets
+  dataloader_persistent_workers: false

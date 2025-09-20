@@ -1,0 +1,43 @@
+# @package _global_
+defaults:
+  - override /model: small
+  - override /data: production_streaming  # Uses streaming mode
+  - override /training: production
+
+# Override specific training settings for streaming compatibility
+training:
+  output_dir: ./outputs/streaming_model
+  num_train_epochs: 1  # Streaming datasets work better with epochs
+  max_steps: -1  # Let epochs control training length
+
+  # Evaluation strategy for streaming
+  eval_strategy: steps
+  eval_steps: 100  # Evaluate every 500 steps
+  save_strategy: steps
+  save_steps: 500
+
+
+  # Logging
+  logging_steps: 10
+  logging_first_step: true
+  report_to: tensorboard
+
+  # Performance settings
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8
+
+  # Streaming datasets don't support dataloader_num_workers > 0
+  dataloader_num_workers: 0
+  dataloader_persistent_workers: false
+
+  # Memory optimization
+  gradient_checkpointing: true
+  fp16: false
+  bf16: true
+
+# Data configuration for streaming
+data:
+  use_streaming: true
+  max_train_samples: null  # Process full dataset in streaming mode
+  max_eval_samples: 500  # Limit eval samples for faster evaluation
