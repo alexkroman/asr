@@ -451,18 +451,40 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
                 val_datasets.append(ds_dict["validation"])
 
         elif dataset_info.name == "gigaspeech":
-            # Load GigaSpeech
+            # Load GigaSpeech (English only)
             import os
             token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
+            subset = dataset_info.subset if hasattr(dataset_info, "subset") else "xs"
+            # GigaSpeech uses format like "xs" for English
             ds_dict = load_dataset(
                 "speechcolab/gigaspeech",
-                dataset_info.subset if hasattr(dataset_info, "subset") else "xs",
+                subset,  # xs, s, m, l, xl are all English subsets
                 split={"train": dataset_info.train_split, "validation": dataset_info.eval_split},
                 cache_dir=config.data.dataset_cache_dir,
                 trust_remote_code=True,
                 num_proc=config.data.num_proc,
                 token=token,
             )
+            train_datasets.append(ds_dict["train"])
+            val_datasets.append(ds_dict["validation"])
+
+        elif dataset_info.name == "common_voice":
+            # Load Common Voice dataset
+            import os
+            token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
+            language = dataset_info.language if hasattr(dataset_info, "language") else "en"
+            ds_dict = load_dataset(
+                "mozilla-foundation/common_voice_17_0",
+                language,
+                split={"train": dataset_info.train_split, "validation": dataset_info.eval_split},
+                cache_dir=config.data.dataset_cache_dir,
+                trust_remote_code=True,
+                num_proc=config.data.num_proc,
+                token=token,
+            )
+            # Common Voice uses 'sentence' field for transcription
+            for split in ["train", "validation"]:
+                ds_dict[split] = ds_dict[split].rename_column("sentence", "text")
             train_datasets.append(ds_dict["train"])
             val_datasets.append(ds_dict["validation"])
 

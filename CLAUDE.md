@@ -79,9 +79,9 @@ For RunPod/CUDA:
 RunPod instances come with PyTorch pre-installed with CUDA support. The training scripts use the system Python (python3) directly rather than a virtual environment to avoid conflicts with the pre-installed CUDA libraries. The deployment script installs only the additional required packages (transformers, accelerate, etc.) via pip3.
 
 ## Dataset
-The project uses LibriSpeech and GigaSpeech datasets from Hugging Face.
+The project uses LibriSpeech, GigaSpeech, and Common Voice datasets from Hugging Face.
 
-**Important for GigaSpeech**: This is a gated dataset requiring authentication:
+**Important for GigaSpeech and Common Voice**: These are gated datasets requiring authentication:
 1. Accept the license at https://huggingface.co/datasets/speechcolab/gigaspeech
 2. Create a token at https://huggingface.co/settings/tokens
 3. Export it: `export HUGGING_FACE_HUB_TOKEN='your_token'`

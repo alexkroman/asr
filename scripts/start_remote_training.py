@@ -70,10 +70,10 @@ export TORCH_HOME=/workspace/.cache/torch
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export HUGGING_FACE_HUB_TOKEN="{hf_token}"  # Pass through from host
 export DATASETS_PARALLEL=1  # Enable parallel dataset processing
-export HF_DATASETS_MULTIPROCESSING_MAX_WORKERS=24  # Match Xeon Gold 6342 cores
-export HF_DATASETS_DOWNLOAD_MANAGER_MAX_WORKERS=8  # Parallel downloads within each dataset
-export HF_DATASETS_DOWNLOAD_BATCH_SIZE=100  # Download multiple files in parallel
-export DATASETS_MAX_CONCURRENT_DOWNLOADS=8  # Max concurrent file downloads
+export HF_DATASETS_MULTIPROCESSING_MAX_WORKERS=8  # Optimized for 9 vCPUs
+export HF_DATASETS_DOWNLOAD_MANAGER_MAX_WORKERS=4  # Parallel downloads within each dataset
+export HF_DATASETS_DOWNLOAD_BATCH_SIZE=50  # Download multiple files in parallel
+export DATASETS_MAX_CONCURRENT_DOWNLOADS=4  # Max concurrent file downloads
 
 export TOKENIZERS_PARALLELISM=false  # Disable parallel tokenization to avoid deadlocks
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512  # Better memory management
