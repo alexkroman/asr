@@ -8,7 +8,6 @@ defaults:
 # Debug-specific overrides
 training:
   output_dir: ./outputs/debug_model
-  num_train_epochs: 2
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 1
 

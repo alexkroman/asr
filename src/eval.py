@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import evaluate
 import torch
+from accelerate import Accelerator
 from datasets import Audio, load_dataset
 from torch.utils.data import DataLoader
 from transformers import WhisperFeatureExtractor
@@ -22,24 +23,17 @@ from src.train import ASRModel
 
 def load_model_and_processors(
     checkpoint_path: str,
-) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
-    """Load the model from checkpoint and return model, tokenizer, and feature extractor."""
+) -> Tuple[Any, Any, WhisperFeatureExtractor]:
+    """Load the model from checkpoint using the from_pretrained method."""
     print(f"Loading model from: {checkpoint_path}")
+
+    # Use the ASRModel's from_pretrained method
     model = ASRModel.from_pretrained(checkpoint_path)
     model.eval()
 
-    # Get tokenizer and feature extractor from the model
+    # Get tokenizer and feature extractor
     tokenizer = model.decoder.tokenizer
     feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-
-    # Move model to appropriate device
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available() else "cpu"
-    )
-    model = model.to(device)
-    print(f"Using device: {device}")
 
     return model, tokenizer, feature_extractor
 
@@ -50,22 +44,39 @@ def load_validation_dataset(
     split: str = "validation",
     num_samples: int = 10,
 ) -> Any:
-    """Load a validation dataset for evaluation."""
-    print(f"Loading {dataset_name} dataset (config={config}, split={split})...")
+    """Load a validation dataset for evaluation using streaming."""
+    print(f"Loading {dataset_name} dataset (config={config}, split={split}) in streaming mode...")
 
-    dataset = load_dataset(dataset_name, config, split=split)
+    # Use streaming to avoid downloading the entire dataset
+    dataset = load_dataset(
+        dataset_name,
+        config,
+        split=split,
+        streaming=True,
+        cache_dir="/workspace/datasets" if Path("/workspace").exists() else None,
+    )
+
+    # Cast audio to correct sampling rate
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
     # Take only the specified number of samples
-    if num_samples and len(dataset) > num_samples:
-        dataset = dataset.select(range(num_samples))
+    if num_samples:
+        dataset = dataset.take(num_samples)
+        # Convert to list to materialize only these samples
+        samples = list(dataset)
+        # Convert back to a regular dataset for compatibility with DataLoader
+        from datasets import Dataset
 
-    print(f"Loaded {len(dataset)} samples for evaluation")
+        dataset = Dataset.from_list(samples)
+        print(f"Loaded {len(dataset)} samples for evaluation")
+    else:
+        print("Loaded streaming dataset for evaluation")
+
     return dataset
 
 
 def evaluate_model(
-    model: ASRModel,
+    model: Any,
     tokenizer: Any,
     feature_extractor: WhisperFeatureExtractor,
     dataset: Any,
@@ -73,7 +84,8 @@ def evaluate_model(
 ) -> Dict[str, Any]:
     """Evaluate the model on the dataset and calculate WER."""
 
-    device = next(model.parameters()).device
+    # Initialize accelerator
+    accelerator = Accelerator(mixed_precision="fp16")
 
     # Create a simple data collator
     class SimpleDataCollator:
@@ -111,20 +123,28 @@ def evaluate_model(
     collator = SimpleDataCollator(tokenizer, feature_extractor)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collator)
 
+    # Prepare model and dataloader with accelerator
+    model, dataloader = accelerator.prepare(model, dataloader)
+
+    print(f"Using device: {accelerator.device}")
+    if accelerator.device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
     all_predictions = []
     all_references = []
 
     print("\nGenerating predictions...")
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            # Move inputs to device
-            input_values = batch["input_values"].to(device)
+            # Inputs are automatically on the right device with accelerator
+            input_values = batch["input_values"]
             encoder_attention_mask = batch["encoder_attention_mask"]
-            if encoder_attention_mask is not None:
-                encoder_attention_mask = encoder_attention_mask.to(device)
 
-            # Generate predictions
-            generated_ids = model.generate(
+            # Unwrap the model to access custom methods
+            unwrapped_model = accelerator.unwrap_model(model)
+
+            # Generate predictions with the unwrapped model
+            generated_ids = unwrapped_model.generate(
                 input_values=input_values,
                 encoder_attention_mask=encoder_attention_mask,
                 max_new_tokens=100,

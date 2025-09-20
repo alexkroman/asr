@@ -13,6 +13,8 @@ from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
 from transformers import (
+    AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
     PretrainedConfig,
@@ -116,16 +118,64 @@ class LLMDecoder(nn.Module):
         return self.model(**kwargs)
 
 
+class ASRModelConfig(PretrainedConfig):
+    model_type = "asr_model"
+
+    def __init__(
+        self,
+        decoder_model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        lora_r=32,
+        lora_alpha=64,
+        lora_target_modules=None,
+        lora_dropout=0.05,
+        **kwargs,
+    ):
+        self.decoder_model_name = decoder_model_name
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
+        self.lora_dropout = lora_dropout
+        super().__init__(**kwargs)
+
+
 class ASRModel(PreTrainedModel):
+    config_class = ASRModelConfig
     base_model_prefix = "asr"
     supports_gradient_checkpointing = True
     _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
 
-    def __init__(self, config: DictConfig) -> None:
-        minimal_config = PretrainedConfig()
-        super().__init__(minimal_config)
+    def __init__(self, config: Union[DictConfig, ASRModelConfig]) -> None:
+        # Handle both Hydra config and HuggingFace config
+        from omegaconf import DictConfig as OmegaDictConfig
 
-        self.hydra_config = config
+        if isinstance(config, OmegaDictConfig):
+            # Convert Hydra config to HuggingFace config
+            hf_config = ASRModelConfig(
+                decoder_model_name=config.model.decoder_model_name,
+                lora_r=config.model.lora_r,
+                lora_alpha=config.model.lora_alpha,
+                lora_target_modules=list(config.model.lora_target_modules),
+                lora_dropout=config.model.lora_dropout,
+            )
+            super().__init__(hf_config)
+            self.hydra_config = config
+        else:
+            # Already a HuggingFace config
+            super().__init__(config)
+            # Create a minimal DictConfig for compatibility
+            from omegaconf import DictConfig as OmegaDictConfig
+
+            self.hydra_config = OmegaDictConfig(
+                {
+                    "model": {
+                        "decoder_model_name": config.decoder_model_name,
+                        "lora_r": config.lora_r,
+                        "lora_alpha": config.lora_alpha,
+                        "lora_target_modules": config.lora_target_modules,
+                        "lora_dropout": config.lora_dropout,
+                    }
+                }
+            )
         self.encoder = WhisperEncoder(config)
         self.decoder = LLMDecoder(config)
         self.config = self.decoder.model.config
@@ -133,6 +183,17 @@ class ASRModel(PreTrainedModel):
         audio_dim = self.encoder.d_model
         self.audio_projector = AudioProjector(audio_dim, text_dim, config)
         self.add_audio_special_tokens()
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save the model and its configuration."""
+        # The parent class will save config.json automatically
+        super().save_pretrained(save_directory, **kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """Load a model from a saved checkpoint."""
+        # Use the parent class method which handles config.json automatically
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
@@ -243,6 +304,73 @@ class ASRModel(PreTrainedModel):
             labels=labels,
             return_dict=True,
         )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_values: torch.Tensor,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 100,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Generate text from audio input."""
+        # Get audio embeddings
+        audio_features = self.encoder(input_values, attention_mask=encoder_attention_mask)
+        audio_embeds = self.audio_projector(audio_features)
+        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
+
+        batch_size = audio_embeds.shape[0]
+        embed_layer = self.decoder.model.get_input_embeddings()
+
+        # Build the instruction prompt
+        instruction = (
+            "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+        )
+        prompt_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids
+        prompt_ids = prompt_ids.to(input_values.device)
+
+        # Find the audio chunk placeholder
+        chunk_idx = (prompt_ids[0] == self.audio_chunk_id).nonzero()
+        if chunk_idx.shape[0] == 0:
+            raise ValueError("'<|audio_chunk|>' token not found in instruction.")
+        chunk_idx = chunk_idx[0].item()
+
+        # Get embeddings for the prompt
+        prompt_embeds = embed_layer(prompt_ids)
+
+        # Build inputs for each sample in batch
+        inputs_embeds_list = []
+        for i in range(batch_size):
+            # Combine prompt and audio embeddings
+            combined_embeds = torch.cat(
+                [prompt_embeds[0, :chunk_idx], audio_embeds[i], prompt_embeds[0, chunk_idx + 1 :]],
+                dim=0,
+            )
+            inputs_embeds_list.append(combined_embeds)
+
+        # Pad to same length
+        inputs_embeds = torch.nn.utils.rnn.pad_sequence(
+            inputs_embeds_list, batch_first=True, padding_value=0
+        )
+
+        # Create attention mask
+        attention_mask = torch.ones(
+            inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
+        )
+
+        # Generate
+        prompt_length = inputs_embeds.shape[1]
+        full_output = self.decoder.model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.decoder.tokenizer.pad_token_id,
+            eos_token_id=self.decoder.tokenizer.eos_token_id,
+            **kwargs,
+        )
+
+        # Return only the generated tokens (excluding the prompt)
+        return full_output[:, prompt_length:]
 
 
 class DataCollator:
@@ -528,6 +656,11 @@ def main(cfg: DictConfig) -> None:
     # Train the model
     trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
     trainer.save_model()
+
+
+# Register the model with AutoModel
+AutoConfig.register("asr_model", ASRModelConfig)
+AutoModel.register(ASRModelConfig, ASRModel)
 
 
 if __name__ == "__main__":

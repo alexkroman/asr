@@ -1,20 +1,19 @@
 # @package _global_
 defaults:
-  - override /model: small
+  - override /model: large
   - override /data: production_streaming  # Uses streaming mode
   - override /training: production
 
 # Override specific training settings for streaming compatibility
 training:
   output_dir: ./outputs/streaming_model
-  num_train_epochs: 1  # Streaming datasets work better with epochs
   max_steps: -1  # Let epochs control training length
 
   # Evaluation strategy for streaming
   eval_strategy: steps
   eval_steps: 100  # Evaluate every 500 steps
   save_strategy: steps
-  save_steps: 500
+  save_steps: 5
 
 
   # Logging
