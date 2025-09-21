@@ -129,6 +129,7 @@ def install_python_dependencies(host, port):
     required_packages = [
         "transformers>=4.35.0",
         "accelerate>=0.24.0",
+        "bitsandbytes",
         "datasets==3.6.0",
         "peft>=0.6.0",
         "evaluate>=0.4.0",

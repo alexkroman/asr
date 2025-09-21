@@ -403,7 +403,6 @@ class DataCollator:
         self.feature_extractor = feature_extractor
         self.sample_rate = config.data.sample_rate
         self.max_audio_seconds = config.data.max_audio_seconds
-        self.max_text_words = config.data.max_text_words
 
     def __call__(
         self, features: List[Dict[str, Any]]
@@ -418,12 +417,8 @@ class DataCollator:
                 # Handle different field names for transcription text
                 # LibriSpeech uses "text", GigaSpeech uses "text" or "sentence"
                 text = f.get("text") or f.get("sentence") or ""
-                text_len_words = len(text.split())
 
-                if (
-                    audio_len_sec <= self.max_audio_seconds
-                    and text_len_words <= self.max_text_words
-                ):
+                if audio_len_sec <= self.max_audio_seconds:
                     # Normalize to use "text" field
                     if "text" not in f:
                         f["text"] = text
