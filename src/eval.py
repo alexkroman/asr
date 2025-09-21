@@ -31,9 +31,10 @@ def load_model_and_processors(
     model = ASRModel.from_pretrained(checkpoint_path)
     model.eval()
 
-    # Get tokenizer and feature extractor
-    tokenizer = model.decoder.tokenizer
-    feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
+    # Load tokenizer and feature extractor from checkpoint
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    feature_extractor = WhisperFeatureExtractor.from_pretrained(checkpoint_path)
 
     return model, tokenizer, feature_extractor
 
@@ -62,12 +63,9 @@ def load_validation_dataset(
     # Take only the specified number of samples
     if num_samples:
         dataset = dataset.take(num_samples)
-        # Convert to list to materialize only these samples
-        samples = list(dataset)
-        # Convert back to a regular dataset for compatibility with DataLoader
+        # Materialize samples
         from datasets import Dataset
-
-        dataset = Dataset.from_list(samples)
+        dataset = Dataset.from_list(list(dataset))
         print(f"Loaded {len(dataset)} samples for evaluation")
     else:
         print("Loaded streaming dataset for evaluation")
@@ -85,7 +83,7 @@ def evaluate_model(
     """Evaluate the model on the dataset and calculate WER."""
 
     # Initialize accelerator
-    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator = Accelerator(mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16")
 
     # Create a simple data collator
     class SimpleDataCollator:
@@ -104,19 +102,15 @@ def evaluate_model(
                 return_tensors="pt",
                 return_attention_mask=True,
                 padding="max_length",
-                max_length=480000,
+                max_length=480000,  # 30 seconds at 16kHz
             )
 
             # Process text (for reference)
             texts = [f.get("text", f.get("sentence", "")) for f in features]
 
             return {
-                "input_values": audio_features.input_features,
-                "encoder_attention_mask": (
-                    audio_features.attention_mask
-                    if hasattr(audio_features, "attention_mask")
-                    else None
-                ),
+                "input_features": audio_features.input_features,
+                "attention_mask": getattr(audio_features, "attention_mask", None),
                 "texts": texts,
             }
 
@@ -137,19 +131,18 @@ def evaluate_model(
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             # Inputs are automatically on the right device with accelerator
-            input_values = batch["input_values"]
-            encoder_attention_mask = batch["encoder_attention_mask"]
+            input_features = batch["input_features"]
+            attention_mask = batch["attention_mask"]
 
             # Unwrap the model to access custom methods
             unwrapped_model = accelerator.unwrap_model(model)
 
-            # Generate predictions with the unwrapped model
+            # Generate predictions using standard HF parameter names
             generated_ids = unwrapped_model.generate(
-                input_values=input_values,
-                encoder_attention_mask=encoder_attention_mask,
+                input_features=input_features,
+                attention_mask=attention_mask,
                 max_new_tokens=100,
                 do_sample=False,  # Greedy decoding for evaluation
-                temperature=1.0,
             )
 
             # Decode predictions
@@ -172,7 +165,7 @@ def evaluate_model(
     print("SAMPLE PREDICTIONS (Truth | Prediction)")
     print("=" * 80)
 
-    for i, (ref, pred) in enumerate(zip(all_references, all_predictions)):
+    for i, (ref, pred) in enumerate(zip(all_references[:5], all_predictions[:5])):
         print(f"\nSample {i+1}:")
         print(f"Truth:      {ref}")
         print(f"Prediction: {pred}")
