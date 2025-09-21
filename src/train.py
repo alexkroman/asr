@@ -213,17 +213,16 @@ class ASRModel(PreTrainedModel):
 
     def add_audio_special_tokens(self):
         """Add audio-specific special tokens for better audio-text alignment."""
-        special_tokens = {
-            "additional_special_tokens": [
-                "<|audio_start|>",
-                "<|audio_end|>",
-                "<|audio_pad|>",
-                "<|audio_sep|>",
-                "<|audio_chunk|>",  # Placeholder for audio embeddings in instruction
-            ]
-        }
+        audio_tokens = [
+            "<|audio_start|>",
+            "<|audio_end|>",
+            "<|audio_pad|>",
+            "<|audio_sep|>",
+            "<|audio_chunk|>",  # Placeholder for audio embeddings in instruction
+        ]
 
-        num_added = self.decoder.tokenizer.add_special_tokens(special_tokens)
+        # First add them as regular tokens to ensure they're treated as single tokens
+        num_added = self.decoder.tokenizer.add_tokens(audio_tokens, special_tokens=True)
 
         if num_added > 0:
             # Check if model is on meta device
@@ -398,11 +397,13 @@ class DataCollator:
         tokenizer: Any,
         feature_extractor: WhisperFeatureExtractor,
         config: DictConfig,
+        model: Optional[ASRModel] = None,
     ):
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor
         self.sample_rate = config.data.sample_rate
         self.max_audio_seconds = config.data.max_audio_seconds
+        self.model = model
 
     def __call__(
         self, features: List[Dict[str, Any]]
@@ -660,6 +661,7 @@ def main(cfg: DictConfig) -> None:
             tokenizer=tokenizer,
             feature_extractor=feature_extractor,
             config=cfg,
+            model=model,
         ),
         processing_class=tokenizer,
         # No compute_metrics - only eval_loss will be calculated

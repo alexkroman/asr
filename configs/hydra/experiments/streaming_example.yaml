@@ -27,8 +27,8 @@ training:
   gradient_accumulation_steps: 8
 
   # Streaming datasets don't support dataloader_num_workers > 0
-  dataloader_num_workers: 0
-  dataloader_persistent_workers: false
+  dataloader_num_workers: 6
+  dataloader_persistent_workers: true
 
   # Memory optimization
   gradient_checkpointing: true

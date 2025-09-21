@@ -13,5 +13,5 @@ training:
   push_to_hub: false
 
   # Streaming compatibility settings
-  dataloader_num_workers: 0  # Required for streaming datasets
-  dataloader_persistent_workers: false
+  dataloader_num_workers: 16  # Required for streaming datasets
+  dataloader_persistent_workers: true
