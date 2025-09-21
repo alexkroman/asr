@@ -11,13 +11,13 @@ training:
 
   # Evaluation strategy for streaming
   eval_strategy: steps
-  eval_steps: 500  # Evaluate every 500 steps
+  eval_steps: 1000  # Evaluate every 500 steps
   save_strategy: steps
   save_steps: 1000
 
 
   # Logging
-  logging_steps: 10
+  logging_steps: 50
   logging_first_step: true
   report_to: tensorboard
 

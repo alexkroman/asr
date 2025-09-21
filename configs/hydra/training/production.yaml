@@ -4,9 +4,9 @@ overwrite_output_dir: false
 
 # Training configuration
 max_steps: 100000  # Use steps instead of epochs for streaming datasets
-per_device_train_batch_size: 6
-per_device_eval_batch_size: 6
-gradient_accumulation_steps: 3
+per_device_train_batch_size: 5
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4
 eval_accumulation_steps: 1
 
 # Learning rate
@@ -51,7 +51,6 @@ fp16: false
 bf16: true
 dataloader_pin_memory: true
 max_grad_norm: 1.0
-group_by_length: true  # Group similar-length samples to reduce padding and memory spikes
 
 # Misc
 seed: 42
