@@ -96,9 +96,17 @@ class LLMDecoder(nn.Module):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_model_name, token=False)
 
+        # Set up proper padding token - use a dedicated pad token or add one
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            # Try to use an existing special token that's not EOS
+            if self.tokenizer.unk_token and self.tokenizer.unk_token != self.tokenizer.eos_token:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
+                self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
+            else:
+                # Add a new pad token
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                # Resize model embeddings to accommodate the new token
+                self.model.resize_token_embeddings(len(self.tokenizer))
 
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.config.bos_token_id = self.tokenizer.bos_token_id
@@ -373,6 +381,7 @@ class ASRModel(PreTrainedModel):
             initial_embeds = initial_embeds.expand(batch_size, -1, -1)
 
         # Generate from embeddings
+        # HF will handle attention mask automatically since we have a proper pad token
         outputs = self.decoder.model.generate(
             inputs_embeds=initial_embeds,
             max_new_tokens=max_new_tokens,
