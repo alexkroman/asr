@@ -2,7 +2,6 @@
 """Deploy and sync ASR project to RunPod instance."""
 
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -140,7 +139,7 @@ def install_python_dependencies(host, port):
         "hf-transfer",  # For fast HuggingFace downloads
         "ninja",  # For faster CUDA kernel compilation
         "soundfile",
-        "librosa" # Required by datasets for audio decoding
+        "librosa",  # Required by datasets for audio decoding
     ]
 
     packages_str = " ".join(f'"{pkg}"' for pkg in required_packages)
@@ -162,14 +161,17 @@ def install_python_dependencies(host, port):
 
 def main():
     parser = argparse.ArgumentParser(description="Deploy ASR project to RunPod instance")
-    parser.add_argument("host", help="RunPod instance IP address (e.g., 192.168.1.100 or pod.runpod.io)")
+    parser.add_argument(
+        "host", help="RunPod instance IP address (e.g., 192.168.1.100 or pod.runpod.io)"
+    )
     parser.add_argument("port", type=int, help="SSH port for the RunPod instance (e.g., 22222)")
-    parser.add_argument("--skip-setup", action="store_true",
-                       help="Skip system dependency installation")
-    parser.add_argument("--skip-sync", action="store_true",
-                       help="Skip project file sync")
-    parser.add_argument("--skip-deps", action="store_true",
-                       help="Skip Python dependency installation")
+    parser.add_argument(
+        "--skip-setup", action="store_true", help="Skip system dependency installation"
+    )
+    parser.add_argument("--skip-sync", action="store_true", help="Skip project file sync")
+    parser.add_argument(
+        "--skip-deps", action="store_true", help="Skip Python dependency installation"
+    )
 
     args = parser.parse_args()
 
@@ -192,16 +194,16 @@ def main():
     if not args.skip_deps:
         install_python_dependencies(args.host, args.port)
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("Deployment complete!")
-    print(f"You can now SSH into your RunPod instance:")
+    print("You can now SSH into your RunPod instance:")
     print(f"  ssh -i ~/.ssh/id_ed25519 -p {args.port} root@{args.host}")
     print("\nTo start training:")
     print("  cd /workspace")
     print("  python3 src/train.py +experiments=production")
     print("\nOr use the training script:")
     print(f"  python scripts/start_remote_training.py {args.host} {args.port}")
-    print("="*50)
+    print("=" * 50)
 
 
 if __name__ == "__main__":

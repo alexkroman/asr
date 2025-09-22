@@ -21,6 +21,7 @@ from modeling import (
     ASRModelConfig,
 )
 
+
 def create_asr_model(config: DictConfig) -> ASRModel:
     """Create ASRModel with Hydra config."""
     asr_config = ASRModelConfig(
@@ -59,7 +60,9 @@ def evaluate_samples(model, tokenizer, feature_extractor, eval_samples, device=N
             )
 
             input_features = inputs.input_features.to(device)
-            attention_mask = inputs.attention_mask.to(device) if hasattr(inputs, 'attention_mask') else None
+            attention_mask = (
+                inputs.attention_mask.to(device) if hasattr(inputs, "attention_mask") else None
+            )
 
             generated_ids = model.generate(
                 input_features=input_features,
@@ -122,7 +125,9 @@ class DataCollator:
         self.max_audio_seconds = config.data.max_audio_seconds
         self.model = model
         # Cache instruction length to avoid recomputing
-        self.instruction_length = len(tokenizer.encode(model.INSTRUCTION_TEMPLATE, add_special_tokens=False))
+        self.instruction_length = len(
+            tokenizer.encode(model.INSTRUCTION_TEMPLATE, add_special_tokens=False)
+        )
 
     def __call__(
         self, features: List[Dict[str, Any]]
@@ -185,7 +190,7 @@ class DataCollator:
 
         # Create labels and mask the instruction part (we only train on the response)
         labels = batch["input_ids"].clone()
-        labels[:, :self.instruction_length] = -100
+        labels[:, : self.instruction_length] = -100
         if self.tokenizer.pad_token_id is not None:
             labels[labels == self.tokenizer.pad_token_id] = -100
 
@@ -200,8 +205,6 @@ class DataCollator:
                 audio_features.attention_mask if hasattr(audio_features, "attention_mask") else None
             ),
         }
-
-
 
 
 def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
@@ -221,14 +224,14 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
                     "librispeech_asr",
                     dataset_config,
                     split=train_split,
-                    streaming=False,  # Don't use streaming for tiny dataset
+                    streaming=True,  # Use streaming to avoid downloading entire dataset
                     cache_dir=config.data.dataset_cache_dir,
                 )
                 val_ds = load_dataset(
                     "librispeech_asr",
                     dataset_config,
                     split=eval_split,
-                    streaming=False,  # Don't use streaming for tiny dataset
+                    streaming=True,  # Use streaming to avoid downloading entire dataset
                     cache_dir=config.data.dataset_cache_dir,
                 )
 
@@ -314,9 +317,7 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         )
 
     if len(train_datasets) > 1:
-        train_dataset = interleave_datasets(
-            train_datasets, stopping_strategy="first_exhausted"
-        )
+        train_dataset = interleave_datasets(train_datasets, stopping_strategy="first_exhausted")
         val_dataset = interleave_datasets(val_datasets, stopping_strategy="first_exhausted")
     else:
         train_dataset = train_datasets[0]
@@ -324,20 +325,24 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
 
     # Apply sample limits
     if config.data.max_train_samples:
-        if hasattr(train_dataset, 'take'):
+        if hasattr(train_dataset, "take"):
             # Streaming dataset
             train_dataset = train_dataset.take(config.data.max_train_samples)
         else:
             # Regular dataset
-            train_dataset = train_dataset.select(range(min(config.data.max_train_samples, len(train_dataset))))
+            train_dataset = train_dataset.select(
+                range(min(config.data.max_train_samples, len(train_dataset)))
+            )
 
     if config.data.max_eval_samples:
-        if hasattr(val_dataset, 'take'):
+        if hasattr(val_dataset, "take"):
             # Streaming dataset
             val_dataset = val_dataset.take(config.data.max_eval_samples)
         else:
             # Regular dataset
-            val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
+            val_dataset = val_dataset.select(
+                range(min(config.data.max_eval_samples, len(val_dataset)))
+            )
 
     return train_dataset, val_dataset
 
@@ -391,8 +396,9 @@ def main(cfg: DictConfig) -> None:
                 print(f"✅ Copied modeling.py to {modeling_dst} for Hub upload")
 
     class PredictionLoggingCallback(TrainerCallback):
-
-        def __init__(self, eval_dataset, tokenizer, feature_extractor, cfg, log_predictions_every_n_steps=500):
+        def __init__(
+            self, eval_dataset, tokenizer, feature_extractor, cfg, log_predictions_every_n_steps=500
+        ):
             self.eval_dataset = eval_dataset
             self.tokenizer = tokenizer
             self.feature_extractor = feature_extractor
@@ -402,11 +408,13 @@ def main(cfg: DictConfig) -> None:
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
             # Log predictions every N steps
-            if state.global_step % self.log_predictions_every_n_steps == 0 and state.global_step > 0:
+            if (
+                state.global_step % self.log_predictions_every_n_steps == 0
+                and state.global_step > 0
+            ):
                 self._log_predictions(args, state, model)
 
         def _log_predictions(self, args, state, model):
-
             if model is None:
                 return
 
@@ -415,7 +423,7 @@ def main(cfg: DictConfig) -> None:
 
             model.eval()
 
-            num_samples = getattr(self.cfg, 'log_predictions_samples', 10)
+            num_samples = getattr(self.cfg, "log_predictions_samples", 10)
 
             # Always use streaming dataset's take method
             eval_samples = list(self.eval_dataset.take(num_samples))
@@ -430,7 +438,9 @@ def main(cfg: DictConfig) -> None:
 
             predictions_text = []
             for i, (ref, pred) in enumerate(zip(references[:5], predictions[:5])):
-                predictions_text.append(f"**Sample {i+1}**\n\nTruth: {ref}\n\nPrediction: {pred}\n\n---")
+                predictions_text.append(
+                    f"**Sample {i + 1}**\n\nTruth: {ref}\n\nPrediction: {pred}\n\n---"
+                )
 
             full_text = "\n".join(predictions_text)
             self.writer.add_text("eval/predictions", full_text, state.global_step)
@@ -449,14 +459,16 @@ def main(cfg: DictConfig) -> None:
         callbacks.append(ModelingFileCopyCallback())
 
     if val_dataset and "tensorboard" in training_args.report_to:
-        log_predictions_every_n_steps = getattr(cfg, 'log_predictions_every_n_steps', 500)
-        callbacks.append(PredictionLoggingCallback(
-            eval_dataset=val_dataset,
-            tokenizer=tokenizer,
-            feature_extractor=feature_extractor,
-            cfg=cfg,
-            log_predictions_every_n_steps=log_predictions_every_n_steps
-        ))
+        log_predictions_every_n_steps = getattr(cfg, "log_predictions_every_n_steps", 500)
+        callbacks.append(
+            PredictionLoggingCallback(
+                eval_dataset=val_dataset,
+                tokenizer=tokenizer,
+                feature_extractor=feature_extractor,
+                cfg=cfg,
+                log_predictions_every_n_steps=log_predictions_every_n_steps,
+            )
+        )
 
     trainer = Trainer(
         model=model,
@@ -479,6 +491,7 @@ def main(cfg: DictConfig) -> None:
     if training_args.push_to_hub:
         print("\n🚀 Pushing final model to Hub...")
         trainer.push_to_hub()
+
 
 if __name__ == "__main__":
     main()

@@ -57,7 +57,8 @@ def start_training(host, port, experiment, session_name, env_vars=None):
 
     # Get the token from environment
     import os
-    hf_token = os.environ.get('HUGGING_FACE_HUB_TOKEN', '')
+
+    hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
 
     # Create a shell script to run on the remote
     training_script = f"""#!/bin/bash
@@ -170,14 +171,20 @@ def main():
     parser = argparse.ArgumentParser(description="Start training on remote RunPod instance")
     parser.add_argument("host", help="RunPod instance IP address or hostname")
     parser.add_argument("port", type=int, help="SSH port for the RunPod instance")
-    parser.add_argument("--experiment", default="production",
-                       help="Experiment config to use (default: production)")
-    parser.add_argument("--session-name", default=None,
-                       help="Name for the tmux session (default: train_YYYYMMDD_HHMMSS)")
-    parser.add_argument("--no-attach", action="store_true",
-                       help="Don't attach to session after starting")
-    parser.add_argument("--force", action="store_true",
-                       help="Kill existing session with same name if it exists")
+    parser.add_argument(
+        "--experiment", default="production", help="Experiment config to use (default: production)"
+    )
+    parser.add_argument(
+        "--session-name",
+        default=None,
+        help="Name for the tmux session (default: train_YYYYMMDD_HHMMSS)",
+    )
+    parser.add_argument(
+        "--no-attach", action="store_true", help="Don't attach to session after starting"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Kill existing session with same name if it exists"
+    )
 
     args = parser.parse_args()
 
@@ -199,13 +206,16 @@ def main():
         sys.exit(1)
 
     print(f"\nTraining started successfully in session '{args.session_name}'!")
-    print(f"To attach to the session manually, run:")
-    print(f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name {args.session_name}")
+    print("To attach to the session manually, run:")
+    print(
+        f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name {args.session_name}"
+    )
 
     # Attach to session unless --no-attach is specified
     if not args.no_attach:
         print("\nAttaching to session in 2 seconds...")
         import time
+
         time.sleep(2)
         attach_to_session(args.host, args.port, args.session_name)
 

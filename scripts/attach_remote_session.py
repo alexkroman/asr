@@ -39,10 +39,10 @@ def list_sessions(host, port):
             return []
 
         sessions = []
-        for line in result.split('\n'):
+        for line in result.split("\n"):
             if line:
                 # Parse tmux list-sessions output (format: "session_name: ...")
-                session_name = line.split(':')[0].strip()
+                session_name = line.split(":")[0].strip()
                 sessions.append(session_name)
         return sessions
     except subprocess.CalledProcessError:
@@ -94,14 +94,16 @@ def main():
     parser = argparse.ArgumentParser(description="Attach to tmux session on remote RunPod instance")
     parser.add_argument("host", help="RunPod instance IP address or hostname")
     parser.add_argument("port", type=int, help="SSH port for the RunPod instance")
-    parser.add_argument("--session-name", default=None,
-                       help="Name of the tmux session to attach to")
-    parser.add_argument("--list", action="store_true",
-                       help="List all available tmux sessions")
-    parser.add_argument("--logs", action="store_true",
-                       help="Show recent logs from session without attaching")
-    parser.add_argument("--lines", type=int, default=100,
-                       help="Number of log lines to show (default: 100)")
+    parser.add_argument(
+        "--session-name", default=None, help="Name of the tmux session to attach to"
+    )
+    parser.add_argument("--list", action="store_true", help="List all available tmux sessions")
+    parser.add_argument(
+        "--logs", action="store_true", help="Show recent logs from session without attaching"
+    )
+    parser.add_argument(
+        "--lines", type=int, default=100, help="Number of log lines to show (default: 100)"
+    )
 
     args = parser.parse_args()
 
@@ -120,8 +122,10 @@ def main():
                 print(f"  - {session}")
 
         if not args.session_name and sessions:
-            print(f"\nTo attach to a session, run:")
-            print(f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name <session_name>")
+            print("\nTo attach to a session, run:")
+            print(
+                f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name <session_name>"
+            )
         return
 
     # If no session name provided, try to find one
@@ -161,8 +165,10 @@ def main():
             print("=" * 50)
             print(logs)
             print("=" * 50)
-            print(f"\nTo attach to this session, run:")
-            print(f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name {args.session_name}")
+            print("\nTo attach to this session, run:")
+            print(
+                f"  python scripts/attach_remote_session.py {args.host} {args.port} --session-name {args.session_name}"
+            )
         else:
             print(f"Could not get logs from session '{args.session_name}'")
         return

@@ -101,13 +101,15 @@ class LLMDecoder(nn.Module):
 
         # Add padding token if missing to avoid HF warnings
         if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
             self.model.resize_token_embeddings(len(self.tokenizer))
 
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
-            target_modules=list(lora_target_modules) if lora_target_modules else ["q_proj", "v_proj"],
+            target_modules=list(lora_target_modules)
+            if lora_target_modules
+            else ["q_proj", "v_proj"],
             lora_dropout=lora_dropout,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
@@ -123,7 +125,9 @@ class ASRModel(PreTrainedModel):
     base_model_prefix = "asr"
     supports_gradient_checkpointing = True
     _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
-    INSTRUCTION_TEMPLATE = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+    INSTRUCTION_TEMPLATE = (
+        "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
+    )
 
     def __init__(self, config: Union[ASRModelConfig, dict]) -> None:
         # Convert dict config to ASRModelConfig if needed
@@ -149,6 +153,7 @@ class ASRModel(PreTrainedModel):
 
         # Save the feature extractor
         from transformers import WhisperFeatureExtractor
+
         feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
         feature_extractor.save_pretrained(save_directory)
 
@@ -162,16 +167,22 @@ class ASRModel(PreTrainedModel):
             "<|audio_chunk|>",
         ]
 
-        num_added = self.decoder.tokenizer.add_special_tokens({
-            'additional_special_tokens': audio_tokens
-        })
+        num_added = self.decoder.tokenizer.add_special_tokens(
+            {"additional_special_tokens": audio_tokens}
+        )
 
         if num_added > 0:
             embeddings = self.decoder.model.get_input_embeddings()
-            is_meta_device = embeddings is not None and hasattr(embeddings, "weight") and embeddings.weight.device.type == "meta"
+            is_meta_device = (
+                embeddings is not None
+                and hasattr(embeddings, "weight")
+                and embeddings.weight.device.type == "meta"
+            )
 
             if is_meta_device:
-                self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer), mean_resizing=False)
+                self.decoder.model.resize_token_embeddings(
+                    len(self.decoder.tokenizer), mean_resizing=False
+                )
             else:
                 self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer))
 
@@ -243,9 +254,7 @@ class ASRModel(PreTrainedModel):
         for emb, lab in zip(final_inputs_embeds, final_labels):
             pad_len = max_len - emb.shape[0]
             if pad_len > 0:
-                pad_emb = torch.zeros(
-                    (pad_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device
-                )
+                pad_emb = torch.zeros((pad_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
                 emb = torch.cat([emb, pad_emb], dim=0)
 
                 pad_lab = torch.full((pad_len,), -100, dtype=lab.dtype, device=lab.device)
@@ -293,7 +302,9 @@ class ASRModel(PreTrainedModel):
         batch_size = audio_embeds.shape[0]
         embed_layer = self.decoder.model.get_input_embeddings()
 
-        prompt_ids = self.decoder.tokenizer(self.INSTRUCTION_TEMPLATE, return_tensors="pt").input_ids
+        prompt_ids = self.decoder.tokenizer(
+            self.INSTRUCTION_TEMPLATE, return_tensors="pt"
+        ).input_ids
         prompt_ids = prompt_ids.to(input_features.device)
 
         chunk_idx = (prompt_ids[0] == self.audio_chunk_id).nonzero()
@@ -322,7 +333,9 @@ class ASRModel(PreTrainedModel):
 
         return outputs
 
+
 # Register model with HuggingFace Auto classes
-from transformers import AutoModel, AutoConfig
+from transformers import AutoConfig, AutoModel
+
 AutoConfig.register("asr_model", ASRModelConfig)
 AutoModel.register(ASRModelConfig, ASRModel)
