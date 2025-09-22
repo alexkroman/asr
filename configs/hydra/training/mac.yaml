@@ -44,6 +44,7 @@ push_to_hub: false
 
 # Performance - Mac optimized
 dataloader_num_workers: 0  # Important for Mac
+dataloader_prefetch_factor: null  # Disable prefetching for streaming
 gradient_checkpointing: true
 fp16: false
 bf16: false
@@ -52,7 +53,7 @@ max_grad_norm: 1.0
 
 # Misc
 seed: 42
-save_safetensors: false  # Faster on Mac
+save_safetensors: true  # Required to avoid torch.load security issue
 disable_tqdm: false
 log_level: info
 

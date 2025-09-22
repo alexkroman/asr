@@ -32,8 +32,7 @@ def create_asr_model(config: DictConfig) -> ASRModel:
         lora_dropout=config.model.lora_dropout,
     )
 
-    model = ASRModel(asr_config)
-    return model
+    return ASRModel(asr_config)
 
 
 def evaluate_samples(model, tokenizer, feature_extractor, eval_samples, device=None):
@@ -117,7 +116,7 @@ class DataCollator:
         tokenizer: Any,
         feature_extractor: WhisperFeatureExtractor,
         config: DictConfig,
-        model: Optional[ASRModel] = None,
+        model: ASRModel,
     ):
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor
@@ -132,6 +131,7 @@ class DataCollator:
     def __call__(
         self, features: List[Dict[str, Any]]
     ) -> Dict[str, Union[torch.Tensor, Optional[torch.Tensor], np.ndarray]]:
+
         valid_features = []
         for f in features:
             try:
@@ -159,12 +159,14 @@ class DataCollator:
                 continue
 
         if not valid_features:
+            # Skip this batch if no valid features
+            # Return minimal tensors that won't cause errors
             return {
-                "input_ids": torch.zeros((1, 10), dtype=torch.long),
-                "labels": torch.zeros((1, 10), dtype=torch.long),
-                "attention_mask": torch.zeros((1, 10), dtype=torch.long),
-                "input_features": torch.zeros((1, 80, 3000)),
-                "audio_attention_mask": torch.ones((1, 1500)),
+                "input_ids": torch.zeros((0, 0), dtype=torch.long),
+                "labels": torch.zeros((0, 0), dtype=torch.long),
+                "attention_mask": torch.zeros((0, 0), dtype=torch.long),
+                "input_features": torch.zeros((0, 80, 3000)),
+                "audio_attention_mask": torch.zeros((0, 1500)),
             }
 
         audio_arrays = [f["audio"]["array"] for f in valid_features]

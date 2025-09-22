@@ -4,7 +4,7 @@
 import argparse
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def run_command(cmd, check=True, capture_output=False):
@@ -190,7 +190,7 @@ def main():
 
     # Generate session name if not provided
     if args.session_name is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         args.session_name = f"train_{timestamp}"
 
     # Test SSH connection

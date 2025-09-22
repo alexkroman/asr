@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
+    AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
     PretrainedConfig,
@@ -30,11 +32,12 @@ class WhisperEncoder(nn.Module):
 
     def forward(
         self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> torch.FloatTensor:
         with torch.no_grad():
             input_features = input_features.to(self.whisper.dtype)
             outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
-            return outputs.last_hidden_state
+            last_hidden_state: torch.FloatTensor = outputs.last_hidden_state
+            return last_hidden_state
 
 
 class ASRModelConfig(PretrainedConfig):
@@ -277,14 +280,12 @@ class ASRModel(PreTrainedModel):
         labels = torch.stack(padded_labels)
         attention_mask = torch.stack(padded_attention)
 
-        outputs = self.decoder.model(
+        return self.decoder.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             **kwargs,
         )
-
-        return outputs
 
     @torch.no_grad()
     def generate(
@@ -293,7 +294,7 @@ class ASRModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 100,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.LongTensor:
         """Generate text from audio input."""
         audio_features = self.encoder(input_features, attention_mask=attention_mask)
         audio_embeds = self.audio_projector(audio_features)
@@ -325,17 +326,14 @@ class ASRModel(PreTrainedModel):
         if batch_size > 1:
             initial_embeds = initial_embeds.expand(batch_size, -1, -1)
 
-        outputs = self.decoder.model.generate(
+        generated: torch.LongTensor = self.decoder.model.generate(
             inputs_embeds=initial_embeds,
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
-
-        return outputs
+        return generated
 
 
 # Register model with HuggingFace Auto classes
-from transformers import AutoConfig, AutoModel
-
 AutoConfig.register("asr_model", ASRModelConfig)
 AutoModel.register(ASRModelConfig, ASRModel)
