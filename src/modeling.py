@@ -15,7 +15,7 @@ from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
 
 
 class WhisperEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self):
         super().__init__()
         self.whisper = WhisperModel.from_pretrained(
             "openai/whisper-small", dtype=torch.bfloat16, token=False
@@ -37,7 +37,7 @@ class WhisperEncoder(nn.Module):
 
 
 class AudioProjector(nn.Module):
-    def __init__(self, audio_dim: int, text_dim: int, config):
+    def __init__(self, audio_dim: int, text_dim: int):
         super().__init__()
         self.norm = RMSNorm(audio_dim, eps=1e-6)
 
@@ -61,30 +61,14 @@ class AudioProjector(nn.Module):
 
 
 class LLMDecoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: ASRModelConfig):
         super().__init__()
-        # Handle different config types
-        if hasattr(config, 'model'):
-            # Hydra DictConfig
-            decoder_model_name = config.model.decoder_model_name
-            lora_r = config.model.lora_r
-            lora_alpha = config.model.lora_alpha
-            lora_target_modules = config.model.lora_target_modules
-            lora_dropout = config.model.lora_dropout
-        elif hasattr(config, 'decoder_model_name'):
-            # ASRModelConfig
-            decoder_model_name = config.decoder_model_name
-            lora_r = config.lora_r
-            lora_alpha = config.lora_alpha
-            lora_target_modules = config.lora_target_modules
-            lora_dropout = config.lora_dropout
-        else:
-            # Dict or other config
-            decoder_model_name = config.get('decoder_model_name', 'Qwen/Qwen2.5-0.5B-Instruct')
-            lora_r = config.get('lora_r', 32)
-            lora_alpha = config.get('lora_alpha', 64)
-            lora_target_modules = config.get('lora_target_modules', ["q_proj", "v_proj"])
-            lora_dropout = config.get('lora_dropout', 0.05)
+        # Extract config values directly from ASRModelConfig
+        decoder_model_name = config.decoder_model_name
+        lora_r = config.lora_r
+        lora_alpha = config.lora_alpha
+        lora_target_modules = config.lora_target_modules
+        lora_dropout = config.lora_dropout
 
         self.model: Union[PreTrainedModel, PeftModel, PeftMixedModel] = (
             AutoModelForCausalLM.from_pretrained(
@@ -96,27 +80,10 @@ class LLMDecoder(nn.Module):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_model_name, token=False)
 
-        # Set up proper padding token - use a dedicated pad token or add one
+        # Add padding token if missing to avoid HF warnings
         if self.tokenizer.pad_token is None:
-            # Try to use an existing special token that's not EOS
-            if self.tokenizer.unk_token and self.tokenizer.unk_token != self.tokenizer.eos_token:
-                self.tokenizer.pad_token = self.tokenizer.unk_token
-                self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
-            else:
-                # Add a new pad token
-                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-                # Resize model embeddings to accommodate the new token
-                self.model.resize_token_embeddings(len(self.tokenizer))
-
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.model.config.bos_token_id = self.tokenizer.bos_token_id
-        self.model.config.eos_token_id = self.tokenizer.eos_token_id
-
-        if hasattr(self.model, "generation_config") and self.model.generation_config is not None:
-            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            if self.tokenizer.bos_token_id is not None:
-                self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
-            self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.model.resize_token_embeddings(len(self.tokenizer))
 
         lora_config = LoraConfig(
             r=lora_r,
@@ -137,7 +104,7 @@ class ASRModelConfig(PretrainedConfig):
 
     def __init__(
         self,
-        decoder_model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        decoder_model_name="HuggingFaceTB/SmolLM2-360M-Instruct",
         lora_r=32,
         lora_alpha=64,
         lora_target_modules=None,
@@ -157,6 +124,7 @@ class ASRModel(PreTrainedModel):
     base_model_prefix = "asr"
     supports_gradient_checkpointing = True
     _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
+    INSTRUCTION_TEMPLATE = "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
 
     def __init__(self, config: Union[ASRModelConfig, dict]) -> None:
         # Convert dict config to ASRModelConfig if needed
@@ -166,11 +134,11 @@ class ASRModel(PreTrainedModel):
         super().__init__(config)
 
         # Create encoder, decoder, and projector
-        self.encoder = WhisperEncoder(config)
+        self.encoder = WhisperEncoder()
         self.decoder = LLMDecoder(config)
         text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
         audio_dim = self.encoder.d_model
-        self.audio_projector = AudioProjector(audio_dim, text_dim, config)
+        self.audio_projector = AudioProjector(audio_dim, text_dim)
         self.add_audio_special_tokens()
 
     def save_pretrained(self, save_directory: str, **kwargs):
@@ -208,7 +176,6 @@ class ASRModel(PreTrainedModel):
             "<|audio_chunk|>",
         ]
 
-        # Add tokens as special tokens - this ensures they're treated as single tokens
         num_added = self.decoder.tokenizer.add_special_tokens({
             'additional_special_tokens': audio_tokens
         })
@@ -234,15 +201,10 @@ class ASRModel(PreTrainedModel):
                                 embeddings.weight[0]
                             ) * (std_embedding * 0.02)
 
-        # Store the token IDs and verify they were added correctly
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
         self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
         self.audio_chunk_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_chunk|>")
-
-        # Verify the tokens were added (they should not be the unknown token ID)
-        if self.audio_chunk_id == self.decoder.tokenizer.unk_token_id:
-            raise ValueError("Audio special tokens were not properly added to the tokenizer")
 
     def forward(
         self,
@@ -253,16 +215,13 @@ class ASRModel(PreTrainedModel):
         audio_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # 1. Get audio embeddings
         audio_features = self.encoder(input_features, attention_mask=audio_attention_mask)
         audio_embeds = self.audio_projector(audio_features)
         audio_embeds = audio_embeds.to(self.decoder.model.dtype)
 
-        # 2. Get text embeddings
         embed_layer = self.decoder.model.get_input_embeddings()
         text_embeds = embed_layer(input_ids)
 
-        # 3. Find placeholder and insert audio
         final_inputs_embeds = []
         final_labels = []
         for i in range(input_ids.shape[0]):
@@ -271,7 +230,6 @@ class ASRModel(PreTrainedModel):
                 raise ValueError("'<|audio_chunk|>' token not found in input_ids.")
             chunk_idx = chunk_idx[0].item()
 
-            # Concatenate: [text_before_chunk, audio_embeds, text_after_chunk]
             combined_embeds = torch.cat(
                 [
                     text_embeds[i, :chunk_idx],
@@ -282,7 +240,6 @@ class ASRModel(PreTrainedModel):
             )
             final_inputs_embeds.append(combined_embeds)
 
-            # Adjust labels to match the new sequence length
             audio_len = audio_embeds[i].shape[0]
             label_before = labels[i, :chunk_idx]
             label_after = labels[i, chunk_idx + 1 :]
@@ -291,7 +248,6 @@ class ASRModel(PreTrainedModel):
             combined_labels = torch.cat([label_before, audio_labels, label_after], dim=0)
             final_labels.append(combined_labels)
 
-        # Pad sequences to same length
         max_len = max(emb.shape[0] for emb in final_inputs_embeds)
 
         padded_embeds = []
@@ -326,7 +282,6 @@ class ASRModel(PreTrainedModel):
         labels = torch.stack(padded_labels)
         attention_mask = torch.stack(padded_attention)
 
-        # 4. Forward through decoder
         outputs = self.decoder.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -345,7 +300,6 @@ class ASRModel(PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         """Generate text from audio input."""
-        # Get audio embeddings
         audio_features = self.encoder(input_features, attention_mask=attention_mask)
         audio_embeds = self.audio_projector(audio_features)
         audio_embeds = audio_embeds.to(self.decoder.model.dtype)
@@ -353,20 +307,14 @@ class ASRModel(PreTrainedModel):
         batch_size = audio_embeds.shape[0]
         embed_layer = self.decoder.model.get_input_embeddings()
 
-        # Build the instruction prompt
-        instruction = (
-            "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
-        )
-        prompt_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids
+        prompt_ids = self.decoder.tokenizer(self.INSTRUCTION_TEMPLATE, return_tensors="pt").input_ids
         prompt_ids = prompt_ids.to(input_features.device)
 
-        # Find the audio chunk placeholder
         chunk_idx = (prompt_ids[0] == self.audio_chunk_id).nonzero()
         if chunk_idx.shape[0] == 0:
             raise ValueError("'<|audio_chunk|>' token not found in instruction.")
         chunk_idx = chunk_idx[0].item()
 
-        # Prepare initial embeddings with audio inserted
         prompt_embeds = embed_layer(prompt_ids)
         initial_embeds = torch.cat(
             [
@@ -380,8 +328,6 @@ class ASRModel(PreTrainedModel):
         if batch_size > 1:
             initial_embeds = initial_embeds.expand(batch_size, -1, -1)
 
-        # Generate from embeddings
-        # HF will handle attention mask automatically since we have a proper pad token
         outputs = self.decoder.model.generate(
             inputs_embeds=initial_embeds,
             max_new_tokens=max_new_tokens,
@@ -390,7 +336,5 @@ class ASRModel(PreTrainedModel):
 
         return outputs
 
-
-# Register the model with AutoModel
 from transformers import AutoModel
 AutoModel.register(ASRModelConfig, ASRModel)
