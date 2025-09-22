@@ -200,7 +200,10 @@ class ASRModel(PreTrainedModel):
             "<|audio_chunk|>",
         ]
 
-        num_added = self.decoder.tokenizer.add_tokens(audio_tokens, special_tokens=True)
+        # Add tokens as special tokens - this ensures they're treated as single tokens
+        num_added = self.decoder.tokenizer.add_special_tokens({
+            'additional_special_tokens': audio_tokens
+        })
 
         if num_added > 0:
             embeddings = self.decoder.model.get_input_embeddings()
@@ -223,10 +226,15 @@ class ASRModel(PreTrainedModel):
                                 embeddings.weight[0]
                             ) * (std_embedding * 0.02)
 
+        # Store the token IDs and verify they were added correctly
         self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
         self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
         self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
         self.audio_chunk_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_chunk|>")
+
+        # Verify the tokens were added (they should not be the unknown token ID)
+        if self.audio_chunk_id == self.decoder.tokenizer.unk_token_id:
+            raise ValueError("Audio special tokens were not properly added to the tokenizer")
 
     def forward(
         self,

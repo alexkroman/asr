@@ -3,12 +3,11 @@
 🎙️ ASR Training
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import hydra
 import numpy as np
 import torch
-import torch.nn as nn
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from transformers import (
@@ -23,9 +22,6 @@ from transformers import (
 from modeling import (
     ASRModel,
     ASRModelConfig,
-    WhisperEncoder,
-    AudioProjector,
-    LLMDecoder,
 )
 
 
@@ -101,6 +97,38 @@ def evaluate_samples(model, tokenizer, feature_extractor, eval_samples, device=N
     return predictions, references, wer
 
 
+def clean_gigaspeech_text(text: str) -> Optional[str]:
+    """Clean GigaSpeech text by replacing punctuation tags and filtering garbage utterances.
+
+    Returns None if the text contains only garbage utterance tags.
+    """
+    # Check if text contains only garbage utterance tags
+    garbage_tags = ["<SIL>", "<MUSIC>", "<NOISE>", "<OTHER>"]
+    for tag in garbage_tags:
+        if tag in text:
+            # If the text is just a garbage tag or mostly garbage, skip it
+            cleaned = text.replace(tag, "").strip()
+            if not cleaned or len(cleaned) < 3:  # Very short after removing garbage
+                return None
+
+    # Replace punctuation tags with actual punctuation
+    text = text.replace("<COMMA>", ",")
+    text = text.replace("<PERIOD>", ".")
+    text = text.replace("<QUESTIONMARK>", "?")
+    text = text.replace("<EXCLAMATIONPOINT>", "!")
+
+    # Remove any remaining garbage tags (in case they're mixed with real text)
+    for tag in garbage_tags:
+        text = text.replace(tag, " ")
+
+    # Clean up multiple spaces and strip
+    text = " ".join(text.split())
+    text = text.strip()
+
+    # Return None if empty after cleaning
+    return text if text else None
+
+
 class DataCollator:
     """Data collator that performs instruction formatting and masking."""
 
@@ -131,9 +159,20 @@ class DataCollator:
                 # LibriSpeech uses "text", GigaSpeech uses "text" or "sentence"
                 text = f.get("text") or f.get("sentence") or ""
 
+                # Clean GigaSpeech text (handles punctuation and garbage tags)
+                cleaned_text = clean_gigaspeech_text(text)
+
+                # Skip samples with only garbage utterances
+                if cleaned_text is None:
+                    continue
+
+                text = cleaned_text
+
                 if audio_len_sec <= self.max_audio_seconds:
                     # Normalize to use "text" field
                     if "text" not in f:
+                        f["text"] = text
+                    else:
                         f["text"] = text
                     valid_features.append(f)
             except Exception:
@@ -272,6 +311,18 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
                 token=token,
             )
 
+            # Filter out garbage utterances from GigaSpeech
+            def filter_gigaspeech(example):
+                text = example.get("text", "")
+                cleaned = clean_gigaspeech_text(text)
+                if cleaned:
+                    example["text"] = cleaned
+                    return True
+                return False
+
+            train_ds = train_ds.filter(filter_gigaspeech)
+            val_ds = val_ds.filter(filter_gigaspeech)
+
             train_datasets.append(train_ds)
             val_datasets.append(val_ds)
 
@@ -346,8 +397,8 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
 def main(cfg: DictConfig) -> None:
     """Main training function using Hydra configuration."""
     import os
+
     from huggingface_hub import HfFolder
-    import evaluate
 
     print(OmegaConf.to_yaml(cfg))
 
@@ -380,7 +431,7 @@ def main(cfg: DictConfig) -> None:
                     training_args_dict["hub_token"] = hub_token
 
         # Log hub configuration
-        print(f"\n📤 Hub push enabled:")
+        print("\n📤 Hub push enabled:")
         print(f"   Repository: {training_args_dict.get('hub_model_id', 'auto-generated')}")
         print(f"   Strategy: {training_args_dict.get('hub_strategy', 'every_save')}")
         print(f"   Private: {training_args_dict.get('hub_private_repo', False)}")
@@ -388,12 +439,11 @@ def main(cfg: DictConfig) -> None:
     training_args = TrainingArguments(**training_args_dict)
 
     # Create custom callbacks
-    from transformers import TrainerCallback
-    from transformers.integrations import TensorBoardCallback
     import shutil
     from pathlib import Path
-    import evaluate
+
     from torch.utils.tensorboard import SummaryWriter
+    from transformers import TrainerCallback
 
     class ModelingFileCopyCallback(TrainerCallback):
         """Copy modeling.py to the output directory so it gets pushed to Hub."""
@@ -463,7 +513,7 @@ def main(cfg: DictConfig) -> None:
             # Also print to console
             print(f"📈 WER at step {state.global_step}: {wer:.2%}")
             print("\nSample predictions:")
-            for i, (ref, pred) in enumerate(zip(references[:3], predictions[:3])):
+            for _i, (ref, pred) in enumerate(zip(references[:3], predictions[:3])):
                 print(f"  Truth:      {ref[:80]}...")
                 print(f"  Prediction: {pred[:80]}...")
                 print()
