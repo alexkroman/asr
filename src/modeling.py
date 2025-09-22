@@ -19,7 +19,7 @@ class WhisperEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small", torch_dtype="auto", token=False
+            "openai/whisper-small", dtype="auto", token=False
         )
 
         for param in self.whisper.parameters():
@@ -35,6 +35,26 @@ class WhisperEncoder(nn.Module):
             input_features = input_features.to(self.whisper.dtype)
             outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
             return outputs.last_hidden_state
+
+
+class ASRModelConfig(PretrainedConfig):
+    model_type = "asr_model"
+
+    def __init__(
+        self,
+        decoder_model_name="HuggingFaceTB/SmolLM2-360M-Instruct",
+        lora_r=32,
+        lora_alpha=64,
+        lora_target_modules=None,
+        lora_dropout=0.05,
+        **kwargs,
+    ):
+        self.decoder_model_name = decoder_model_name
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
+        self.lora_dropout = lora_dropout
+        super().__init__(**kwargs)
 
 
 class AudioProjector(nn.Module):
@@ -73,7 +93,7 @@ class LLMDecoder(nn.Module):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             decoder_model_name,
-            torch_dtype="auto",
+            dtype="auto",
             token=False,
             use_cache=False,
         )
@@ -96,26 +116,6 @@ class LLMDecoder(nn.Module):
 
     def forward(self, **kwargs):
         return self.model(**kwargs)
-
-
-class ASRModelConfig(PretrainedConfig):
-    model_type = "asr_model"
-
-    def __init__(
-        self,
-        decoder_model_name="HuggingFaceTB/SmolLM2-360M-Instruct",
-        lora_r=32,
-        lora_alpha=64,
-        lora_target_modules=None,
-        lora_dropout=0.05,
-        **kwargs,
-    ):
-        self.decoder_model_name = decoder_model_name
-        self.lora_r = lora_r
-        self.lora_alpha = lora_alpha
-        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
-        self.lora_dropout = lora_dropout
-        super().__init__(**kwargs)
 
 
 class ASRModel(PreTrainedModel):

@@ -134,18 +134,21 @@ class DataCollator:
                 audio_len_sec = len(audio_array) / self.sample_rate
 
                 text = f.get("text") or f.get("sentence") or ""
-                cleaned_text = clean_gigaspeech_text(text)
 
-                if cleaned_text is None:
+                # Only apply GigaSpeech cleaning if text contains GigaSpeech-specific tags
+                if "<" in text and ">" in text:
+                    cleaned_text = clean_gigaspeech_text(text)
+                    if cleaned_text is None:
+                        continue
+                    text = cleaned_text
+
+                # Basic cleanup for all text
+                text = text.strip()
+                if not text:
                     continue
 
-                text = cleaned_text
-
                 if audio_len_sec <= self.max_audio_seconds:
-                    if "text" not in f:
-                        f["text"] = text
-                    else:
-                        f["text"] = text
+                    f["text"] = text
                     valid_features.append(f)
             except Exception:
                 continue
@@ -170,6 +173,7 @@ class DataCollator:
         )
 
         # Use instruction template from model
+        # The template contains special tokens like <|audio_chunk|> that need to be in the tokenizer
         texts = [self.model.INSTRUCTION_TEMPLATE + f["text"] for f in valid_features]
 
         batch = self.tokenizer(
@@ -217,14 +221,14 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
                     "librispeech_asr",
                     dataset_config,
                     split=train_split,
-                    streaming=True,
+                    streaming=False,  # Don't use streaming for tiny dataset
                     cache_dir=config.data.dataset_cache_dir,
                 )
                 val_ds = load_dataset(
                     "librispeech_asr",
                     dataset_config,
                     split=eval_split,
-                    streaming=True,
+                    streaming=False,  # Don't use streaming for tiny dataset
                     cache_dir=config.data.dataset_cache_dir,
                 )
 
@@ -318,11 +322,22 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
         train_dataset = train_datasets[0]
         val_dataset = val_datasets[0]
 
-    # Apply sample limits for streaming datasets
+    # Apply sample limits
     if config.data.max_train_samples:
-        train_dataset = train_dataset.take(config.data.max_train_samples)
+        if hasattr(train_dataset, 'take'):
+            # Streaming dataset
+            train_dataset = train_dataset.take(config.data.max_train_samples)
+        else:
+            # Regular dataset
+            train_dataset = train_dataset.select(range(min(config.data.max_train_samples, len(train_dataset))))
+
     if config.data.max_eval_samples:
-        val_dataset = val_dataset.take(config.data.max_eval_samples)
+        if hasattr(val_dataset, 'take'):
+            # Streaming dataset
+            val_dataset = val_dataset.take(config.data.max_eval_samples)
+        else:
+            # Regular dataset
+            val_dataset = val_dataset.select(range(min(config.data.max_eval_samples, len(val_dataset))))
 
     return train_dataset, val_dataset
 

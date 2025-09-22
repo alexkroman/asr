@@ -8,4 +8,5 @@ defaults:
 training:
   output_dir: ./outputs/mac_minimal_model
   eval_steps: 100
-  save_per_epoch: 1
+  save_steps: 100
+  max_steps: 500
