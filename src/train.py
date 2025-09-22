@@ -11,382 +11,94 @@ import torch
 import torch.nn as nn
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
-from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
 from transformers import (
     AutoConfig,
     AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PretrainedConfig,
-    PreTrainedModel,
     Trainer,
     TrainingArguments,
     WhisperFeatureExtractor,
-    WhisperModel,
 )
-from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
+
+# Import model classes from modeling.py
+from modeling import (
+    ASRModel,
+    ASRModelConfig,
+    WhisperEncoder,
+    AudioProjector,
+    LLMDecoder,
+)
 
 
-class WhisperEncoder(nn.Module):
-    def __init__(self, config: DictConfig):
-        super().__init__()
-        self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small", dtype=torch.bfloat16, token=False
-        )
+# Model classes have been moved to modeling.py for reusability
+# Create ASRModel with proper config handling for training
+def create_asr_model(config: DictConfig) -> ASRModel:
+    """Create ASRModel with Hydra config."""
+    # Convert Hydra config to ASRModelConfig
+    asr_config = ASRModelConfig(
+        decoder_model_name=config.model.decoder_model_name,
+        lora_r=config.model.lora_r,
+        lora_alpha=config.model.lora_alpha,
+        lora_target_modules=list(config.model.lora_target_modules),
+        lora_dropout=config.model.lora_dropout,
+    )
 
-        for param in self.whisper.parameters():
-            param.requires_grad = False
+    # Create model with the config
+    model = ASRModel(asr_config)
 
-        self.d_model = self.whisper.config.d_model
-        self.whisper.eval()
+    # Store the hydra config for backward compatibility
+    model.hydra_config = config
 
-    def forward(
-        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        input_features and attention_mask come directly from the WhisperFeatureExtractor.
-        """
-        with torch.no_grad():
-            input_features = input_features.to(self.whisper.dtype)
-            # The model internally handles the attention mask to ignore padding
-            outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
-            return cast(torch.Tensor, outputs.last_hidden_state)
+    return model
 
 
-class AudioProjector(nn.Module):
-    def __init__(self, audio_dim: int, text_dim: int, config: DictConfig):
-        super().__init__()
-        self.norm = RMSNorm(audio_dim, eps=1e-6)
+def evaluate_samples(model, tokenizer, feature_extractor, eval_samples, device=None):
+    """Evaluate model on samples and return predictions, references, and WER.
 
-        self.linear_1 = nn.Linear(audio_dim, text_dim, bias=True)
-        self.act = nn.GELU()
-        self.linear_2 = nn.Linear(text_dim, text_dim, bias=True)
+    This is a reusable function for both evaluation mode and callbacks.
+    """
+    import evaluate
 
-        nn.init.normal_(self.linear_1.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.linear_1.bias)
-        nn.init.normal_(self.linear_2.weight)
-        nn.init.zeros_(self.linear_2.bias)
+    if device is None:
+        device = model.device
 
-    def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm(audio_features)
-        hidden_states = self.linear_1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
+    predictions = []
+    references = []
 
-        result: torch.Tensor = hidden_states * 0.01
-        return result
-
-
-class LLMDecoder(nn.Module):
-    def __init__(self, config: DictConfig):
-        super().__init__()
-        self.model: Union[PreTrainedModel, PeftModel, PeftMixedModel] = (
-            AutoModelForCausalLM.from_pretrained(
-                config.model.decoder_model_name,
-                dtype=torch.bfloat16,
-                token=False,
-                use_cache=False,  # Disable KV cache for training (incompatible with gradient checkpointing)
+    with torch.no_grad():
+        for sample in eval_samples:
+            # Process audio using feature extractor
+            audio_array = sample["audio"]["array"]
+            inputs = feature_extractor(
+                audio_array,
+                sampling_rate=16000,
+                return_tensors="pt",
+                return_attention_mask=True,
             )
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model.decoder_model_name, token=False)
 
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            # Move to device
+            input_features = inputs.input_features.to(device)
+            attention_mask = inputs.attention_mask.to(device) if hasattr(inputs, 'attention_mask') else None
 
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.model.config.bos_token_id = self.tokenizer.bos_token_id
-        self.model.config.eos_token_id = self.tokenizer.eos_token_id
-
-        if hasattr(self.model, "generation_config") and self.model.generation_config is not None:
-            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            if self.tokenizer.bos_token_id is not None:
-                self.model.generation_config.bos_token_id = self.tokenizer.bos_token_id
-            self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
-
-        lora_config = LoraConfig(
-            r=config.model.lora_r,
-            lora_alpha=config.model.lora_alpha,
-            target_modules=list(config.model.lora_target_modules),
-            lora_dropout=config.model.lora_dropout,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        self.model = get_peft_model(self.model, lora_config)
-
-    def forward(self, **kwargs):
-        return self.model(**kwargs)
-
-
-class ASRModelConfig(PretrainedConfig):
-    model_type = "asr_model"
-
-    def __init__(
-        self,
-        decoder_model_name="Qwen/Qwen2.5-0.5B-Instruct",
-        lora_r=32,
-        lora_alpha=64,
-        lora_target_modules=None,
-        lora_dropout=0.05,
-        **kwargs,
-    ):
-        self.decoder_model_name = decoder_model_name
-        self.lora_r = lora_r
-        self.lora_alpha = lora_alpha
-        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
-        self.lora_dropout = lora_dropout
-        super().__init__(**kwargs)
-
-
-class ASRModel(PreTrainedModel):
-    config_class = ASRModelConfig
-    base_model_prefix = "asr"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["WhisperEncoder", "LLMDecoder", "AudioProjector"]
-
-    def __init__(self, config: Union[DictConfig, ASRModelConfig]) -> None:
-        # Handle both Hydra config and HuggingFace config
-        from omegaconf import DictConfig as OmegaDictConfig
-
-        if isinstance(config, OmegaDictConfig):
-            # Convert Hydra config to HuggingFace config
-            hf_config = ASRModelConfig(
-                decoder_model_name=config.model.decoder_model_name,
-                lora_r=config.model.lora_r,
-                lora_alpha=config.model.lora_alpha,
-                lora_target_modules=list(config.model.lora_target_modules),
-                lora_dropout=config.model.lora_dropout,
+            # Use model's generate method which handles the full audio->text pipeline
+            generated_ids = model.generate(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                max_new_tokens=100,
+                do_sample=False,  # Greedy decoding for consistent evaluation
             )
-            super().__init__(hf_config)
-            self.hydra_config = config
-        else:
-            # Already a HuggingFace config
-            super().__init__(config)
-            # Create a minimal DictConfig for compatibility
-            from omegaconf import DictConfig as OmegaDictConfig
 
-            self.hydra_config = OmegaDictConfig(
-                {
-                    "model": {
-                        "decoder_model_name": config.decoder_model_name,
-                        "lora_r": config.lora_r,
-                        "lora_alpha": config.lora_alpha,
-                        "lora_target_modules": config.lora_target_modules,
-                        "lora_dropout": config.lora_dropout,
-                    }
-                }
-            )
-        self.encoder = WhisperEncoder(self.hydra_config)
-        self.decoder = LLMDecoder(self.hydra_config)
-        # Don't override self.config - keep the ASRModelConfig
-        text_dim = getattr(self.decoder.model.config, "hidden_size", 768)
-        audio_dim = self.encoder.d_model
-        self.audio_projector = AudioProjector(audio_dim, text_dim, self.hydra_config)
-        self.add_audio_special_tokens()
+            # Decode the generated tokens
+            prediction = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            reference = sample.get("text", sample.get("sentence", ""))
 
-    def save_pretrained(self, save_directory: str, **kwargs):
-        """Save the model, tokenizer, and feature extractor."""
-        # The parent class will save config.json and model weights
-        super().save_pretrained(save_directory, **kwargs)
+            predictions.append(prediction)
+            references.append(reference)
 
-        # Save the tokenizer
-        self.decoder.tokenizer.save_pretrained(save_directory)
+    # Calculate WER
+    wer_metric = evaluate.load("wer")
+    wer = wer_metric.compute(predictions=predictions, references=references)
 
-        # Save the feature extractor (Whisper's)
-        from transformers import WhisperFeatureExtractor
-        feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-        feature_extractor.save_pretrained(save_directory)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load a model from a saved checkpoint."""
-        # Use the parent class method which handles config.json automatically
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
-            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
-
-    def gradient_checkpointing_disable(self):
-        if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
-            self.decoder.model.gradient_checkpointing_disable()
-
-    def add_audio_special_tokens(self):
-        """Add audio-specific special tokens for better audio-text alignment."""
-        audio_tokens = [
-            "<|audio_start|>",
-            "<|audio_end|>",
-            "<|audio_pad|>",
-            "<|audio_sep|>",
-            "<|audio_chunk|>",  # Placeholder for audio embeddings in instruction
-        ]
-
-        # First add them as regular tokens to ensure they're treated as single tokens
-        num_added = self.decoder.tokenizer.add_tokens(audio_tokens, special_tokens=True)
-
-        if num_added > 0:
-            # Check if model is on meta device
-            embeddings = self.decoder.model.get_input_embeddings()
-            is_meta_device = embeddings is not None and hasattr(embeddings, "weight") and embeddings.weight.device.type == "meta"
-
-            # Disable mean_resizing when on meta device to avoid the error
-            if is_meta_device:
-                self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer), mean_resizing=False)
-            else:
-                self.decoder.model.resize_token_embeddings(len(self.decoder.tokenizer))
-
-                # Only initialize embeddings if not on meta device (i.e., during training)
-                with torch.no_grad():
-                    embeddings = self.decoder.model.get_input_embeddings()
-                    if embeddings is not None and hasattr(embeddings, "weight"):
-                        existing_embeds = embeddings.weight[:-num_added]
-                        mean_embedding = existing_embeds.mean(dim=0)
-                        std_embedding = existing_embeds.std()
-
-                        for i in range(num_added):
-                            embeddings.weight[-num_added + i] = mean_embedding + torch.randn_like(
-                                embeddings.weight[0]
-                            ) * (std_embedding * 0.02)
-
-        self.audio_start_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_start|>")
-        self.audio_end_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_end|>")
-        self.audio_pad_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
-        self.audio_chunk_id = self.decoder.tokenizer.convert_tokens_to_ids("<|audio_chunk|>")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
-        input_features: torch.Tensor,
-        audio_attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        # 1. Get audio embeddings
-        audio_features = self.encoder(input_features, attention_mask=audio_attention_mask)
-        audio_embeds = self.audio_projector(audio_features)
-        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
-
-        # 2. Get text embeddings
-        embed_layer = self.decoder.model.get_input_embeddings()
-        text_embeds = embed_layer(input_ids)
-
-        # 3. Find placeholder and insert audio
-        final_inputs_embeds = []
-        final_labels = []
-        for i in range(input_ids.shape[0]):  # Iterate over batch
-            chunk_idx = (input_ids[i] == self.audio_chunk_id).nonzero()
-            if chunk_idx.shape[0] == 0:
-                raise ValueError("'<|audio_chunk|>' token not found in input_ids.")
-            chunk_idx = chunk_idx[0].item()
-
-            # Concatenate: [text_before_chunk, audio_embeds, text_after_chunk]
-            combined_embeds = torch.cat(
-                [
-                    text_embeds[i, :chunk_idx],
-                    audio_embeds[i],
-                    text_embeds[i, chunk_idx + 1 :],
-                ],
-                dim=0,
-            )
-            final_inputs_embeds.append(combined_embeds)
-
-            # Adjust labels to match the new sequence length
-            # Insert -100 labels for the audio embeddings
-            audio_len = audio_embeds[i].shape[0]
-            label_before = labels[i, :chunk_idx]
-            label_after = labels[i, chunk_idx + 1 :]
-            audio_labels = torch.full((audio_len,), -100, dtype=labels.dtype, device=labels.device)
-            combined_labels = torch.cat([label_before, audio_labels, label_after], dim=0)
-            final_labels.append(combined_labels)
-
-        # Pad the combined embeddings to the same length
-        inputs_embeds = torch.nn.utils.rnn.pad_sequence(
-            final_inputs_embeds, batch_first=True, padding_value=0
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(final_labels, batch_first=True, padding_value=-100)
-
-        # Recreate the attention mask for the new embedding sequence length
-        new_attention_mask = torch.ones(
-            inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=attention_mask.dtype
-        )
-        # Mask padding positions
-        for i, embed in enumerate(final_inputs_embeds):
-            new_attention_mask[i, embed.shape[0] :] = 0
-
-        return self.decoder.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=new_attention_mask,
-            labels=labels,
-            return_dict=True,
-        )
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 100,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Generate text from audio input."""
-        # Get audio embeddings
-        audio_features = self.encoder(input_features, attention_mask=attention_mask)
-        audio_embeds = self.audio_projector(audio_features)
-        audio_embeds = audio_embeds.to(self.decoder.model.dtype)
-
-        batch_size = audio_embeds.shape[0]
-        embed_layer = self.decoder.model.get_input_embeddings()
-
-        # Build the instruction prompt
-        instruction = (
-            "User: Please transcribe the following audio recording.\n<|audio_chunk|>\nAssistant: "
-        )
-        prompt_ids = self.decoder.tokenizer(instruction, return_tensors="pt").input_ids
-        prompt_ids = prompt_ids.to(input_features.device)
-
-        # Find the audio chunk placeholder
-        chunk_idx = (prompt_ids[0] == self.audio_chunk_id).nonzero()
-        if chunk_idx.shape[0] == 0:
-            raise ValueError("'<|audio_chunk|>' token not found in instruction.")
-        chunk_idx = chunk_idx[0].item()
-
-        # Get embeddings for the prompt
-        prompt_embeds = embed_layer(prompt_ids)
-
-        # Build inputs for each sample in batch
-        inputs_embeds_list = []
-        for i in range(batch_size):
-            # Combine prompt and audio embeddings
-            combined_embeds = torch.cat(
-                [prompt_embeds[0, :chunk_idx], audio_embeds[i], prompt_embeds[0, chunk_idx + 1 :]],
-                dim=0,
-            )
-            inputs_embeds_list.append(combined_embeds)
-
-        # Pad to same length
-        inputs_embeds = torch.nn.utils.rnn.pad_sequence(
-            inputs_embeds_list, batch_first=True, padding_value=0
-        )
-
-        # Create attention mask
-        attention_mask = torch.ones(
-            inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
-        )
-
-        # Generate
-        prompt_length = inputs_embeds.shape[1]
-        full_output = self.decoder.model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.decoder.tokenizer.pad_token_id,
-            eos_token_id=self.decoder.tokenizer.eos_token_id,
-            **kwargs,
-        )
-
-        # Return only the generated tokens (excluding the prompt)
-        return full_output[:, prompt_length:]
+    return predictions, references, wer
 
 
 class DataCollator:
@@ -494,7 +206,7 @@ class DataCollator:
 
 def initialize_model(config: DictConfig) -> Tuple[ASRModel, Any, WhisperFeatureExtractor]:
     """Initialize the ASR model, tokenizer, and feature extractor."""
-    model = ASRModel(config)
+    model = create_asr_model(config)
     tokenizer = model.decoder.tokenizer
     feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
     return model, tokenizer, feature_extractor
@@ -633,12 +345,16 @@ def load_datasets(config: DictConfig) -> Tuple[Dataset, Dataset]:
 @hydra.main(version_base=None, config_path="../configs/hydra", config_name="config")
 def main(cfg: DictConfig) -> None:
     """Main training function using Hydra configuration."""
+    import os
+    from huggingface_hub import HfFolder
+    import evaluate
 
     print(OmegaConf.to_yaml(cfg))
 
     # Enable TensorFloat32 for better performance on Ampere and newer GPUs
     torch.set_float32_matmul_precision("high")
 
+    # Normal training mode
     model, tokenizer, feature_extractor = initialize_model(cfg)
     train_dataset, val_dataset = load_datasets(cfg)
 
@@ -650,7 +366,125 @@ def main(cfg: DictConfig) -> None:
     training_args_dict = OmegaConf.to_container(cfg.training, resolve=True)
     assert isinstance(training_args_dict, dict), "Training args must be a dict"
 
+    # Handle Hub token from environment if not in config
+    if training_args_dict.get("push_to_hub", False):
+        if not training_args_dict.get("hub_token"):
+            # Try to get token from environment variables
+            hub_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+            if hub_token:
+                training_args_dict["hub_token"] = hub_token
+            else:
+                # Try to get from HfFolder (huggingface-cli login)
+                hub_token = HfFolder.get_token()
+                if hub_token:
+                    training_args_dict["hub_token"] = hub_token
+
+        # Log hub configuration
+        print(f"\n📤 Hub push enabled:")
+        print(f"   Repository: {training_args_dict.get('hub_model_id', 'auto-generated')}")
+        print(f"   Strategy: {training_args_dict.get('hub_strategy', 'every_save')}")
+        print(f"   Private: {training_args_dict.get('hub_private_repo', False)}")
+
     training_args = TrainingArguments(**training_args_dict)
+
+    # Create custom callbacks
+    from transformers import TrainerCallback
+    from transformers.integrations import TensorBoardCallback
+    import shutil
+    from pathlib import Path
+    import evaluate
+    from torch.utils.tensorboard import SummaryWriter
+
+    class ModelingFileCopyCallback(TrainerCallback):
+        """Copy modeling.py to the output directory so it gets pushed to Hub."""
+
+        def on_save(self, args, state, control, **kwargs):
+            modeling_src = Path(__file__).parent / "modeling.py"
+            if modeling_src.exists():
+                modeling_dst = Path(args.output_dir) / "modeling_asr.py"
+                shutil.copy2(modeling_src, modeling_dst)
+                print(f"✅ Copied modeling.py to {modeling_dst} for Hub upload")
+
+    class PredictionLoggingCallback(TrainerCallback):
+        """Log predictions and WER to TensorBoard periodically during training."""
+
+        def __init__(self, eval_dataset, tokenizer, feature_extractor, cfg, log_predictions_every_n_steps=500):
+            self.eval_dataset = eval_dataset
+            self.tokenizer = tokenizer
+            self.feature_extractor = feature_extractor
+            self.cfg = cfg
+            self.log_predictions_every_n_steps = log_predictions_every_n_steps
+            self.writer = None
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            # Log predictions every N steps
+            if state.global_step % self.log_predictions_every_n_steps == 0 and state.global_step > 0:
+                self._log_predictions(args, state, model)
+
+        def _log_predictions(self, args, state, model):
+            """Generate predictions on a sample of validation data and log to TensorBoard."""
+            if model is None:
+                return
+
+            # Initialize TensorBoard writer if needed
+            if self.writer is None:
+                self.writer = SummaryWriter(log_dir=args.logging_dir)
+
+            model.eval()
+
+            # Get a sample of validation data (configurable, default 10 samples)
+            num_samples = getattr(self.cfg, 'log_predictions_samples', 10)
+
+            # If eval_dataset is streaming, take samples
+            if hasattr(self.eval_dataset, 'take'):
+                eval_samples = list(self.eval_dataset.take(num_samples))
+            else:
+                # For regular dataset, take first N samples
+                eval_samples = [self.eval_dataset[i] for i in range(min(num_samples, len(self.eval_dataset)))]
+
+            print(f"\n📊 Generating predictions for logging (step {state.global_step})...")
+
+            # Use the shared evaluation function
+            predictions, references, wer = evaluate_samples(
+                model, self.tokenizer, self.feature_extractor, eval_samples, device=model.device
+            )
+
+            # Log to TensorBoard
+            self.writer.add_scalar("eval/wer", wer, state.global_step)
+
+            # Log sample predictions as text
+            predictions_text = []
+            for i, (ref, pred) in enumerate(zip(references[:5], predictions[:5])):
+                predictions_text.append(f"**Sample {i+1}**\n\nTruth: {ref}\n\nPrediction: {pred}\n\n---")
+
+            full_text = "\n".join(predictions_text)
+            self.writer.add_text("eval/predictions", full_text, state.global_step)
+
+            # Also print to console
+            print(f"📈 WER at step {state.global_step}: {wer:.2%}")
+            print("\nSample predictions:")
+            for i, (ref, pred) in enumerate(zip(references[:3], predictions[:3])):
+                print(f"  Truth:      {ref[:80]}...")
+                print(f"  Prediction: {pred[:80]}...")
+                print()
+
+            model.train()
+
+    # Determine which callbacks to use
+    callbacks = []
+    if training_args.push_to_hub:
+        callbacks.append(ModelingFileCopyCallback())
+
+    # Add prediction logging callback if we have eval dataset and TensorBoard is enabled
+    if val_dataset and "tensorboard" in training_args.report_to:
+        log_predictions_every_n_steps = getattr(cfg, 'log_predictions_every_n_steps', 500)
+        callbacks.append(PredictionLoggingCallback(
+            eval_dataset=val_dataset,
+            tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
+            cfg=cfg,
+            log_predictions_every_n_steps=log_predictions_every_n_steps
+        ))
 
     trainer = Trainer(
         model=model,
@@ -664,12 +498,18 @@ def main(cfg: DictConfig) -> None:
             model=model,
         ),
         processing_class=tokenizer,
+        callbacks=callbacks,
         # No compute_metrics - only eval_loss will be calculated
     )
 
     # Train the model
     trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
     trainer.save_model()
+
+    # Push final model to Hub if enabled
+    if training_args.push_to_hub:
+        print("\n🚀 Pushing final model to Hub...")
+        trainer.push_to_hub()
 
 
 # Register the model with AutoModel

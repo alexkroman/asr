@@ -17,7 +17,55 @@ This is an ASR (Automatic Speech Recognition) training pipeline that combines a 
 - **Train locally on Mac**: `uv run python src/train.py +experiments=mac_minimal`
 - **Train with custom config**: `uv run python src/train.py +experiments=your_experiment`
 - **Train on RunPod (uses system Python)**: `python3 -m accelerate launch --config_file configs/accelerate/a40.yaml src/train.py +experiments=production`
-- **Evaluate checkpoint**: `python3 src/train.py +experiments=production eval_checkpoint=./outputs/production_model/checkpoint-1000`
+- **Resume from checkpoint**: `python3 src/train.py +experiments=production resume_from_checkpoint=./outputs/checkpoint-5000`
+
+### Automatic Evaluation During Training
+When TensorBoard is enabled (`report_to: [tensorboard]` in training config), the trainer will automatically:
+- Log sample predictions and WER metrics every N training steps (default: 500)
+- Display predictions in TensorBoard's TEXT tab
+- Track WER over time in TensorBoard's SCALARS tab
+- Note: Predictions are logged only at specified step intervals, not during regular evaluation
+
+Configure evaluation frequency:
+```yaml
+# In your experiment config or via CLI
+log_predictions_every_n_steps: 500  # How often to evaluate
+log_predictions_samples: 10         # Number of samples to evaluate
+```
+
+View TensorBoard logs:
+```bash
+tensorboard --logdir ./logs
+```
+
+### Automatic Hub Pushing During Training
+The trainer can automatically push checkpoints to HuggingFace Hub during training:
+
+1. **Set up authentication** (one-time setup):
+   ```bash
+   huggingface-cli login
+   # Or set environment variable:
+   export HF_TOKEN='your_token_here'
+   ```
+
+2. **Configure in your experiment YAML** or override via CLI:
+   ```yaml
+   training:
+     push_to_hub: true
+     hub_model_id: "username/model-name"  # Your HF repo
+     hub_strategy: checkpoint  # Push every checkpoint
+     hub_private_repo: false  # Set true for private
+   ```
+
+3. **Or use CLI overrides**:
+   ```bash
+   python3 src/train.py +experiments=production \
+     training.push_to_hub=true \
+     training.hub_model_id="username/my-asr-model" \
+     training.hub_strategy=checkpoint
+   ```
+
+The production config already has `push_to_hub: true` configured. Just update `hub_model_id` to your repository.
 
 ### RunPod Deployment
 - **Deploy to RunPod**: `python scripts/deploy_runpod.py <IP_ADDRESS> <PORT>`

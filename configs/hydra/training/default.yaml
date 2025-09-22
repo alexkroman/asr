@@ -40,6 +40,10 @@ greater_is_better: false
 
 # Hub
 push_to_hub: false
+hub_model_id: null  # e.g., "username/model-name"
+hub_strategy: every_save  # or "checkpoint" or "end"
+hub_token: null  # Will use HF_TOKEN env var if not set
+hub_private_repo: false
 
 # Performance
 dataloader_num_workers: 4
