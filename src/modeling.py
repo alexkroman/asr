@@ -1,8 +1,10 @@
 """ASR Model for Whisper-LLM integration"""
 
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -11,14 +13,13 @@ from transformers import (
     WhisperModel,
 )
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
-from peft import LoraConfig, PeftMixedModel, PeftModel, TaskType, get_peft_model
 
 
 class WhisperEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.whisper = WhisperModel.from_pretrained(
-            "openai/whisper-small", dtype=torch.bfloat16, token=False
+            "openai/whisper-small", torch_dtype="auto", token=False
         )
 
         for param in self.whisper.parameters():
@@ -33,7 +34,7 @@ class WhisperEncoder(nn.Module):
         with torch.no_grad():
             input_features = input_features.to(self.whisper.dtype)
             outputs = self.whisper.encoder(input_features, attention_mask=attention_mask)
-            return cast(torch.Tensor, outputs.last_hidden_state)
+            return outputs.last_hidden_state
 
 
 class AudioProjector(nn.Module):
@@ -70,13 +71,11 @@ class LLMDecoder(nn.Module):
         lora_target_modules = config.lora_target_modules
         lora_dropout = config.lora_dropout
 
-        self.model: Union[PreTrainedModel, PeftModel, PeftMixedModel] = (
-            AutoModelForCausalLM.from_pretrained(
-                decoder_model_name,
-                dtype=torch.bfloat16,
-                token=False,
-                use_cache=False,
-            )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            decoder_model_name,
+            torch_dtype="auto",
+            token=False,
+            use_cache=False,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_model_name, token=False)
 
@@ -152,19 +151,6 @@ class ASRModel(PreTrainedModel):
         from transformers import WhisperFeatureExtractor
         feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
         feature_extractor.save_pretrained(save_directory)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load a model from a saved checkpoint."""
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        if hasattr(self.decoder.model, "gradient_checkpointing_enable"):
-            self.decoder.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
-
-    def gradient_checkpointing_disable(self):
-        if hasattr(self.decoder.model, "gradient_checkpointing_disable"):
-            self.decoder.model.gradient_checkpointing_disable()
 
     def add_audio_special_tokens(self):
         """Add audio-specific special tokens for better audio-text alignment."""
@@ -336,5 +322,7 @@ class ASRModel(PreTrainedModel):
 
         return outputs
 
-from transformers import AutoModel
+# Register model with HuggingFace Auto classes
+from transformers import AutoModel, AutoConfig
+AutoConfig.register("asr_model", ASRModelConfig)
 AutoModel.register(ASRModelConfig, ASRModel)

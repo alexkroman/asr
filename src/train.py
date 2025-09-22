@@ -11,8 +11,6 @@ import torch
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from transformers import (
-    AutoConfig,
-    AutoModel,
     Trainer,
     TrainingArguments,
     WhisperFeatureExtractor,
@@ -466,9 +464,6 @@ def main(cfg: DictConfig) -> None:
     if training_args.push_to_hub:
         print("\n🚀 Pushing final model to Hub...")
         trainer.push_to_hub()
-
-AutoConfig.register("asr_model", ASRModelConfig)
-AutoModel.register(ASRModelConfig, ASRModel)
 
 if __name__ == "__main__":
     main()
